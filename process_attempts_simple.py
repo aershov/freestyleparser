@@ -9,6 +9,23 @@ import subprocess
 import threading
 from queue import Queue
 
+# Конфигурация YOLO
+YOLO_CONFIDENCE_THRESHOLD = 0.4  # Порог уверенности для детекции объектов
+YOLO_TARGET_CLASSES = ['person', 'boat', 'surfboard']  # Классы объектов для детекции
+YOLO_FRAME_SCALE_FACTOR = 0.2  # Масштаб для уменьшения кадра перед детекцией
+
+# Конфигурация области интереса (ROI)
+ROI_PERCENTAGES = (0, 23, 95, 90)  # (left, top, right, bottom) в процентах от размера кадра
+
+# Конфигурация обработки видео
+FRAME_SKIP = 25  # Обрабатываем каждый N-й кадр
+MIN_DETECTION_TIME = 1  # Минимальное время (в секундах) с детекциями для начала попытки
+MIN_ATTEMPT_DURATION = 3  # Минимальная длительность попытки в секундах
+MIN_PAUSE_DURATION = 3  # Минимальная пауза между попытками в секундах
+
+ATTEMPT_START_PADDING = 2  # Запас времени (в секундах) к началу попытки
+ATTEMPT_END_PADDING = 1 # Запас времени (в секундах) от конца попытки
+
 def safe_print(*args, **kwargs):
     """Потокобезопасный вывод в консоль"""
     print(*args, **kwargs)
@@ -21,16 +38,31 @@ def parse_arguments():
                         help='Output directory (default: output)')
     parser.add_argument('--limit', '-l', type=int, default=None,
                         help='Limit processing to first N seconds of all videos (default: process all)')
+    parser.add_argument('--inputFiles', '-f', type=str, default=None,
+                        help='Filter input files by mask or specific files (semicolon-separated). Example: "*.MTS" or "file1.MTS;file2.MTS"')
     return parser.parse_args()
 
-def get_video_files(input_path):
+def get_video_files(input_path, file_filter=None):
     """Получает список видео файлов для обработки"""
     path = Path(input_path)
     if path.is_file():
         return [str(path)]
     elif path.is_dir():
-        # Получаем все .MTS файлы и сортируем их по имени
-        files = glob.glob(str(path / "*.MTS"))
+        if file_filter:
+            if ';' in file_filter:
+                # Список конкретных файлов
+                files = []
+                for file_name in file_filter.split(';'):
+                    file_path = path / file_name.strip()
+                    if file_path.exists():
+                        files.append(str(file_path))
+            else:
+                # Маска файлов
+                files = glob.glob(str(path / file_filter))
+        else:
+            # Все .MTS файлы
+            files = glob.glob(str(path / "*.MTS"))
+        
         files.sort()  # Сортировка по имени файла
         safe_print("Files will be processed in the following order:")
         for file in files:
@@ -45,11 +77,8 @@ def detect_objects_yolo(frame, model, roi_percentages):
     x2_px = int(frame_width * roi_percentages[2] / 100)
     y2_px = int(frame_height * roi_percentages[3] / 100)
     roi = frame[y1_px:y2_px, x1_px:x2_px]
-    scale_factor = 0.15
-    small_frame = cv2.resize(roi, None, fx=scale_factor, fy=scale_factor)
+    small_frame = cv2.resize(roi, None, fx=YOLO_FRAME_SCALE_FACTOR, fy=YOLO_FRAME_SCALE_FACTOR)
     results = model(small_frame, verbose=False)
-    YOLO_CONFIDENCE_THRESHOLD = 0.4
-    YOLO_TARGET_CLASSES = ['person', 'boat', 'surfboard']
     detections = []
     for r in results:
         boxes = r.boxes
@@ -58,7 +87,7 @@ def detect_objects_yolo(frame, model, roi_percentages):
             conf = float(box.conf[0].cpu().numpy())
             cls = int(box.cls[0].cpu().numpy())
             class_name = model.names[cls]
-            x1, y1, x2, y2 = [int(coord / scale_factor) for coord in [x1, y1, x2, y2]]
+            x1, y1, x2, y2 = [int(coord / YOLO_FRAME_SCALE_FACTOR) for coord in [x1, y1, x2, y2]]
             x1 += x1_px
             x2 += x1_px
             y1 += y1_px
@@ -121,17 +150,12 @@ def process_video(video_path, output_dir, model, time_limit=None, total_duration
         safe_print(f"Processing limited to first {time_limit} seconds")
         duration = min(duration, time_limit)
 
-    # Параметры для обработки
-    YOLO_CONFIDENCE_THRESHOLD = 0.4
-    YOLO_TARGET_CLASSES = ['person', 'boat', 'surfboard']
-    MIN_PERSON_HEIGHT_RATIO = 0.15
-    roi_percentages = (0, 23, 95, 90)
-
     # Список попыток
     attempt_start = None
     no_detection_count = 0
     detection_count = 0
     frame_index = 0
+    last_attempt_end = 0  # Время окончания последней попытки
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -142,22 +166,28 @@ def process_video(video_path, output_dir, model, time_limit=None, total_duration
         if time_limit is not None and total_duration + current_time > time_limit:
             break
 
-        if frame_index % 3 == 0:  # Обрабатываем каждый третий кадр
-            detections = detect_objects_yolo(frame, model, roi_percentages)
-            if any(d['class'] in YOLO_TARGET_CLASSES for d in detections):
-                detection_count += 1
-                if detection_count >= 0.4 * fps:  # 0.4 секунды с детекциями
-                    if attempt_start is None:
-                        attempt_start = current_time
-                    no_detection_count = 0
+        if frame_index % FRAME_SKIP == 0:  # Обрабатываем каждый N-й кадр
+            detections = detect_objects_yolo(frame, model, ROI_PERCENTAGES)
+            has_detections = any(d['class'] in YOLO_TARGET_CLASSES for d in detections)
+            
+            if has_detections:
+                # Проверяем, прошло ли достаточно времени с последней попытки
+                if current_time - last_attempt_end >= MIN_PAUSE_DURATION:
+                    detection_count += 1
+                    if detection_count >= MIN_DETECTION_TIME * fps/FRAME_SKIP:  # Минимальное время с детекциями
+                        if attempt_start is None:
+                            attempt_start = current_time
+                        no_detection_count = 0
             else:
                 no_detection_count += 1
-                if no_detection_count >= 3 * fps:  # 3 секунды без детекций
+                if no_detection_count >= MIN_PAUSE_DURATION * fps/FRAME_SKIP:  # Минимальная пауза между попытками
                     if attempt_start is not None:
-                        # attempts.append((attempt_start, current_time))
-                        start1 = max(0, attempt_start - 3)
-                        end1 = current_time - 5
-                        attempt_queue.put((video_path, start1, end1, output_dir))
+                        # Проверяем минимальную длительность попытки
+                        if current_time - attempt_start >= MIN_ATTEMPT_DURATION:
+                            start1 = max(0, attempt_start - ATTEMPT_START_PADDING)
+                            end1 = current_time - ATTEMPT_END_PADDING
+                            attempt_queue.put((video_path, start1, end1, output_dir))
+                            last_attempt_end = current_time
                         attempt_start = None
                     no_detection_count = 0
                     detection_count = 0
@@ -165,23 +195,18 @@ def process_video(video_path, output_dir, model, time_limit=None, total_duration
         frame_index += 1
 
     cap.release()
-
-    # # Вырезаем попытки с помощью ffmpeg
-    # for start, end in attempts:
-    #     # Добавляем запас 4 секунды к началу и уменьшаем запас с хвоста на 4 секунды
-    #     start = max(0, start - 3)
-    #     end = end - 5
-    #     attempt_queue.put((video_path, start, end, output_dir))
-
     return total_duration + duration
 
 def main():
     args = parse_arguments()
     model = YOLO('yolov8n.pt')
-    video_files = get_video_files(args.input)
+    video_files = get_video_files(args.input, args.inputFiles)
     if not video_files:
-        safe_print(f"No .MTS files found in {args.input}")
+        safe_print(f"No video files found in {args.input}")
         return
+
+    # Создаем выходную директорию, если она не существует
+    os.makedirs(args.output, exist_ok=True)
 
     # Запускаем рабочий поток для создания файлов попыток
     save_thread = threading.Thread(target=save_attempt_worker)

@@ -11,6 +11,7 @@ import yaml
 import logging
 import shutil
 from utils import get_ffprobe_path, get_ffmpeg_path
+import time
 
 from Components import AthleteWidget
 from splitter import process_video
@@ -654,7 +655,14 @@ class FreestyleParserApp:
 
                 # Удаляем временный файл
                 if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                    try:
+                        # Даем небольшую задержку для освобождения файла
+                        time.sleep(0.1)
+                        os.remove(temp_path)
+                    except PermissionError:
+                        self.log(f"Не удалось удалить временный файл {temp_path} - файл занят")
+                    except Exception as e:
+                        self.log(f"Ошибка при удалении временного файла: {e}")
             else:
                 cmd = [
                     get_ffmpeg_path(), '-ss', '2.5',
@@ -703,13 +711,37 @@ class FreestyleParserApp:
             if sys.platform == "darwin":  # macOS
                 subprocess.Popen(['open', '-a', 'VLC', abs_path])
             elif sys.platform == "win32":  # Windows
-                subprocess.Popen(['vlc', abs_path])
+                # Пробуем найти VLC в стандартных местах установки
+                vlc_paths = [
+                    r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                    r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+                    "vlc"  # Пробуем системный путь
+                ]
+                
+                vlc_found = False
+                for vlc_path in vlc_paths:
+                    try:
+                        if os.path.exists(vlc_path):
+                            subprocess.Popen([vlc_path, abs_path])
+                            vlc_found = True
+                            break
+                    except Exception:
+                        continue
+                
+                if not vlc_found:
+                    # Если VLC не найден, пробуем открыть файл системным способом
+                    os.startfile(abs_path)
             else:  # Linux
                 subprocess.Popen(['vlc', abs_path])
 
             self.log(f"Открыто видео: {filename}")
         except Exception as e:
             self.log(f"Ошибка при открытии видео: {str(e)}")
+            # Пробуем открыть файл системным способом как запасной вариант
+            try:
+                os.startfile(abs_path)
+            except Exception as e2:
+                self.log(f"Не удалось открыть файл системным способом: {str(e2)}")
 
     def poll_attempts(self):
         """Проверяет появление новых попыток и обновляет UI"""

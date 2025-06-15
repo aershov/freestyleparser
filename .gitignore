@@ -1,0 +1,8 @@
+./dist
+./bin
+./build
+./__pycache__
+./venv
+./.FreestyleParser
+FreestyleParser.spec
+yolov8n.pt

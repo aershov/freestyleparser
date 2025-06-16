@@ -36,7 +36,7 @@ class FreestyleParserApp:
         # Инициализируем переменные
         current_date = datetime.date.today()
         formatted_date = current_date.strftime("%Y-%m-%d")
-        self._app_folder = os.path.expanduser(".FreestyleParser")
+        self._app_folder = os.path.expanduser("~/.FreestyleParser")
         if not os.path.exists(self._app_folder):
             os.makedirs(self._app_folder, exist_ok=True)
         self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")

@@ -3,7 +3,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import cv2
 from PIL import Image, ImageTk
-import os
 import subprocess
 import datetime
 import threading

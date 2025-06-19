@@ -35,7 +35,8 @@ def process_video(input_paths, output_folder, roi, callback):
     video_files = input_paths
 
     # Сортировка файлов по дате создания
-    video_files.sort(key=os.path.getctime)
+    # video_files.sort(key=os.path.getctime)
+    video_files.sort(key=os.path.basename, reverse=False)
 
     # Создание выходной папки, если она не существует
     os.makedirs(output_folder, exist_ok=True)

@@ -7,19 +7,19 @@ from ultralytics import YOLO
 from utils import get_ffmpeg_path
 
 # Конфигурация YOLO
-YOLO_CONFIDENCE_THRESHOLD = 0.4  # Порог уверенности для детекции объектов
+YOLO_CONFIDENCE_THRESHOLD = 0.3  # Порог уверенности для детекции объектов
 YOLO_TARGET_CLASSES = ['person', 'boat', 'surfboard']  # Классы объектов для детекции
-YOLO_FRAME_SCALE_FACTOR = 0.3  # Масштаб для уменьшения кадра перед детекцией
+YOLO_MAX_WIDTH = 200  # уменьшаем кадр перед анализом в YOLO до стольких пикселей
 
 
 # Конфигурация обработки видео
-FRAME_SKIP = 25  # Обрабатываем каждый N-й кадр
+FRAME_SKIP = 25  # Обрабатываем каждый N-й кадр //TODO надо поменять на указания N кадров в секунду анализа, чтобы не зависеть от частоты кадров в видео
 MIN_DETECTION_TIME = 1  # Минимальное время (в секундах) с детекциями для начала попытки
 MIN_ATTEMPT_DURATION = 3  # Минимальная длительность попытки в секундах
-MIN_PAUSE_DURATION = 3  # Минимальная пауза между попытками в секундах
+MIN_PAUSE_DURATION = 3  # Минимальная пауза между попытками в секундах (если потеряли атлета меньше чем на столько сек, то попытка продолжается, если больше - то новая попытка)
 
 ATTEMPT_START_PADDING = 2  # Запас времени (в секундах) к началу попытки
-ATTEMPT_END_PADDING = 1 # Запас времени (в секундах) от конца попытки
+ATTEMPT_END_PADDING = 0 # Запас времени (в секундах) от конца попытки
 
 def safe_print(*args, **kwargs):
     """Потокобезопасный вывод в консоль"""
@@ -74,7 +74,13 @@ def process_video(input_paths, output_folder, roi, callback):
                     frame = frame[y1_px:y2_px, x1_px:x2_px]
 
                 # Детекция с помощью YOLO
-                small_frame = cv2.resize(frame, None, fx=YOLO_FRAME_SCALE_FACTOR, fy=YOLO_FRAME_SCALE_FACTOR)
+                # scale_factor = 0.3
+                if frame.shape[1] > YOLO_MAX_WIDTH:  # Check if the current frame's width is greater than 200
+                    scale_factor = YOLO_MAX_WIDTH / frame.shape[1]
+                    small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
+                else:
+                    small_frame = frame.copy()  # No resizing needed
+
                 results = model(small_frame, verbose=False)
 
                 # Проверка наличия объектов
@@ -107,7 +113,7 @@ def process_video(input_paths, output_folder, roi, callback):
 
                         if end_time - start_time >= MIN_ATTEMPT_DURATION:
                             start1 = max(0, start_time - ATTEMPT_START_PADDING)
-                            end1 = end_time - ATTEMPT_END_PADDING
+                            end1 = end_time + ATTEMPT_END_PADDING
 
                             # Вырезание попытки с помощью ffmpeg
                             output_file = os.path.join(output_folder, f"{attempt_number:04d}.mp4")

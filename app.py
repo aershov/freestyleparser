@@ -10,7 +10,7 @@ import threading
 import yaml
 import logging
 import shutil
-from utils import get_ffprobe_path, get_ffmpeg_path
+from utils import *
 import time
 
 from Components import AthleteWidget
@@ -586,7 +586,11 @@ class FreestyleParserApp:
         self.create_canvas_from_video(self.current_video_for_roi)
 
     def select_files(self):
-        files = filedialog.askopenfilenames(filetypes=[("Video Files", "*.MTS *.MP4 *.AVI")])
+        initial_dir = find_default_video_folder()
+        files = filedialog.askopenfilenames(
+            title="Выберите видеофайлы",
+            filetypes=[("Video Files", "*.MTS *.MP4 *.AVI")],
+            initialdir=initial_dir)
         if not files:
             return
 
@@ -603,7 +607,7 @@ class FreestyleParserApp:
 
     def change_output_folder(self):
         """Изменяет выходную папку"""
-        folder = filedialog.askdirectory()
+        folder = filedialog.askdirectory(initialdir=os.path.expanduser(f"~/Desktop/FreestyleParser"))
         if folder:
             self.output_folder = folder
             self.entry_output.delete(0, tk.END)
@@ -642,7 +646,8 @@ class FreestyleParserApp:
                 crop_y = int(y1 * orig_height / 100)
                 crop_w = int((x2 - x1) * orig_width / 100)
                 crop_h = int((y2 - y1) * orig_height / 100)
-
+                if crop_h == 0 or crop_w == 0:
+                    self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
                 # Вырезаем ROI из оригинального кадра
                 cmd = [
                     get_ffmpeg_path(),

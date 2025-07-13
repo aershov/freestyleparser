@@ -5,4 +5,5 @@
 ./venv
 ./.FreestyleParser
 FreestyleParser.spec
-yolov8n.pt
+temp
+*.zip

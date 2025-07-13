@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('requirements.txt', '.'), ('bin', 'bin'), ('yolov8n.pt', '.')],
+    datas=[('requirements.txt', '.'), ('bin', 'bin'), ('models/yolo11s-seg.pt', './models')],
     hiddenimports=['PIL._tkinter_finder', 'cv2', 'numpy', 'yaml'],
     hookspath=[],
     hooksconfig={},

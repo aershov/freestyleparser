@@ -27,6 +27,38 @@ CANVAS_HEIGHT = 240
 
 MAX_LOG_LINES = 200
 
+def point_in_polygon(point, polygon):
+    """
+    Проверяет, находится ли точка внутри многоугольника
+    Использует алгоритм ray casting
+    """
+    x, y = point
+    n = len(polygon)
+    inside = False
+    
+    p1x, p1y = polygon[0]
+    for i in range(n + 1):
+        p2x, p2y = polygon[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    
+    return inside
+
+def create_polygon_mask(polygon_points, width, height):
+    """
+    Создает маску многоугольника для проверки попадания точек
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    polygon_array = np.array(polygon_points, dtype=np.int32)
+    cv2.fillPoly(mask, [polygon_array], 255)
+    return mask
+
 class FreestyleParserApp:
     def __init__(self, root):
         self.root = root
@@ -41,7 +73,10 @@ class FreestyleParserApp:
         self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")
         self.processing_config_file = None
         #TODO почистить это всё (
-        self.roi = None
+        self.roi = None  # Теперь это будет список точек многоугольника в процентах
+        self.roi_points = []  # Точки многоугольника в пикселях canvas
+        self.roi_mode = "polygon"  # "rectangle" или "polygon"
+        self.drawing_polygon = False
         self.logger = None
         self.selected_files = []
         self.processing = False
@@ -49,7 +84,6 @@ class FreestyleParserApp:
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value="Все")
-
 
         # self.on_output_folder_changed()
 
@@ -140,17 +174,49 @@ class FreestyleParserApp:
         # Запускаем обработку в отдельном потоке
         threading.Thread(target=self.process_videos, daemon=True).start()
 
-    def on_attempt_file_created(self, file):
+    def on_attempt_file_created(self, attempt):
+        ## TODO analyze best_frame
+        cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
+        cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
+        person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
+        colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
+        pers_file_path = os.path.join(self.output_folder, f"{attempt.number:04d}-person-{colors}.jpg")
+        cv2.imwrite(pers_file_path, attempt.person_frame)
+        # self.log(f"Colors {colors}")
+        output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
+        self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
+        subprocess.run([get_ffmpeg_path(), "-i", attempt.source_video, "-ss", str(attempt.start), "-to", str(attempt.end), "-c", "copy", output_file], check=True)
+        # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
+
         self.need_update_attempts = True
-        self.log(f"Видео попытки готово: {file}")
+        self.log(f"Видео попытки готово: {output_file}")
         # сообщаем, продолжать или нет (если была отмена кнопкой - то остановимся)
         return self.processing
+
+    def get_colors_from_athlete(self, frame_bg, frame_with, bbox=None, k=5, threshold=10):
+        roi = extract_athlete_difference(frame_bg, frame_with, bbox)
+        if roi is None:
+            return []
+
+        # --- Фильтруем пустые/неподходящие регионы ---
+        non_zero_pixels = cv2.countNonZero(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+        total_pixels = roi.shape[0] * roi.shape[1]
+        if total_pixels == 0 or non_zero_pixels / total_pixels < 0.05:
+            print("[INFO] ROI слишком мал или пуст")
+            return []
+
+        # --- Анализируем цвета только в этой области ---
+        dominant_colors = get_dominant_colors(roi, k, threshold)
+
+        return dominant_colors
+
 
     def process_videos(self):
         """Обрабатывает видео в отдельном потоке"""
         try:
-            process_video(self.selected_files, self.output_folder, self.roi, lambda file: self.on_attempt_file_created(file))
-            self.log(f"Файлы {self.selected_files} успешно обработан.")
+            next_attempt_number = get_next_attempt_number(self.output_folder)
+            process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt), next_attempt_number)
+            self.log(f"Файлы {self.selected_files} успешно обработаны.")
         except Exception as e:
             error_trace = traceback.format_exc()
             self.log(f"Ошибка обработки: {e} {error_trace}")
@@ -318,15 +384,32 @@ class FreestyleParserApp:
         self.frame_roi = tk.LabelFrame(self.left_frame, text="Область интереса")
         self.frame_roi.pack(pady=10, fill=tk.X)
 
-        self.label_roi = tk.Label(self.frame_roi, text="Выберите область интереса:")
+        # Кнопки для переключения режимов ROI
+        self.frame_roi_controls = tk.Frame(self.frame_roi)
+        self.frame_roi_controls.pack(pady=5)
+        
+        self.button_rectangle_mode = tk.Button(self.frame_roi_controls, text="Прямоугольник", 
+                                              command=lambda: self.switch_roi_mode("rectangle"))
+        self.button_rectangle_mode.pack(side=tk.LEFT, padx=5)
+        
+        self.button_polygon_mode = tk.Button(self.frame_roi_controls, text="Многоугольник", 
+                                            command=lambda: self.switch_roi_mode("polygon"))
+        self.button_polygon_mode.pack(side=tk.LEFT, padx=5)
+        
+        self.button_clear_roi = tk.Button(self.frame_roi_controls, text="Очистить", 
+                                         command=self.clear_roi)
+        self.button_clear_roi.pack(side=tk.LEFT, padx=5)
+
+        self.label_roi = tk.Label(self.frame_roi, text="Кликните по точкам многоугольника. Двойной клик завершает:")
         self.label_roi.pack()
 
         self.canvas = tk.Canvas(self.frame_roi, width=CANVAS_WIDTH, height=CANVAS_HEIGHT, bg="black")
-        self.canvas.pack()
+        self.canvas.pack(pady=5)
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", self.finish_polygon)  # Двойной клик завершает многоугольник
 
         # --- Выходная папка и управление ---
         self.frame_output = tk.LabelFrame(self.left_frame, text="Настройки")
@@ -543,20 +626,79 @@ class FreestyleParserApp:
             self.logger.log(level, message)
 
     def on_click(self, event):
-        self.start_x = event.x
-        self.start_y = event.y
+        if self.roi_mode == "rectangle":
+            self.start_x = event.x
+            self.start_y = event.y
+            self.dragging = True
+        elif self.roi_mode == "polygon":
+            if not self.drawing_polygon:
+                # Начинаем рисовать новый многоугольник
+                self.roi_points = []
+                self.drawing_polygon = True
+                self.canvas.delete("roi_polygon")
+                self.canvas.delete("roi_points")
+            
+            # Добавляем точку
+            self.roi_points.append((event.x, event.y))
+            
+            # Рисуем точку
+            self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, 
+                                  fill="red", tags="roi_points")
+            
+            # Рисуем линии между точками
+            if len(self.roi_points) > 1:
+                prev_point = self.roi_points[-2]
+                self.canvas.create_line(prev_point[0], prev_point[1], event.x, event.y, 
+                                      fill="red", width=2, tags="roi_polygon")
 
     def on_drag(self, event):
-        self.canvas.delete("roi_rectangle")
-        self.end_x = event.x
-        self.end_y = event.y
-        self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
+        if self.dragging and self.roi_mode == "rectangle":
+            self.end_x = event.x
+            self.end_y = event.y
+            self.canvas.delete("roi_rectangle")
+            self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
 
     def on_release(self, event):
-        self.end_x = event.x
-        self.end_y = event.y
-        self.roi = (100 * self.start_x/ CANVAS_WIDTH, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / CANVAS_WIDTH, 100* self.end_y/ CANVAS_HEIGHT)
-        self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
+        if self.dragging and self.roi_mode == "rectangle":
+            self.dragging = False
+            self.end_x = event.x
+            self.end_y = event.y
+            self.roi = (100 * self.start_x/ CANVAS_WIDTH, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / CANVAS_WIDTH, 100* self.end_y/ CANVAS_HEIGHT)
+            self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
+
+    def finish_polygon(self, event):
+        """Завершает рисование многоугольника"""
+        if self.roi_mode == "polygon" and self.drawing_polygon and len(self.roi_points) >= 3:
+            # Замыкаем многоугольник
+            if len(self.roi_points) > 2:
+                first_point = self.roi_points[0]
+                last_point = self.roi_points[-1]
+                self.canvas.create_line(last_point[0], last_point[1], first_point[0], first_point[1], 
+                                      fill="red", width=2, tags="roi_polygon")
+            
+            # Сохраняем ROI в процентах
+            self.roi = [(100 * x / CANVAS_WIDTH, 100 * y / CANVAS_HEIGHT) for x, y in self.roi_points]
+            self.drawing_polygon = False
+            self.log(f"Многоугольная ROI создана с {len(self.roi_points)} точками")
+
+    def clear_roi(self):
+        """Очищает текущую ROI"""
+        self.canvas.delete("roi_rectangle")
+        self.canvas.delete("roi_polygon")
+        self.canvas.delete("roi_points")
+        self.roi = None
+        self.roi_points = []
+        self.drawing_polygon = False
+        self.dragging = False
+
+    def switch_roi_mode(self, mode):
+        """Переключает режим ROI между прямоугольником и многоугольником"""
+        self.roi_mode = mode
+        self.clear_roi()
+        if mode == "rectangle":
+            self.label_roi.config(text="Выберите прямоугольную область интереса:")
+        else:
+            self.label_roi.config(text="Кликните по точкам многоугольника. Двойной клик завершает:")
 
     def on_file_select(self, event):
         """Обработчик выбора файла в списке"""
@@ -635,27 +777,50 @@ class FreestyleParserApp:
                 subprocess.run(cmd, check=True, capture_output=True)
 
                 # Получаем размеры оригинального кадра
-                # TODO ну что блядь за способ? надо сначала процессинга брать размер и сохранять (
                 img = Image.open(temp_path)
                 orig_width, orig_height = img.size
 
-                # Конвертируем ROI из процентов в пиксели оригинального размера
-                x1, y1, x2, y2 = roi
-                crop_x = int(x1 * orig_width / 100)
-                crop_y = int(y1 * orig_height / 100)
-                crop_w = int((x2 - x1) * orig_width / 100)
-                crop_h = int((y2 - y1) * orig_height / 100)
-                if crop_h == 0 or crop_w == 0:
-                    self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
-                # Вырезаем ROI из оригинального кадра
-                cmd = [
-                    get_ffmpeg_path(),
-                    '-i', temp_path,
-                    '-vf', f'crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={THUMB_X}:-1',  # Сначала crop, потом scale
-                    '-q:v', '2',
-                    '-y', output_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
+                # Проверяем формат ROI
+                if len(roi) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
+                    x1, y1, x2, y2 = roi
+                    crop_x = int(x1 * orig_width / 100)
+                    crop_y = int(y1 * orig_height / 100)
+                    crop_w = int((x2 - x1) * orig_width / 100)
+                    crop_h = int((y2 - y1) * orig_height / 100)
+                    if crop_h == 0 or crop_w == 0:
+                        self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
+                    # Вырезаем ROI из оригинального кадра
+                    cmd = [
+                        get_ffmpeg_path(),
+                        '-i', temp_path,
+                        '-vf', f'crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={THUMB_X}:-1',  # Сначала crop, потом scale
+                        '-q:v', '2',
+                        '-y', output_path
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    
+                elif len(roi) > 4:  # Многоугольник (новый формат)
+                    # Для многоугольника используем Python для обработки
+                    import cv2
+                    import numpy as np
+                    
+                    # Загружаем изображение
+                    frame = cv2.imread(temp_path)
+                    
+                    # Конвертируем точки из процентов в пиксели
+                    polygon_points = [(int(orig_width * x / 100), int(orig_height * y / 100)) for x, y in roi]
+                    
+                    # Создаем маску многоугольника
+                    mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
+                    polygon_array = np.array(polygon_points, dtype=np.int32)
+                    cv2.fillPoly(mask, [polygon_array], 255)
+                    
+                    # Применяем маску к кадру
+                    frame = cv2.bitwise_and(frame, frame, mask=mask)
+                    
+                    # Изменяем размер и сохраняем
+                    frame = cv2.resize(frame, (THUMB_X, THUMB_Y))
+                    cv2.imwrite(output_path, frame)
 
                 # Удаляем временный файл
                 if os.path.exists(temp_path):
@@ -776,17 +941,28 @@ class FreestyleParserApp:
         if os.path.exists(self.processing_config_file):
             with open(self.processing_config_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
-                if 'processing-config' in config and 'roi' in config['processing-config']:
-                    # Преобразуем список обратно в tuple
-                    roi_list = config['processing-config']['roi']
-                    if isinstance(roi_list, list) and len(roi_list) == 4:
-                        self.roi = tuple(roi_list)
+                if 'processing-config' in config:
+                    # Загружаем ROI
+                    if 'roi' in config['processing-config']:
+                        roi_data = config['processing-config']['roi']
+                        if isinstance(roi_data, list):
+                            if len(roi_data) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
+                                self.roi = tuple(roi_data)
+                                self.roi_mode = "rectangle"
+                            elif len(roi_data) > 4 and all(isinstance(point, list) and len(point) == 2 for point in roi_data):  # Многоугольник (список точек)
+                                self.roi = roi_data
+                                self.roi_mode = "polygon"
+                    
+                    # Загружаем режим ROI
+                    if 'roi_mode' in config['processing-config']:
+                        self.roi_mode = config['processing-config']['roi_mode']
 
     def save_processing_config(self):
         """Сохраняет конфигурацию обработки в файл"""
         config = {
             'processing-config': {
-                'roi': list(self.roi) if self.roi else None  # Преобразуем tuple в список
+                'roi': self.roi if self.roi else None,
+                'roi_mode': self.roi_mode
             }
         }
         with open(self.processing_config_file, "w", encoding="utf-8") as f:
@@ -838,15 +1014,30 @@ class FreestyleParserApp:
                     self.display_image(np.array(image))
                     # Если есть сохраненный ROI, показываем его
                     if self.roi:
-                        x1, y1, x2, y2 = self.roi
-                        self.canvas.create_rectangle(
-                            x1 * CANVAS_WIDTH / 100,
-                            y1 * CANVAS_HEIGHT / 100,
-                            x2 * CANVAS_WIDTH / 100,
-                            y2 * CANVAS_HEIGHT / 100,
-                            outline="red",
-                            tags="roi_rectangle"
-                        )
+                        if self.roi_mode == "rectangle":
+                            x1, y1, x2, y2 = self.roi
+                            self.canvas.create_rectangle(
+                                x1 * CANVAS_WIDTH / 100,
+                                y1 * CANVAS_HEIGHT / 100,
+                                x2 * CANVAS_WIDTH / 100,
+                                y2 * CANVAS_HEIGHT / 100,
+                                outline="red",
+                                tags="roi_rectangle"
+                            )
+                        elif self.roi_mode == "polygon":
+                            # Конвертируем точки из процентов в пиксели
+                            pixel_points = [(x * CANVAS_WIDTH / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
+                            
+                            # Рисуем точки
+                            for x, y in pixel_points:
+                                self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="red", tags="roi_points")
+                            
+                            # Рисуем линии многоугольника
+                            for i in range(len(pixel_points)):
+                                p1 = pixel_points[i]
+                                p2 = pixel_points[(i + 1) % len(pixel_points)]
+                                self.canvas.create_line(p1[0], p1[1], p2[0], p2[1], 
+                                                      fill="red", width=2, tags="roi_polygon")
                 # return canvas_path
             except subprocess.CalledProcessError as e:
                 print(f"Ошибка создания canvas.jpg (1): {e}")
@@ -936,23 +1127,6 @@ class FreestyleParserApp:
 
 
 
-    def extract_video_frame(self, video_path, output_path, timestamp=0):
-        """Извлекает кадр из видео в указанный момент времени"""
-        ffmpeg_path = get_ffmpeg_path()
-        if not ffmpeg_path:
-            raise Exception("FFmpeg не найден в системе или в папке bin")
-        
-        try:
-            subprocess.run([
-                ffmpeg_path,
-                '-ss', str(timestamp),
-                '-i', video_path,
-                '-vframes', '1',
-                '-q:v', '2',
-                output_path
-            ], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"Ошибка при извлечении кадра: {e.stderr.decode()}")
 
     def on_output_folder_changed(self):
         self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")

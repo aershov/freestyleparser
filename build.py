@@ -26,8 +26,7 @@ def build_app():
         '--windowed',
         '--add-data=requirements.txt:.',
         '--add-data=bin:bin',  # Добавляем бинарные файлы
-        '--add-data=yolov8n.pt:.',  # Добавляем модель
-        # '--add-data=yolov8s.pt:.',  # Добавляем бинарные файлы
+        '--add-data=models/yolo11s-seg.pt:./models',  # Добавляем модель
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',
         '--hidden-import=numpy',

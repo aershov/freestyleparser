@@ -177,11 +177,11 @@ class FreestyleParserApp:
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
         cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
-        cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
-        person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
-        colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
-        pers_file_path = os.path.join(self.output_folder, f"{attempt.number:04d}-person-{colors}.jpg")
-        cv2.imwrite(pers_file_path, attempt.person_frame)
+        # cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
+        # person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
+        # colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
+        # pers_file_path = os.path.join(self.output_folder, f"{attempt.number:04d}-person-{colors}.jpg")
+        # cv2.imwrite(pers_file_path, attempt.person_frame)
         # self.log(f"Colors {colors}")
         output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
         self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
@@ -677,7 +677,7 @@ class FreestyleParserApp:
                                       fill="red", width=2, tags="roi_polygon")
             
             # Сохраняем ROI в процентах
-            self.roi = [(100 * x / CANVAS_WIDTH, 100 * y / CANVAS_HEIGHT) for x, y in self.roi_points]
+            self.roi = [[100 * x / CANVAS_WIDTH, 100 * y / CANVAS_HEIGHT] for x, y in self.roi_points]
             self.drawing_polygon = False
             self.log(f"Многоугольная ROI создана с {len(self.roi_points)} точками")
 
@@ -807,16 +807,9 @@ class FreestyleParserApp:
                     # Загружаем изображение
                     frame = cv2.imread(temp_path)
                     
-                    # Конвертируем точки из процентов в пиксели
-                    polygon_points = [(int(orig_width * x / 100), int(orig_height * y / 100)) for x, y in roi]
-                    
-                    # Создаем маску многоугольника
-                    mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
-                    polygon_array = np.array(polygon_points, dtype=np.int32)
-                    cv2.fillPoly(mask, [polygon_array], 255)
-                    
-                    # Применяем маску к кадру
-                    frame = cv2.bitwise_and(frame, frame, mask=mask)
+                    # Для превью показываем полный кадр без маски
+                    # Маска применяется только при обработке для детекции
+                    # Здесь мы просто используем полный кадр для красивого превью
                     
                     # Изменяем размер и сохраняем
                     frame = cv2.resize(frame, (THUMB_X, THUMB_Y))
@@ -945,13 +938,29 @@ class FreestyleParserApp:
                     # Загружаем ROI
                     if 'roi' in config['processing-config']:
                         roi_data = config['processing-config']['roi']
-                        if isinstance(roi_data, list):
-                            if len(roi_data) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
-                                self.roi = tuple(roi_data)
-                                self.roi_mode = "rectangle"
-                            elif len(roi_data) > 4 and all(isinstance(point, list) and len(point) == 2 for point in roi_data):  # Многоугольник (список точек)
-                                self.roi = roi_data
-                                self.roi_mode = "polygon"
+                        if roi_data is not None:
+                            if isinstance(roi_data, dict):
+                                if 'rectangle' in roi_data:
+                                    self.roi = tuple(roi_data['rectangle']) # Преобразуем обратно в tuple
+                                    self.roi_mode = "rectangle"
+                                elif 'polygon' in roi_data:
+                                    # Убеждаемся, что каждая точка является list
+                                    polygon_points = []
+                                    for point in roi_data['polygon']:
+                                        if isinstance(point, tuple):
+                                            polygon_points.append(list(point))
+                                        else:
+                                            polygon_points.append(point)
+                                    self.roi = polygon_points # Многоугольник в формате list
+                                    self.roi_mode = "polygon"
+                            # Поддержка старого формата для обратной совместимости
+                            elif isinstance(roi_data, list):
+                                if len(roi_data) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
+                                    self.roi = tuple(roi_data)  # Преобразуем обратно в tuple
+                                    self.roi_mode = "rectangle"
+                                elif len(roi_data) > 4 and all(isinstance(point, list) and len(point) == 2 for point in roi_data):  # Многоугольник (список точек)
+                                    self.roi = roi_data
+                                    self.roi_mode = "polygon"
                     
                     # Загружаем режим ROI
                     if 'roi_mode' in config['processing-config']:
@@ -961,10 +970,32 @@ class FreestyleParserApp:
         """Сохраняет конфигурацию обработки в файл"""
         config = {
             'processing-config': {
-                'roi': self.roi if self.roi else None,
                 'roi_mode': self.roi_mode
             }
         }
+        
+        # Сохраняем ROI в зависимости от режима
+        if self.roi:
+            if self.roi_mode == "rectangle":
+                # Прямоугольник: сохраняем как list
+                config['processing-config']['roi'] = {
+                    'rectangle': list(self.roi)
+                }
+            elif self.roi_mode == "polygon":
+                # Многоугольник: сохраняем как список точек
+                # Убеждаемся, что каждая точка тоже является list, а не tuple
+                polygon_points = []
+                for point in self.roi:
+                    if isinstance(point, tuple):
+                        polygon_points.append(list(point))
+                    else:
+                        polygon_points.append(point)
+                config['processing-config']['roi'] = {
+                    'polygon': polygon_points
+                }
+        else:
+            config['processing-config']['roi'] = None
+        
         with open(self.processing_config_file, "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
 

@@ -11,7 +11,7 @@ YOLO_MAX_WIDTH = 600  # уменьшаем кадр перед анализом 
 
 
 # Конфигурация обработки видео
-FRAME_SKIP = 25  # Обрабатываем каждый N-й кадр //TODO надо поменять на указания N кадров в секунду анализа, чтобы не зависеть от частоты кадров в видео
+FRAME_SKIP = 10  # Обрабатываем каждый N-й кадр //TODO надо поменять на указания N кадров в секунду анализа, чтобы не зависеть от частоты кадров в видео
 MIN_DETECTION_TIME = 1  # Минимальное время (в секундах) с детекциями для начала попытки
 MIN_ATTEMPT_DURATION = 5  # Минимальная длительность попытки в секундах
 MIN_PAUSE_DURATION = 3  # Минимальная пауза между попытками в секундах (если потеряли атлета меньше чем на столько сек, то попытка продолжается, если больше - то новая попытка)
@@ -76,6 +76,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
         base_frame = None # первый кадр попытки
         person_bbox = None
         current_frame_small = None
+        best_frame_original = None  # Оригинальный кадр без маски для превью
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -83,18 +84,23 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
                 break
 
             if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) % FRAME_SKIP == 0:
+                # Сохраняем оригинальный кадр для превью
+                original_frame = frame.copy()
+                
                 # Установка области интереса
                 if roi:
                     frame_height, frame_width = frame.shape[:2]
                     
                     # Проверяем формат ROI
-                    if len(roi) == 4:  # Прямоугольник (старый формат)
+                    if len(roi) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
                         left, top, right, bottom = roi
                         x1_px = int(frame_width * left / 100)
                         y1_px = int(frame_height * top / 100)
                         x2_px = int(frame_width * right / 100)
                         y2_px = int(frame_height * bottom / 100)
                         frame = frame[y1_px:y2_px, x1_px:x2_px]
+                        # Также обрезаем оригинальный кадр для превью
+                        original_frame = original_frame[y1_px:y2_px, x1_px:x2_px]
                     elif len(roi) > 4:  # Многоугольник (новый формат)
                         # Конвертируем точки из процентов в пиксели
                         polygon_points = [(int(frame_width * x / 100), int(frame_height * y / 100)) for x, y in roi]
@@ -104,16 +110,19 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
                         polygon_array = np.array(polygon_points, dtype=np.int32)
                         cv2.fillPoly(mask, [polygon_array], 255)
                         
-                        # Применяем маску к кадру
+                        # Применяем маску к кадру для детекции
                         frame = cv2.bitwise_and(frame, frame, mask=mask)
+                        # Оригинальный кадр оставляем без маски для превью
 
                 # Детекция с помощью YOLO
                 # scale_factor = 0.3
                 if frame.shape[1] > YOLO_MAX_WIDTH:  # Check if the current frame's width is greater than max
                     scale_factor = YOLO_MAX_WIDTH / frame.shape[1]
                     small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
+                    small_frame_original = cv2.resize(original_frame, None, fx=scale_factor, fy=scale_factor)
                 else:
                     small_frame = frame.copy()  # No resizing needed
+                    small_frame_original = original_frame.copy()
 
                 results = model(small_frame, verbose=False)
 
@@ -122,8 +131,8 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
                 for r in results:
                     boxes = r.boxes
                     if best_frame_confidence == 0:
-                        best_frame = small_frame
-                        person_frame = small_frame
+                        best_frame = small_frame_original  # Используем оригинальный кадр для превью
+                        person_frame = small_frame_original
                     for box in boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                         conf = float(box.conf[0].cpu().numpy())
@@ -131,8 +140,8 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
                         class_name = model.names[cls]
                         if class_name == 'person' and best_frame_confidence <= conf and conf >= YOLO_CONFIDENCE_THRESHOLD:
                             best_frame_confidence = conf
-                            best_frame = small_frame
-                            person_frame = small_frame[y1:y2, x1:x2]
+                            best_frame = small_frame_original  # Используем оригинальный кадр для превью
+                            person_frame = small_frame_original[y1:y2, x1:x2]
                             person_bbox = box.xyxy[0].cpu().numpy()
                         if class_name in YOLO_TARGET_CLASSES and conf >= YOLO_CONFIDENCE_THRESHOLD:
                             detections.append({'class': class_name})
@@ -141,7 +150,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
 
                 # запоминаем базовый фрейм без человека
                 if not in_attempt:
-                    base_frame = small_frame
+                    base_frame = small_frame_original  # Используем оригинальный кадр
 
                 if has_detections:
                     frames_in_attempt += 1
@@ -160,14 +169,17 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
 
                         if end_time - start_time >= MIN_ATTEMPT_DURATION:
                             start1 = max(0, start_time - ATTEMPT_START_PADDING)
-                            end1 = end_time + ATTEMPT_END_PADDING
+                            end1 =  min(end_time + ATTEMPT_END_PADDING, (total_frames * fps)/1000.0)
 
 
                             x1, y1, x2, y2 = map(int, person_bbox)
                             try:
                                 bf = base_frame[y1:y2, x1:x2]
                             except:
-                                bf = small_frame[y1:y2, x1:x2]
+                                bf = small_frame_original[y1:y2, x1:x2]
+
+                            end1
+
                             attempt = AttemptInfo(number = attempt_number,
                                                   base_frame=bf,
                                                   best_frame=best_frame,

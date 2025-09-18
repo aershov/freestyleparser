@@ -84,6 +84,10 @@ class FreestyleParserApp:
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value="Все")
+        self.selected_attempts = set()  # Множество выбранных попыток
+        self.attempt_checkboxes = {}  # Словарь для хранения чекбоксов попыток
+        self.attempt_ratings = {}  # Словарь для хранения рейтингов попыток: {attempt: {'up': bool, 'down': bool}}
+        self.active_rating_filters = set()  # Множество активных фильтров по рейтингу
 
         # self.on_output_folder_changed()
 
@@ -294,6 +298,28 @@ class FreestyleParserApp:
         except Exception as e:
             self.log(f"Ошибка при сохранении маппинга: {str(e)}")
 
+    def save_ratings(self):
+        """Сохраняет рейтинги попыток в файл"""
+        ratings_file = os.path.join(self.output_folder, "ratings.yaml")
+        try:
+            with open(ratings_file, 'w', encoding='utf-8') as f:
+                yaml.dump(self.attempt_ratings, f, default_flow_style=False, allow_unicode=True)
+        except Exception as e:
+            self.log(f"Ошибка при сохранении рейтингов: {str(e)}")
+
+    def load_ratings(self):
+        """Загружает рейтинги попыток из файла"""
+        ratings_file = os.path.join(self.output_folder, "ratings.yaml")
+        if os.path.exists(ratings_file):
+            try:
+                with open(ratings_file, 'r', encoding='utf-8') as f:
+                    self.attempt_ratings = yaml.safe_load(f) or {}
+            except Exception as e:
+                self.log(f"Ошибка при загрузке рейтингов: {str(e)}")
+                self.attempt_ratings = {}
+        else:
+            self.attempt_ratings = {}
+
     def add_athlete(self):
         """Добавляет нового атлета"""
         name = simpledialog.askstring("Новый атлет", "Введите имя атлета:")
@@ -453,6 +479,42 @@ class FreestyleParserApp:
         self.frame_attempts = tk.LabelFrame(self.right_frame, text="Попытки")
         self.right_frame.add(self.frame_attempts, width=800)  # 80% ширины
 
+        # Область действий
+        self.actions_frame = tk.Frame(self.frame_attempts)
+        self.actions_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Счетчик выбранных попыток
+        self.selected_count_label = tk.Label(self.actions_frame, text="Выбрано: 0")
+        self.selected_count_label.pack(side=tk.LEFT, padx=5)
+
+        # Фильтры по меткам
+        self.rating_filters_frame = tk.Frame(self.actions_frame)
+        self.rating_filters_frame.pack(side=tk.LEFT, padx=20)
+
+        # Кнопка фильтра "палец вверх"
+        self.filter_up_button = tk.Button(self.rating_filters_frame, text="👍", 
+                                        command=lambda: self.toggle_rating_filter("up"),
+                                        font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
+        self.filter_up_button.pack(side=tk.LEFT, padx=2)
+
+        # Кнопка фильтра "палец вниз"
+        self.filter_down_button = tk.Button(self.rating_filters_frame, text="👎", 
+                                          command=lambda: self.toggle_rating_filter("down"),
+                                          font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
+        self.filter_down_button.pack(side=tk.LEFT, padx=2)
+
+        # Кнопка "Выбрать все"
+        self.select_all_button = tk.Button(self.actions_frame, text="Выбрать все", command=self.select_all_attempts)
+        self.select_all_button.pack(side=tk.RIGHT, padx=5)
+
+        # Кнопка "Снять выделение"
+        self.deselect_all_button = tk.Button(self.actions_frame, text="Снять выделение", command=self.deselect_all_attempts)
+        self.deselect_all_button.pack(side=tk.RIGHT, padx=5)
+
+        # Кнопка удаления
+        self.delete_button = tk.Button(self.actions_frame, text="🗑️ Удалить", command=self.delete_selected_attempts)
+        self.delete_button.pack(side=tk.RIGHT, padx=5)
+
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
         self.attempts_scrollbar = ttk.Scrollbar(self.frame_attempts, orient="vertical", command=self.attempts_canvas.yview)
@@ -535,18 +597,18 @@ class FreestyleParserApp:
         for widget in self.attempts_scrollable_frame.winfo_children():
             widget.destroy()
 
-        # Получаем все попытки
-        attempts = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
+        # Получаем отфильтрованные попытки
+        filtered_files = self.get_filtered_attempts()
+        attempts = [os.path.basename(f) for f in filtered_files]
 
-        # Фильтруем попытки
-        filter_name = self.filter_var.get()
-        if filter_name != "Все":
-            if filter_name == "Неизвестно":
-                # Показываем только непривязанные попытки
-                attempts = [a for a in attempts if not any(a in v for v in self.athlete_mapping.values())]
-            else:
-                # Показываем попытки выбранного атлета
-                attempts = [self.get_relative_path(p) for p in self.athlete_mapping.get(filter_name, [])]
+        # Очищаем выбранные попытки, которые больше не существуют
+        self.selected_attempts = {attempt for attempt in self.selected_attempts if attempt in attempts}
+
+        # Очищаем словарь чекбоксов
+        self.attempt_checkboxes.clear()
+
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
 
         # Сортируем попытки по имени
         attempts.sort()
@@ -579,9 +641,45 @@ class FreestyleParserApp:
                     label.image = photo  # Сохраняем ссылку
                     label.pack()
 
+                    # Создаем фрейм для имени файла и чекбокса
+                    name_frame = tk.Frame(frame)
+                    name_frame.pack()
+
+                    # Создаем чекбокс
+                    var = tk.BooleanVar(value=attempt in self.selected_attempts)
+                    checkbox = tk.Checkbutton(name_frame, variable=var, 
+                                            command=lambda a=attempt, v=var: self.on_attempt_checkbox_change(a, v))
+                    checkbox.pack(side=tk.LEFT, padx=(0, 5))
+                    
+                    # Сохраняем ссылку на чекбокс
+                    self.attempt_checkboxes[attempt] = var
+
                     # Добавляем имя файла
-                    name_label = tk.Label(frame, text=os.path.basename(attempt))
-                    name_label.pack()
+                    name_label = tk.Label(name_frame, text=os.path.basename(attempt))
+                    name_label.pack(side=tk.LEFT)
+
+                    # Добавляем кнопки рейтинга
+                    rating_frame = tk.Frame(name_frame)
+                    rating_frame.pack(side=tk.RIGHT, padx=(10, 0))
+
+                    # Инициализируем рейтинг для попытки, если его нет
+                    if attempt not in self.attempt_ratings:
+                        self.attempt_ratings[attempt] = {'up': False, 'down': False}
+
+                    # Кнопка "палец вверх"
+                    up_button = tk.Button(rating_frame, text="👍", width=3, height=1,
+                                       command=lambda a=attempt: self.toggle_attempt_rating(a, "up"),
+                                       font=('Arial', 9, 'normal'), bd=1)
+                    up_button.pack(side=tk.LEFT, padx=1)
+                    
+                    # Кнопка "палец вниз"
+                    down_button = tk.Button(rating_frame, text="👎", width=3, height=1,
+                                         command=lambda a=attempt: self.toggle_attempt_rating(a, "down"),
+                                         font=('Arial', 9, 'normal'), bd=1)
+                    down_button.pack(side=tk.LEFT, padx=1)
+
+                    # Обновляем стиль кнопок в зависимости от текущего состояния
+                    self.update_rating_button_style(up_button, down_button, self.attempt_ratings[attempt])
 
                     # Добавляем обработчики событий
                     label.bind('<Button-1>', lambda e, a=attempt: self.on_attempt_drag_start(e, a))
@@ -599,6 +697,163 @@ class FreestyleParserApp:
             if col >= max_cols:
                 col = 0
                 row += 1
+
+    def on_attempt_checkbox_change(self, attempt, var):
+        """Обработчик изменения состояния чекбокса попытки"""
+        if var.get():
+            self.selected_attempts.add(attempt)
+        else:
+            self.selected_attempts.discard(attempt)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def delete_selected_attempts(self):
+        """Удаляет выбранные попытки"""
+        if not self.selected_attempts:
+            messagebox.showwarning("Предупреждение", "Не выбрано ни одной попытки для удаления")
+            return
+
+        # Запрашиваем подтверждение
+        count = len(self.selected_attempts)
+        result = messagebox.askyesno("Подтверждение", 
+                                   f"Вы уверены, что хотите удалить {count} попытку(и)?\n"
+                                   "Это действие нельзя отменить.")
+
+        if result:
+            deleted_count = 0
+            for attempt in self.selected_attempts:
+                try:
+                    # Получаем полные пути к файлам
+                    video_path = os.path.join(self.output_folder, attempt)
+                    thumbnail_path = os.path.join(self.output_folder, f"{os.path.splitext(attempt)[0]}.jpg")
+                    
+                    # Удаляем видео файл
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                        deleted_count += 1
+                    
+                    # Удаляем превью
+                    if os.path.exists(thumbnail_path):
+                        os.remove(thumbnail_path)
+                    
+                    # Удаляем из маппинга атлетов
+                    for athlete_name, attempts_list in self.athlete_mapping.items():
+                        if attempt in attempts_list:
+                            attempts_list.remove(attempt)
+                    
+                    self.log(f"Удален файл: {attempt}")
+                    
+                except Exception as e:
+                    self.log(f"Ошибка при удалении {attempt}: {str(e)}", logging.ERROR)
+            
+            # Очищаем выбранные попытки
+            self.selected_attempts.clear()
+            
+            # Обновляем счетчик
+            self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+            
+            # Обновляем интерфейс
+            self.update_attempt_thumbnails()
+            self.update_athlete_list()
+            
+            messagebox.showinfo("Успех", f"Удалено {deleted_count} попыток")
+
+    def select_all_attempts(self):
+        """Выбирает все отображаемые попытки"""
+        # Получаем отфильтрованные попытки
+        filtered_files = self.get_filtered_attempts()
+        attempts = [os.path.basename(f) for f in filtered_files]
+        
+        # Выбираем все попытки
+        self.selected_attempts = set(attempts)
+        
+        # Обновляем чекбоксы
+        for attempt, checkbox_var in self.attempt_checkboxes.items():
+            if attempt in self.selected_attempts:
+                checkbox_var.set(True)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def deselect_all_attempts(self):
+        """Снимает выделение со всех попыток"""
+        # Очищаем выбранные попытки
+        self.selected_attempts.clear()
+        
+        # Обновляем чекбоксы
+        for checkbox_var in self.attempt_checkboxes.values():
+            checkbox_var.set(False)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def toggle_attempt_rating(self, attempt, rating_type):
+        """Переключает рейтинг попытки"""
+        if attempt not in self.attempt_ratings:
+            self.attempt_ratings[attempt] = {'up': False, 'down': False}
+        
+        # Переключаем состояние
+        self.attempt_ratings[attempt][rating_type] = not self.attempt_ratings[attempt][rating_type]
+        
+        # Сохраняем рейтинги
+        self.save_ratings()
+        
+        # Обновляем интерфейс
+        self.update_attempt_thumbnails()
+
+    def update_rating_button_style(self, up_button, down_button, rating_state):
+        """Обновляет стиль кнопок рейтинга"""
+        if rating_state['up']:
+            up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black', 
+                           text='👍', font=('Arial', 9, 'normal'),
+                           bd=2, highlightbackground='blue')
+        else:
+            up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                           text='👍', font=('Arial', 9, 'normal'),
+                           bd=1, highlightbackground='SystemButtonFace')
+            
+        if rating_state['down']:
+            down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                             text='👎', font=('Arial', 9, 'normal'),
+                             bd=2, highlightbackground='blue')
+        else:
+            down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                             text='👎', font=('Arial', 9, 'normal'),
+                             bd=1, highlightbackground='SystemButtonFace')
+
+    def toggle_rating_filter(self, rating_type):
+        """Переключает фильтр по рейтингу"""
+        if rating_type in self.active_rating_filters:
+            self.active_rating_filters.remove(rating_type)
+        else:
+            self.active_rating_filters.add(rating_type)
+        
+        # Обновляем стиль кнопок фильтров
+        self.update_filter_button_styles()
+        
+        # Обновляем отображение попыток
+        self.update_attempt_thumbnails()
+
+    def update_filter_button_styles(self):
+        """Обновляет стиль кнопок фильтров"""
+        if "up" in self.active_rating_filters:
+            self.filter_up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                                       text='👍', font=('Arial', 11, 'normal'),
+                                       bd=2, highlightbackground='blue')
+        else:
+            self.filter_up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                                       text='👍', font=('Arial', 11, 'normal'),
+                                       bd=2, highlightbackground='SystemButtonFace')
+            
+        if "down" in self.active_rating_filters:
+            self.filter_down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                                         text='👎', font=('Arial', 11, 'normal'),
+                                         bd=2, highlightbackground='blue')
+        else:
+            self.filter_down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                                         text='👎', font=('Arial', 11, 'normal'),
+                                         bd=2, highlightbackground='SystemButtonFace')
 
     def on_attempt_double_click(self, event, attempt):
         """Обработчик двойного клика по попытке"""
@@ -1086,13 +1341,32 @@ class FreestyleParserApp:
         files = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
         files = [os.path.join(self.output_folder, f) for f in files]
 
+        # Применяем фильтр по атлетам
         if self.filter_var.get() == "Все":
-            return sorted(files)
+            filtered_files = files
         elif self.filter_var.get() == "Неизвестно":
             assigned = set(sum(self.athlete_mapping.values(), []))
-            return sorted([f for f in files if f not in assigned])
+            filtered_files = [f for f in files if f not in assigned]
         else:
-            return sorted(self.athlete_mapping.get(self.filter_var.get(), []))
+            filtered_files = self.athlete_mapping.get(self.filter_var.get(), [])
+
+        # Применяем фильтры по рейтингу
+        if self.active_rating_filters:
+            rating_filtered_files = []
+            for file_path in filtered_files:
+                file_name = os.path.basename(file_path)
+                if file_name in self.attempt_ratings:
+                    rating = self.attempt_ratings[file_name]
+                    # Показываем файл, если он соответствует хотя бы одному активному фильтру
+                    if any(rating.get(filter_type, False) for filter_type in self.active_rating_filters):
+                        rating_filtered_files.append(file_path)
+                else:
+                    # Если у файла нет рейтинга, показываем его только если нет активных фильтров
+                    if not self.active_rating_filters:
+                        rating_filtered_files.append(file_path)
+            filtered_files = rating_filtered_files
+
+        return sorted(filtered_files)
 
     def on_attempt_drag_start(self, event, attempt):
         """Обработчик начала перетаскивания попытки"""
@@ -1177,6 +1451,9 @@ class FreestyleParserApp:
 
         # Перезагружаем маппинг из новой папки
         self.load_athlete_mapping()
+        
+        # Загружаем рейтинги
+        self.load_ratings()
 
         # Обновляем интерфейс
         self.update_athlete_list()

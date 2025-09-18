@@ -1,9 +1,10 @@
-./dist
-./bin
-./build
+.dist
+.bin
+.build
 ./__pycache__
 ./venv
 ./.FreestyleParser
 FreestyleParser.spec
 temp
 *.zip
+.idea

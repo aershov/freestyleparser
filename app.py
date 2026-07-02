@@ -1126,7 +1126,19 @@ class FreestyleParserApp:
                 return
 
             if sys.platform == "darwin":  # macOS
-                subprocess.Popen(['open', '-a', 'VLC', abs_path])
+                # Скрипт открывает файл и сразу запускает воспроизведение
+                applescript = f'''
+                tell application "QuickTime Player"
+                    activate
+                    set current_movie to open POSIX file "{abs_path}"
+                    set current time of current_movie to 0.7
+                    play current_movie
+                end tell
+                '''
+                # Запускаем AppleScript через subprocess
+                subprocess.run(["osascript", "-e", applescript])
+                # subprocess.run(["open", "-a", "QuickTime Player", abs_path])
+                # subprocess.Popen(['open', '-a', 'VLC', abs_path])
             elif sys.platform == "win32":  # Windows
                 # Пробуем найти VLC в стандартных местах установки
                 vlc_paths = [

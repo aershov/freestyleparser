@@ -193,7 +193,21 @@ class FreestyleParserApp:
             self.log(f"Пропускаем попытку {attempt.number}: start={attempt.start:.2f}s >= end={attempt.end:.2f}s")
             return self.processing
         self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {duration:.2f}s)")
-        subprocess.run([get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video, "-t", str(duration), "-c", "copy", output_file], check=True)
+        try:
+            result = subprocess.run(
+                [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
+                 "-t", str(duration), "-c", "copy", output_file],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                self.log(f"Ошибка ffmpeg для попытки {attempt.number}: {result.stderr[-500:]}", logging.ERROR)
+                return self.processing
+        except subprocess.TimeoutExpired:
+            self.log(f"Таймаут ffmpeg для попытки {attempt.number} (>300с)", logging.ERROR)
+            return self.processing
+        except Exception as e:
+            self.log(f"Ошибка запуска ffmpeg для попытки {attempt.number}: {e}", logging.ERROR)
+            return self.processing
         # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
 
         self.need_update_attempts = True
@@ -1485,6 +1499,12 @@ class GuiLogHandler(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record)
+        try:
+            self.app.root.after(0, lambda: self._append_log(msg))
+        except RuntimeError:
+            pass
+
+    def _append_log(self, msg):
         self.app.log_text.configure(state='normal')
         self.app.log_text.insert(tk.END, msg + '\n')
 

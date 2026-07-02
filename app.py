@@ -188,8 +188,12 @@ class FreestyleParserApp:
         # cv2.imwrite(pers_file_path, attempt.person_frame)
         # self.log(f"Colors {colors}")
         output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
-        self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
-        subprocess.run([get_ffmpeg_path(), "-i", attempt.source_video, "-ss", str(attempt.start), "-to", str(attempt.end), "-c", "copy", output_file], check=True)
+        duration = attempt.end - attempt.start
+        if duration <= 0:
+            self.log(f"Пропускаем попытку {attempt.number}: start={attempt.start:.2f}s >= end={attempt.end:.2f}s")
+            return self.processing
+        self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {duration:.2f}s)")
+        subprocess.run([get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video, "-t", str(duration), "-c", "copy", output_file], check=True)
         # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
 
         self.need_update_attempts = True

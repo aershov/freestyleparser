@@ -41,6 +41,47 @@ def safe_print(*args, **kwargs):
     """Потокобезопасный вывод в консоль"""
     print(*args, **kwargs)
 
+
+def _finalize_attempt(attempt_number, start_time, end_time, total_frames, fps,
+                      person_bbox, base_frame, best_frame, person_frame,
+                      fallback_frame, video_file, callback):
+    """Создаёт попытку и вызывает callback. Возвращает (attempt, attempt_number) или (None, attempt_number) или (False, attempt_number) для стопа."""
+    start1 = max(0, start_time - ATTEMPT_START_PADDING)
+    end1 = min(end_time + ATTEMPT_END_PADDING, total_frames / fps)
+
+    if end1 <= start1:
+        safe_print(f"  [SKIP] Попытка #{attempt_number}: start ({start1:.2f}s) >= end ({end1:.2f}s)")
+        return None, attempt_number
+
+    duration = end1 - start1
+    if duration < MIN_ATTEMPT_DURATION:
+        safe_print(f"  [SKIP] Попытка #{attempt_number}: duration {duration:.2f}s < {MIN_ATTEMPT_DURATION}s")
+        return None, attempt_number
+
+    if person_bbox is None:
+        safe_print(f"  [SKIP] Попытка #{attempt_number}: нет данных о позиции человека")
+        return None, attempt_number
+
+    x1, y1, x2, y2 = map(int, person_bbox)
+    try:
+        bf = base_frame[y1:y2, x1:x2]
+    except:
+        bf = fallback_frame[y1:y2, x1:x2]
+
+    attempt = AttemptInfo(number=attempt_number,
+                          base_frame=bf,
+                          best_frame=best_frame,
+                          person_frame=person_frame,
+                          person_bbox=person_bbox,
+                          source_video=video_file,
+                          start=start1, end=end1)
+    attempt_number += 1
+    need_stop = not callback(attempt)
+    if need_stop:
+        return False, attempt_number
+    return attempt, attempt_number
+
+
 def process_video(input_paths, roi, callback, begin_attempt_number=1):
     # Загрузка модели YOLO
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '', 'models/yolo11s-seg.pt')
@@ -77,13 +118,20 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
         person_bbox = None
         current_frame_small = None
         best_frame_original = None  # Оригинальный кадр без маски для превью
+        small_frame_original = None
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret or (cap.get(cv2.CAP_PROP_POS_FRAMES) >= frame_limit):
                 break
 
-            if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) % FRAME_SKIP == 0:
+            current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if current_frame_num % FRAME_SKIP == 0:
+                current_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if in_attempt and current_frame_num % (FRAME_SKIP * 50) == 0:
+                    safe_print(f"  [{os.path.basename(video_file)}] frame {current_frame_num}/{total_frames}, {current_sec:.1f}s, in attempt #{attempt_number}")
+                elif current_frame_num % (FRAME_SKIP * 100) == 0:
+                    safe_print(f"  [{os.path.basename(video_file)}] frame {current_frame_num}/{total_frames}, {current_sec:.1f}s")
                 # Сохраняем оригинальный кадр для превью
                 original_frame = frame.copy()
                 
@@ -167,37 +215,23 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
                         best_frame_confidence = 0
                         end_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-                        if end_time - start_time >= MIN_ATTEMPT_DURATION:
-                            start1 = max(0, start_time - ATTEMPT_START_PADDING)
-                            end1 =  min(end_time + ATTEMPT_END_PADDING, total_frames / fps)
-
-
-                            x1, y1, x2, y2 = map(int, person_bbox)
-                            try:
-                                bf = base_frame[y1:y2, x1:x2]
-                            except:
-                                bf = small_frame_original[y1:y2, x1:x2]
-
-                            end1
-
-                            attempt = AttemptInfo(number = attempt_number,
-                                                  base_frame=bf,
-                                                  best_frame=best_frame,
-                                                  person_frame=person_frame,
-                                                  person_bbox=person_bbox,
-                                                  source_video=video_file,
-                                                  start = start1, end=end1)
-                            # output_file = os.path.join(output_folder, f"{attempt.number:04d}.mp4")
-                            # safe_print(f"Saving attempt {attempt_number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
-                            # subprocess.run([get_ffmpeg_path(), "-i", video_file, "-ss", str(attempt.start), "-to", str(attempt.end), "-c", "copy", output_file], check=True)
-                            # safe_print(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
-                            attempt_number += 1
-                            need_stop = not callback(attempt)
-                            # need_stop = callback(output_file)
+                        result, attempt_number = _finalize_attempt(
+                            attempt_number, start_time, end_time, total_frames, fps,
+                            person_bbox, base_frame, best_frame, person_frame,
+                            small_frame_original, video_file, callback)
+                        if result is not None:
                             best_frame = None
                             base_frame = None
-                            if need_stop:
-                                cap.release()
-                                return
+                        if result is False:
+                            cap.release()
+                            return
+
+        if in_attempt and start_time is not None:
+            end_time = total_frames / fps
+            safe_print(f"  [{os.path.basename(video_file)}] Финализация попытки #{attempt_number} на конце видео ({end_time:.1f}s)")
+            result, attempt_number = _finalize_attempt(
+                attempt_number, start_time, end_time, total_frames, fps,
+                person_bbox, base_frame, best_frame, person_frame,
+                small_frame_original, video_file, callback)
 
         cap.release()

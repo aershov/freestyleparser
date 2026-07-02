@@ -169,7 +169,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1):
 
                         if end_time - start_time >= MIN_ATTEMPT_DURATION:
                             start1 = max(0, start_time - ATTEMPT_START_PADDING)
-                            end1 =  min(end_time + ATTEMPT_END_PADDING, (total_frames * fps)/1000.0)
+                            end1 =  min(end_time + ATTEMPT_END_PADDING, total_frames / fps)
 
 
                             x1, y1, x2, y2 = map(int, person_bbox)

@@ -1153,8 +1153,7 @@ class FreestyleParserApp:
                     play current_movie
                 end tell
                 '''
-                # Запускаем AppleScript через subprocess
-                subprocess.run(["osascript", "-e", applescript])
+                subprocess.Popen(["osascript", "-e", applescript], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 # subprocess.run(["open", "-a", "QuickTime Player", abs_path])
                 # subprocess.Popen(['open', '-a', 'VLC', abs_path])
             elif sys.platform == "win32":  # Windows

@@ -199,7 +199,7 @@ def process_video(video_path, output_dir, model, time_limit=None, total_duration
 
 def main():
     args = parse_arguments()
-    model = YOLO('yolov8n.pt')
+    model = YOLO('models/yolo11s-seg.pt')
     video_files = get_video_files(args.input, args.inputFiles)
     if not video_files:
         safe_print(f"No video files found in {args.input}")

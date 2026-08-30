@@ -6,7 +6,6 @@ from PIL import Image, ImageTk
 import subprocess
 import datetime
 import threading
-import queue
 import yaml
 import logging
 import shutil
@@ -14,7 +13,7 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video
+from splitter import process_video, DEFAULT_PROCESSING_PARAMS
 import sys
 import traceback
 
@@ -23,15 +22,47 @@ THUMB_Y = 120
 
 logging.basicConfig(level=logging.INFO)
 
-CANVAS_WIDTH = 480
 CANVAS_HEIGHT = 240
 
 MAX_LOG_LINES = 200
+
+def point_in_polygon(point, polygon):
+    """
+    Проверяет, находится ли точка внутри многоугольника
+    Использует алгоритм ray casting
+    """
+    x, y = point
+    n = len(polygon)
+    inside = False
+    
+    p1x, p1y = polygon[0]
+    for i in range(n + 1):
+        p2x, p2y = polygon[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    
+    return inside
+
+def create_polygon_mask(polygon_points, width, height):
+    """
+    Создает маску многоугольника для проверки попадания точек
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    polygon_array = np.array(polygon_points, dtype=np.int32)
+    cv2.fillPoly(mask, [polygon_array], 255)
+    return mask
 
 class FreestyleParserApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Freestyle Parser")
+        self.root.geometry("1605x900")
 
         # Инициализируем переменные
         current_date = datetime.date.today()
@@ -40,21 +71,25 @@ class FreestyleParserApp:
         if not os.path.exists(self._app_folder):
             os.makedirs(self._app_folder, exist_ok=True)
         self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")
-        self.processing_config_file = None
+        self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
         #TODO почистить это всё (
-        self.roi = None
+        self.roi = None  # Теперь это будет список точек многоугольника в процентах
+        self.roi_points = []  # Точки многоугольника в пикселях canvas
+        self.roi_mode = "polygon"  # "rectangle" или "polygon"
+        self.drawing_polygon = False
         self.logger = None
         self.selected_files = []
         self.processing = False
         self.need_update_attempts = False
-        self.need_update_ui_state = False
-        # Логи из рабочих потоков складываются в очередь, GUI вычитывает её в главном потоке
-        self.log_queue = queue.Queue()
-        self._progress_percent = 0.0
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value="Все")
-
+        self.selected_attempts = set()  # Множество выбранных попыток
+        self.attempt_checkboxes = {}  # Словарь для хранения чекбоксов попыток
+        self.attempt_ratings = {}  # Словарь для хранения рейтингов попыток: {attempt: {'up': bool, 'down': bool}}
+        self.active_rating_filters = set()  # Множество активных фильтров по рейтингу
+        self.processing_params = DEFAULT_PROCESSING_PARAMS.copy()
+        self._progress_percent = 0.0
 
         # self.on_output_folder_changed()
 
@@ -72,14 +107,6 @@ class FreestyleParserApp:
             self.need_update_attempts = False
         if self.processing:
             self.progress_var.set(min(self._progress_percent, 100.0))
-        if self.need_update_ui_state:
-            # Состояние обработки изменил рабочий поток - кнопки трогаем только здесь,
-            # в главном потоке
-            self.need_update_ui_state = False
-            self.button_process.config(state=tk.NORMAL)
-            self.button_stop.config(state=tk.DISABLED)
-            self.progress_var.set(100 if self._progress_percent >= 100 else 0)
-        self.flush_log_queue()
         self.root.after(1000, self.periodic_update)
 
     def on_attempt_drag_end(self, event, attempt):
@@ -134,10 +161,17 @@ class FreestyleParserApp:
         """Обработчик изменения фильтра"""
         self.need_update_attempts = True  # Устанавливаем флаг обновления
 
+    @property
+    def canvas_width(self):
+        w = self.canvas.winfo_width()
+        return w if w > 1 else 480
+
     def start_processing(self):
         """Запускает обработку видео"""
 
+        self._sync_params_from_ui()
         # на случай, если папка по умолчанию, надо добавить проверку и делать это только если output_folder не exists
+        self.save_processing_config()
         self.on_output_folder_changed()
         if not self.selected_files:
             messagebox.showwarning("Предупреждение", "Сначала выберите файлы для обработки")
@@ -146,7 +180,6 @@ class FreestyleParserApp:
         if not self.roi:
             messagebox.showwarning("Предупреждение", "Сначала выберите область интереса")
             return
-        self.save_processing_config()  # Сохраняем ROI при изменении
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
@@ -156,31 +189,77 @@ class FreestyleParserApp:
         # Запускаем обработку в отдельном потоке
         threading.Thread(target=self.process_videos, daemon=True).start()
 
-    def on_attempt_file_created(self, file):
+    def on_attempt_file_created(self, attempt):
+        ## TODO analyze best_frame
+        cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
+        # cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
+        # person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
+        # colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
+        # pers_file_path = os.path.join(self.output_folder, f"{attempt.number:04d}-person-{colors}.jpg")
+        # cv2.imwrite(pers_file_path, attempt.person_frame)
+        # self.log(f"Colors {colors}")
+        output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
+        duration = attempt.end - attempt.start
+        if duration <= 0:
+            self.log(f"Пропускаем попытку {attempt.number}: start={attempt.start:.2f}s >= end={attempt.end:.2f}s")
+            return self.processing
+        self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {duration:.2f}s)")
+        try:
+            result = subprocess.run(
+                [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
+                 "-t", str(duration), "-c", "copy", "-y", output_file],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                self.log(f"Ошибка ffmpeg для попытки {attempt.number}: {result.stderr[-500:]}", logging.ERROR)
+                return self.processing
+        except subprocess.TimeoutExpired:
+            self.log(f"Таймаут ffmpeg для попытки {attempt.number} (>300с)", logging.ERROR)
+            return self.processing
+        except Exception as e:
+            self.log(f"Ошибка запуска ffmpeg для попытки {attempt.number}: {e}", logging.ERROR)
+            return self.processing
+        # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
+
         self.need_update_attempts = True
-        self.log(f"Видео попытки готово: {file}")
+        self.log(f"Видео попытки готово: {output_file}")
         # сообщаем, продолжать или нет (если была отмена кнопкой - то остановимся)
         return self.processing
+
+    def get_colors_from_athlete(self, frame_bg, frame_with, bbox=None, k=5, threshold=10):
+        roi = extract_athlete_difference(frame_bg, frame_with, bbox)
+        if roi is None:
+            return []
+
+        # --- Фильтруем пустые/неподходящие регионы ---
+        non_zero_pixels = cv2.countNonZero(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+        total_pixels = roi.shape[0] * roi.shape[1]
+        if total_pixels == 0 or non_zero_pixels / total_pixels < 0.05:
+            print("[INFO] ROI слишком мал или пуст")
+            return []
+
+        # --- Анализируем цвета только в этой области ---
+        dominant_colors = get_dominant_colors(roi, k, threshold)
+
+        return dominant_colors
+
 
     def process_videos(self):
         """Обрабатывает видео в отдельном потоке"""
         try:
-            process_video(
-                self.selected_files,
-                self.output_folder,
-                self.roi,
-                self.on_attempt_file_created,
-                progress_callback=self.on_processing_progress,
-                should_continue=lambda: self.processing,
-            )
-            self.log("Обработка файлов завершена.")
+            next_attempt_number = get_next_attempt_number(self.output_folder)
+            process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
+                          next_attempt_number, params=self.processing_params,
+                          progress_callback=self.on_processing_progress,
+                          should_continue=lambda: self.processing)
+            self.log(f"Файлы {self.selected_files} успешно обработаны.")
         except Exception as e:
             error_trace = traceback.format_exc()
             self.log(f"Ошибка обработки: {e} {error_trace}")
         finally:
             self.processing = False
-            # Кнопки и прогресс обновляются в главном потоке через periodic_update
-            self.need_update_ui_state = True
+            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
 
     def on_processing_progress(self, file_index, file_count, frame_index, total_frames):
         """Прогресс обработки. Вызывается из рабочего потока, поэтому только считаем
@@ -259,6 +338,28 @@ class FreestyleParserApp:
         except Exception as e:
             self.log(f"Ошибка при сохранении маппинга: {str(e)}")
 
+    def save_ratings(self):
+        """Сохраняет рейтинги попыток в файл"""
+        ratings_file = os.path.join(self.output_folder, "ratings.yaml")
+        try:
+            with open(ratings_file, 'w', encoding='utf-8') as f:
+                yaml.dump(self.attempt_ratings, f, default_flow_style=False, allow_unicode=True)
+        except Exception as e:
+            self.log(f"Ошибка при сохранении рейтингов: {str(e)}")
+
+    def load_ratings(self):
+        """Загружает рейтинги попыток из файла"""
+        ratings_file = os.path.join(self.output_folder, "ratings.yaml")
+        if os.path.exists(ratings_file):
+            try:
+                with open(ratings_file, 'r', encoding='utf-8') as f:
+                    self.attempt_ratings = yaml.safe_load(f) or {}
+            except Exception as e:
+                self.log(f"Ошибка при загрузке рейтингов: {str(e)}")
+                self.attempt_ratings = {}
+        else:
+            self.attempt_ratings = {}
+
     def add_athlete(self):
         """Добавляет нового атлета"""
         name = simpledialog.askstring("Новый атлет", "Введите имя атлета:")
@@ -325,59 +426,105 @@ class FreestyleParserApp:
         self.main_frame.add(self.top_frame)
 
         # === ЛЕВЫЙ БЛОК ===
-        self.left_frame = tk.Frame(self.top_frame)
-        self.top_frame.add(self.left_frame)
+        self.left_frame = tk.Frame(self.top_frame, width=460)
+        self.top_frame.add(self.left_frame, width=460, minsize=425)
 
         # --- Выбор файлов ---
         self.frame_files = tk.LabelFrame(self.left_frame, text="Файлы")
         self.frame_files.pack(pady=10, fill=tk.X)
 
-        self.label_files = tk.Label(self.frame_files, text="Выбранные файлы:")
+        files_inner = tk.Frame(self.frame_files)
+        files_inner.pack(fill=tk.X, padx=5, pady=5)
+
+        # Левая часть — входные файлы (фиксированная ширина)
+        files_left = tk.Frame(files_inner)
+        files_left.pack(side=tk.LEFT)
+
+        self.label_files = tk.Label(files_left, text="Входные файлы:")
         self.label_files.pack(anchor=tk.W)
 
-        self.listbox_files = tk.Listbox(self.frame_files, height=5, width=40)
-        self.listbox_files.pack(side=tk.LEFT, padx=5)
+        self.listbox_files = tk.Listbox(files_left, height=5, width=22)
+        self.listbox_files.pack(fill=tk.X, padx=5)
         self.listbox_files.bind('<<ListboxSelect>>', self.on_file_select)
 
-        self.button_select_files = tk.Button(self.frame_files, text="Выбрать файлы", command=self.select_files)
-        self.button_select_files.pack(pady=5)
+        self.button_select_files = tk.Button(files_left, text="Выбрать файлы", command=self.select_files)
+        self.button_select_files.pack(fill=tk.X, padx=5, pady=5)
 
-        self.button_show_screenshot = tk.Button(self.frame_files, text="Область интереса", command=self.show_next_frame)
-        self.button_show_screenshot.pack(pady=5)
+        # Правая часть — выходная папка
+        files_right = tk.Frame(files_inner)
+        files_right.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.label_output = tk.Label(files_right, text="Выходная папка:")
+        self.label_output.pack(anchor=tk.W)
+
+        self.entry_output = tk.Entry(files_right, width=22)
+        self.entry_output.pack(fill=tk.X, padx=5, pady=2)
+        self.entry_output.insert(0, os.path.basename(self.output_folder))
+
+        output_btn_inner = tk.Frame(files_right)
+        output_btn_inner.pack(fill=tk.X, padx=5, pady=5)
+
+        self.button_change_output = tk.Button(output_btn_inner, text="Изменить", command=self.change_output_folder)
+        self.button_change_output.pack(side=tk.LEFT, padx=2)
+
+        self.button_open_output = tk.Button(output_btn_inner, text="Открыть", command=self.open_output_folder)
+        self.button_open_output.pack(side=tk.LEFT, padx=2)
 
         # --- ROI Canvas ---
         self.frame_roi = tk.LabelFrame(self.left_frame, text="Область интереса")
         self.frame_roi.pack(pady=10, fill=tk.X)
 
-        self.label_roi = tk.Label(self.frame_roi, text="Выберите область интереса:")
+        # Кнопки для переключения режимов ROI
+        self.frame_roi_controls = tk.Frame(self.frame_roi)
+        self.frame_roi_controls.pack(pady=5)
+        
+        self.button_rectangle_mode = tk.Button(self.frame_roi_controls, text="Прямоугольник", 
+                                              command=lambda: self.switch_roi_mode("rectangle"))
+        self.button_rectangle_mode.pack(side=tk.LEFT, padx=5)
+        
+        self.button_polygon_mode = tk.Button(self.frame_roi_controls, text="Многоугольник", 
+                                            command=lambda: self.switch_roi_mode("polygon"))
+        self.button_polygon_mode.pack(side=tk.LEFT, padx=5)
+        
+        self.button_clear_roi = tk.Button(self.frame_roi_controls, text="Очистить", 
+                                         command=self.clear_roi)
+        self.button_clear_roi.pack(side=tk.LEFT, padx=5)
+
+        self.label_roi = tk.Label(self.frame_roi, text="Кликните по точкам многоугольника. Двойной клик завершает:")
         self.label_roi.pack()
 
-        self.canvas = tk.Canvas(self.frame_roi, width=CANVAS_WIDTH, height=CANVAS_HEIGHT, bg="black")
-        self.canvas.pack()
+        self.canvas = tk.Canvas(self.frame_roi, height=CANVAS_HEIGHT, bg="black")
+        self.canvas.pack(pady=5, fill=tk.X)
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", self.finish_polygon)  # Двойной клик завершает многоугольник
 
-        # --- Выходная папка и управление ---
+        # --- Параметры обработки ---
         self.frame_output = tk.LabelFrame(self.left_frame, text="Настройки")
         self.frame_output.pack(pady=10, fill=tk.X)
 
-        self.label_output = tk.Label(self.frame_output, text="Выходная папка:")
-        self.label_output.pack(anchor=tk.W)
+        param_defs = [
+            ('min_pause_duration', 'Пауза между попытками'),
+            ('min_attempt_duration', 'Мин. длит. попытки'),
+            ('attempt_start_padding', 'Запас к началу'),
+            ('attempt_end_padding', 'Запас к концу'),
+            ('min_detection_strength', 'Мин. сила детекции (0-1)'),
+        ]
 
-        output_inner = tk.Frame(self.frame_output)
-        output_inner.pack(fill=tk.X)
-
-        self.entry_output = tk.Entry(output_inner, width=30)
-        self.entry_output.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.entry_output.insert(0, self.output_folder)
-
-        self.button_change_output = tk.Button(output_inner, text="Изменить", command=self.change_output_folder)
-        self.button_change_output.pack(side=tk.LEFT, padx=2)
-
-        self.button_open_output = tk.Button(output_inner, text="Открыть", command=self.open_output_folder)
-        self.button_open_output.pack(side=tk.LEFT, padx=2)
+        self.param_vars = {}
+        for i, (key, label_text) in enumerate(param_defs):
+            col = i % 2
+            if col == 0:
+                row_frame = tk.Frame(self.frame_output)
+                row_frame.pack(fill=tk.X, pady=2, padx=5)
+            label = tk.Label(row_frame, text=label_text, anchor=tk.W)
+            label.pack(side=tk.LEFT, padx=(0, 2))
+            var = tk.StringVar(value=str(self.processing_params[key]))
+            entry = tk.Entry(row_frame, textvariable=var, width=6)
+            entry.pack(side=tk.LEFT, padx=(0, 15))
+            self.param_vars[key] = var
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
@@ -399,7 +546,43 @@ class FreestyleParserApp:
 
         # --- Попытки ---
         self.frame_attempts = tk.LabelFrame(self.right_frame, text="Попытки")
-        self.right_frame.add(self.frame_attempts, width=800)  # 80% ширины
+        self.right_frame.add(self.frame_attempts, width=950)  # ~75% ширины
+
+        # Область действий
+        self.actions_frame = tk.Frame(self.frame_attempts)
+        self.actions_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Счетчик выбранных попыток
+        self.selected_count_label = tk.Label(self.actions_frame, text="Выбрано: 0")
+        self.selected_count_label.pack(side=tk.LEFT, padx=5)
+
+        # Фильтры по меткам
+        self.rating_filters_frame = tk.Frame(self.actions_frame)
+        self.rating_filters_frame.pack(side=tk.LEFT, padx=20)
+
+        # Кнопка фильтра "палец вверх"
+        self.filter_up_button = tk.Button(self.rating_filters_frame, text="👍", 
+                                        command=lambda: self.toggle_rating_filter("up"),
+                                        font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
+        self.filter_up_button.pack(side=tk.LEFT, padx=2)
+
+        # Кнопка фильтра "палец вниз"
+        self.filter_down_button = tk.Button(self.rating_filters_frame, text="👎", 
+                                          command=lambda: self.toggle_rating_filter("down"),
+                                          font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
+        self.filter_down_button.pack(side=tk.LEFT, padx=2)
+
+        # Кнопка "Выбрать все"
+        self.select_all_button = tk.Button(self.actions_frame, text="Выбрать все", command=self.select_all_attempts)
+        self.select_all_button.pack(side=tk.RIGHT, padx=5)
+
+        # Кнопка "Снять выделение"
+        self.deselect_all_button = tk.Button(self.actions_frame, text="Снять выделение", command=self.deselect_all_attempts)
+        self.deselect_all_button.pack(side=tk.RIGHT, padx=5)
+
+        # Кнопка удаления
+        self.delete_button = tk.Button(self.actions_frame, text="🗑️ Удалить", command=self.delete_selected_attempts)
+        self.delete_button.pack(side=tk.RIGHT, padx=5)
 
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
@@ -483,20 +666,18 @@ class FreestyleParserApp:
         for widget in self.attempts_scrollable_frame.winfo_children():
             widget.destroy()
 
-        # Получаем все попытки
-        if not os.path.isdir(self.output_folder):
-            return
-        attempts = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
+        # Получаем отфильтрованные попытки
+        filtered_files = self.get_filtered_attempts()
+        attempts = [os.path.basename(f) for f in filtered_files]
 
-        # Фильтруем попытки
-        filter_name = self.filter_var.get()
-        if filter_name != "Все":
-            if filter_name == "Неизвестно":
-                # Показываем только непривязанные попытки
-                attempts = [a for a in attempts if not any(a in v for v in self.athlete_mapping.values())]
-            else:
-                # Показываем попытки выбранного атлета
-                attempts = [self.get_relative_path(p) for p in self.athlete_mapping.get(filter_name, [])]
+        # Очищаем выбранные попытки, которые больше не существуют
+        self.selected_attempts = {attempt for attempt in self.selected_attempts if attempt in attempts}
+
+        # Очищаем словарь чекбоксов
+        self.attempt_checkboxes.clear()
+
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
 
         # Сортируем попытки по имени
         attempts.sort()
@@ -529,9 +710,45 @@ class FreestyleParserApp:
                     label.image = photo  # Сохраняем ссылку
                     label.pack()
 
+                    # Создаем фрейм для имени файла и чекбокса
+                    name_frame = tk.Frame(frame)
+                    name_frame.pack()
+
+                    # Создаем чекбокс
+                    var = tk.BooleanVar(value=attempt in self.selected_attempts)
+                    checkbox = tk.Checkbutton(name_frame, variable=var, 
+                                            command=lambda a=attempt, v=var: self.on_attempt_checkbox_change(a, v))
+                    checkbox.pack(side=tk.LEFT, padx=(0, 5))
+                    
+                    # Сохраняем ссылку на чекбокс
+                    self.attempt_checkboxes[attempt] = var
+
                     # Добавляем имя файла
-                    name_label = tk.Label(frame, text=os.path.basename(attempt))
-                    name_label.pack()
+                    name_label = tk.Label(name_frame, text=os.path.basename(attempt))
+                    name_label.pack(side=tk.LEFT)
+
+                    # Добавляем кнопки рейтинга
+                    rating_frame = tk.Frame(name_frame)
+                    rating_frame.pack(side=tk.RIGHT, padx=(10, 0))
+
+                    # Инициализируем рейтинг для попытки, если его нет
+                    if attempt not in self.attempt_ratings:
+                        self.attempt_ratings[attempt] = {'up': False, 'down': False}
+
+                    # Кнопка "палец вверх"
+                    up_button = tk.Button(rating_frame, text="👍", width=3, height=1,
+                                       command=lambda a=attempt: self.toggle_attempt_rating(a, "up"),
+                                       font=('Arial', 9, 'normal'), bd=1)
+                    up_button.pack(side=tk.LEFT, padx=1)
+                    
+                    # Кнопка "палец вниз"
+                    down_button = tk.Button(rating_frame, text="👎", width=3, height=1,
+                                         command=lambda a=attempt: self.toggle_attempt_rating(a, "down"),
+                                         font=('Arial', 9, 'normal'), bd=1)
+                    down_button.pack(side=tk.LEFT, padx=1)
+
+                    # Обновляем стиль кнопок в зависимости от текущего состояния
+                    self.update_rating_button_style(up_button, down_button, self.attempt_ratings[attempt])
 
                     # Добавляем обработчики событий
                     label.bind('<Button-1>', lambda e, a=attempt: self.on_attempt_drag_start(e, a))
@@ -549,6 +766,163 @@ class FreestyleParserApp:
             if col >= max_cols:
                 col = 0
                 row += 1
+
+    def on_attempt_checkbox_change(self, attempt, var):
+        """Обработчик изменения состояния чекбокса попытки"""
+        if var.get():
+            self.selected_attempts.add(attempt)
+        else:
+            self.selected_attempts.discard(attempt)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def delete_selected_attempts(self):
+        """Удаляет выбранные попытки"""
+        if not self.selected_attempts:
+            messagebox.showwarning("Предупреждение", "Не выбрано ни одной попытки для удаления")
+            return
+
+        # Запрашиваем подтверждение
+        count = len(self.selected_attempts)
+        result = messagebox.askyesno("Подтверждение", 
+                                   f"Вы уверены, что хотите удалить {count} попытку(и)?\n"
+                                   "Это действие нельзя отменить.")
+
+        if result:
+            deleted_count = 0
+            for attempt in self.selected_attempts:
+                try:
+                    # Получаем полные пути к файлам
+                    video_path = os.path.join(self.output_folder, attempt)
+                    thumbnail_path = os.path.join(self.output_folder, f"{os.path.splitext(attempt)[0]}.jpg")
+                    
+                    # Удаляем видео файл
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                        deleted_count += 1
+                    
+                    # Удаляем превью
+                    if os.path.exists(thumbnail_path):
+                        os.remove(thumbnail_path)
+                    
+                    # Удаляем из маппинга атлетов
+                    for athlete_name, attempts_list in self.athlete_mapping.items():
+                        if attempt in attempts_list:
+                            attempts_list.remove(attempt)
+                    
+                    self.log(f"Удален файл: {attempt}")
+                    
+                except Exception as e:
+                    self.log(f"Ошибка при удалении {attempt}: {str(e)}", logging.ERROR)
+            
+            # Очищаем выбранные попытки
+            self.selected_attempts.clear()
+            
+            # Обновляем счетчик
+            self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+            
+            # Обновляем интерфейс
+            self.update_attempt_thumbnails()
+            self.update_athlete_list()
+            
+            messagebox.showinfo("Успех", f"Удалено {deleted_count} попыток")
+
+    def select_all_attempts(self):
+        """Выбирает все отображаемые попытки"""
+        # Получаем отфильтрованные попытки
+        filtered_files = self.get_filtered_attempts()
+        attempts = [os.path.basename(f) for f in filtered_files]
+        
+        # Выбираем все попытки
+        self.selected_attempts = set(attempts)
+        
+        # Обновляем чекбоксы
+        for attempt, checkbox_var in self.attempt_checkboxes.items():
+            if attempt in self.selected_attempts:
+                checkbox_var.set(True)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def deselect_all_attempts(self):
+        """Снимает выделение со всех попыток"""
+        # Очищаем выбранные попытки
+        self.selected_attempts.clear()
+        
+        # Обновляем чекбоксы
+        for checkbox_var in self.attempt_checkboxes.values():
+            checkbox_var.set(False)
+        
+        # Обновляем счетчик
+        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+
+    def toggle_attempt_rating(self, attempt, rating_type):
+        """Переключает рейтинг попытки"""
+        if attempt not in self.attempt_ratings:
+            self.attempt_ratings[attempt] = {'up': False, 'down': False}
+        
+        # Переключаем состояние
+        self.attempt_ratings[attempt][rating_type] = not self.attempt_ratings[attempt][rating_type]
+        
+        # Сохраняем рейтинги
+        self.save_ratings()
+        
+        # Обновляем интерфейс
+        self.update_attempt_thumbnails()
+
+    def update_rating_button_style(self, up_button, down_button, rating_state):
+        """Обновляет стиль кнопок рейтинга"""
+        if rating_state['up']:
+            up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black', 
+                           text='👍', font=('Arial', 9, 'normal'),
+                           bd=2, highlightbackground='blue')
+        else:
+            up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                           text='👍', font=('Arial', 9, 'normal'),
+                           bd=1, highlightbackground='SystemButtonFace')
+            
+        if rating_state['down']:
+            down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                             text='👎', font=('Arial', 9, 'normal'),
+                             bd=2, highlightbackground='blue')
+        else:
+            down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                             text='👎', font=('Arial', 9, 'normal'),
+                             bd=1, highlightbackground='SystemButtonFace')
+
+    def toggle_rating_filter(self, rating_type):
+        """Переключает фильтр по рейтингу"""
+        if rating_type in self.active_rating_filters:
+            self.active_rating_filters.remove(rating_type)
+        else:
+            self.active_rating_filters.add(rating_type)
+        
+        # Обновляем стиль кнопок фильтров
+        self.update_filter_button_styles()
+        
+        # Обновляем отображение попыток
+        self.update_attempt_thumbnails()
+
+    def update_filter_button_styles(self):
+        """Обновляет стиль кнопок фильтров"""
+        if "up" in self.active_rating_filters:
+            self.filter_up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                                       text='👍', font=('Arial', 11, 'normal'),
+                                       bd=2, highlightbackground='blue')
+        else:
+            self.filter_up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                                       text='👍', font=('Arial', 11, 'normal'),
+                                       bd=2, highlightbackground='SystemButtonFace')
+            
+        if "down" in self.active_rating_filters:
+            self.filter_down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+                                         text='👎', font=('Arial', 11, 'normal'),
+                                         bd=2, highlightbackground='blue')
+        else:
+            self.filter_down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+                                         text='👎', font=('Arial', 11, 'normal'),
+                                         bd=2, highlightbackground='SystemButtonFace')
 
     def on_attempt_double_click(self, event, attempt):
         """Обработчик двойного клика по попытке"""
@@ -575,69 +949,80 @@ class FreestyleParserApp:
         if self.logger:
             self.logger.log(level, message)
 
-    def append_log_line(self, msg):
-        """Вставляет строку лога в окно. Только из главного потока."""
-        self.log_text.configure(state='normal')
-        self.log_text.insert(tk.END, msg + '\n')
-
-        # Ограничиваем количество строк
-        lines = self.log_text.get('1.0', tk.END).splitlines()
-        if len(lines) > MAX_LOG_LINES:
-            self.log_text.delete('1.0', f'{len(lines) - MAX_LOG_LINES + 1}.0')
-
-        self.log_text.see(tk.END)
-        self.log_text.configure(state='disabled')
-
-    def flush_log_queue(self):
-        """Вычитывает логи, накопленные рабочими потоками"""
-        try:
-            while True:
-                msg = self.log_queue.get_nowait()
-                self.append_log_line(msg)
-        except queue.Empty:
-            pass
-
     def on_click(self, event):
-        self.start_x = event.x
-        self.start_y = event.y
+        if self.roi_mode == "rectangle":
+            self.start_x = event.x
+            self.start_y = event.y
+            self.dragging = True
+        elif self.roi_mode == "polygon":
+            if not self.drawing_polygon:
+                # Начинаем рисовать новый многоугольник
+                self.roi_points = []
+                self.drawing_polygon = True
+                self.canvas.delete("roi_polygon")
+                self.canvas.delete("roi_points")
+            
+            # Добавляем точку
+            self.roi_points.append((event.x, event.y))
+            
+            # Рисуем точку
+            self.canvas.create_oval(event.x-3, event.y-3, event.x+3, event.y+3, 
+                                  fill="red", tags="roi_points")
+            
+            # Рисуем линии между точками
+            if len(self.roi_points) > 1:
+                prev_point = self.roi_points[-2]
+                self.canvas.create_line(prev_point[0], prev_point[1], event.x, event.y, 
+                                      fill="red", width=2, tags="roi_polygon")
 
     def on_drag(self, event):
-        self.canvas.delete("roi_rectangle")
-        self.end_x = event.x
-        self.end_y = event.y
-        self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
+        if self.dragging and self.roi_mode == "rectangle":
+            self.end_x = event.x
+            self.end_y = event.y
+            self.canvas.delete("roi_rectangle")
+            self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
 
     def on_release(self, event):
-        self.end_x = event.x
-        self.end_y = event.y
-        # Нормализуем прямоугольник: тянут справа-налево/снизу-вверх тоже валидны
-        x1, x2 = sorted((100 * self.start_x / CANVAS_WIDTH, 100 * self.end_x / CANVAS_WIDTH))
-        y1, y2 = sorted((100 * self.start_y / CANVAS_HEIGHT, 100 * self.end_y / CANVAS_HEIGHT))
-        x1, y1 = max(0.0, x1), max(0.0, y1)
-        x2, y2 = min(100.0, x2), min(100.0, y2)
+        if self.dragging and self.roi_mode == "rectangle":
+            self.dragging = False
+            self.end_x = event.x
+            self.end_y = event.y
+            self.roi = (100 * self.start_x/ self.canvas_width, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / self.canvas_width, 100* self.end_y/ CANVAS_HEIGHT)
+            self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
 
+    def finish_polygon(self, event):
+        """Завершает рисование многоугольника"""
+        if self.roi_mode == "polygon" and self.drawing_polygon and len(self.roi_points) >= 3:
+            # Замыкаем многоугольник
+            if len(self.roi_points) > 2:
+                first_point = self.roi_points[0]
+                last_point = self.roi_points[-1]
+                self.canvas.create_line(last_point[0], last_point[1], first_point[0], first_point[1], 
+                                      fill="red", width=2, tags="roi_polygon")
+            
+            # Сохраняем ROI в процентах
+            self.roi = [[100 * x / self.canvas_width, 100 * y / CANVAS_HEIGHT] for x, y in self.roi_points]
+            self.drawing_polygon = False
+            self.log(f"Многоугольная ROI создана с {len(self.roi_points)} точками")
+
+    def clear_roi(self):
+        """Очищает текущую ROI"""
         self.canvas.delete("roi_rectangle")
-        if x2 - x1 < 1 or y2 - y1 < 1:
-            # Слишком маленькая область - считаем это кликом, ROI не меняем
-            self.draw_roi()
-            return
+        self.canvas.delete("roi_polygon")
+        self.canvas.delete("roi_points")
+        self.roi = None
+        self.roi_points = []
+        self.drawing_polygon = False
+        self.dragging = False
 
-        self.roi = (x1, y1, x2, y2)
-        self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
-
-    def draw_roi(self):
-        """Рисует текущий ROI на канвасе"""
-        if not self.roi:
-            return
-        x1, y1, x2, y2 = self.roi
-        self.canvas.create_rectangle(
-            x1 * CANVAS_WIDTH / 100,
-            y1 * CANVAS_HEIGHT / 100,
-            x2 * CANVAS_WIDTH / 100,
-            y2 * CANVAS_HEIGHT / 100,
-            outline="red",
-            tags="roi_rectangle"
-        )
+    def switch_roi_mode(self, mode):
+        """Переключает режим ROI между прямоугольником и многоугольником"""
+        self.roi_mode = mode
+        self.clear_roi()
+        if mode == "rectangle":
+            self.label_roi.config(text="Выберите прямоугольную область интереса:")
+        else:
+            self.label_roi.config(text="Кликните по точкам многоугольника. Двойной клик завершает:")
 
     def on_file_select(self, event):
         """Обработчик выбора файла в списке"""
@@ -691,7 +1076,7 @@ class FreestyleParserApp:
         if folder:
             self.output_folder = folder
             self.entry_output.delete(0, tk.END)
-            self.entry_output.insert(0, folder)
+            self.entry_output.insert(0, os.path.basename(folder))
 
             #
             self.on_output_folder_changed()
@@ -699,6 +1084,20 @@ class FreestyleParserApp:
         else:
             messagebox.showerror("Ошибка", "Папка не найдена.")
 
+    def _sync_params_from_ui(self):
+        """Считывает значения параметров из UI в processing_params"""
+        for key, var in self.param_vars.items():
+            try:
+                val = float(var.get())
+                self.processing_params[key] = val
+            except ValueError:
+                self.log(f"Некорректное значение параметра {key}: {var.get()}")
+                var.set(str(self.processing_params[key]))
+
+    def _sync_ui_from_params(self):
+        """Обновляет UI из processing_params"""
+        for key, var in self.param_vars.items():
+            var.set(str(self.processing_params[key]))
 
     def generate_thumbnail(self, video_path, output_path, roi=None):
         """Создает превью для видео с учетом ROI"""
@@ -716,27 +1115,43 @@ class FreestyleParserApp:
                 subprocess.run(cmd, check=True, capture_output=True)
 
                 # Получаем размеры оригинального кадра
-                # TODO ну что блядь за способ? надо сначала процессинга брать размер и сохранять (
                 img = Image.open(temp_path)
                 orig_width, orig_height = img.size
 
-                # Конвертируем ROI из процентов в пиксели оригинального размера
-                x1, y1, x2, y2 = roi
-                crop_x = int(x1 * orig_width / 100)
-                crop_y = int(y1 * orig_height / 100)
-                crop_w = int((x2 - x1) * orig_width / 100)
-                crop_h = int((y2 - y1) * orig_height / 100)
-                if crop_h == 0 or crop_w == 0:
-                    self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
-                # Вырезаем ROI из оригинального кадра
-                cmd = [
-                    get_ffmpeg_path(),
-                    '-i', temp_path,
-                    '-vf', f'crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={THUMB_X}:-1',  # Сначала crop, потом scale
-                    '-q:v', '2',
-                    '-y', output_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
+                # Проверяем формат ROI
+                if len(roi) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
+                    x1, y1, x2, y2 = roi
+                    crop_x = int(x1 * orig_width / 100)
+                    crop_y = int(y1 * orig_height / 100)
+                    crop_w = int((x2 - x1) * orig_width / 100)
+                    crop_h = int((y2 - y1) * orig_height / 100)
+                    if crop_h == 0 or crop_w == 0:
+                        self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
+                    # Вырезаем ROI из оригинального кадра
+                    cmd = [
+                        get_ffmpeg_path(),
+                        '-i', temp_path,
+                        '-vf', f'crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={THUMB_X}:-1',  # Сначала crop, потом scale
+                        '-q:v', '2',
+                        '-y', output_path
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    
+                elif len(roi) > 4:  # Многоугольник (новый формат)
+                    # Для многоугольника используем Python для обработки
+                    import cv2
+                    import numpy as np
+                    
+                    # Загружаем изображение
+                    frame = cv2.imread(temp_path)
+                    
+                    # Для превью показываем полный кадр без маски
+                    # Маска применяется только при обработке для детекции
+                    # Здесь мы просто используем полный кадр для красивого превью
+                    
+                    # Изменяем размер и сохраняем
+                    frame = cv2.resize(frame, (THUMB_X, THUMB_Y))
+                    cv2.imwrite(output_path, frame)
 
                 # Удаляем временный файл
                 if os.path.exists(temp_path):
@@ -772,7 +1187,7 @@ class FreestyleParserApp:
         self.canvas.image = self.photo
 
     def open_output_folder(self):
-        folder = self.entry_output.get()
+        folder = self.output_folder
         if os.path.exists(folder):
             if sys.platform == "darwin":
                 subprocess.Popen(["open", folder])
@@ -794,7 +1209,24 @@ class FreestyleParserApp:
                 return
 
             if sys.platform == "darwin":  # macOS
-                subprocess.Popen(['open', '-a', 'VLC', abs_path])
+                # Скрипт открывает файл и сразу запускает воспроизведение
+                applescript = f'''
+                tell application "QuickTime Player"
+                    activate
+                    open POSIX file "{abs_path}"
+                    delay 0.5
+                    tell document 1
+                        try
+                            set sound volume to 0.05
+                        end try
+                        set current time to 0.7
+                        play
+                    end tell
+                end tell
+                '''
+                subprocess.Popen(["osascript", "-e", applescript], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # subprocess.run(["open", "-a", "QuickTime Player", abs_path])
+                # subprocess.Popen(['open', '-a', 'VLC', abs_path])
             elif sys.platform == "win32":  # Windows
                 # Пробуем найти VLC в стандартных местах установки
                 vlc_paths = [
@@ -857,19 +1289,80 @@ class FreestyleParserApp:
         if os.path.exists(self.processing_config_file):
             with open(self.processing_config_file, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
-                if 'processing-config' in config and 'roi' in config['processing-config']:
-                    # Преобразуем список обратно в tuple
-                    roi_list = config['processing-config']['roi']
-                    if isinstance(roi_list, list) and len(roi_list) == 4:
-                        self.roi = tuple(roi_list)
+                if 'processing-config' in config:
+                    # Загружаем ROI
+                    if 'roi' in config['processing-config']:
+                        roi_data = config['processing-config']['roi']
+                        if roi_data is not None:
+                            if isinstance(roi_data, dict):
+                                if 'rectangle' in roi_data:
+                                    self.roi = tuple(roi_data['rectangle']) # Преобразуем обратно в tuple
+                                    self.roi_mode = "rectangle"
+                                elif 'polygon' in roi_data:
+                                    # Убеждаемся, что каждая точка является list
+                                    polygon_points = []
+                                    for point in roi_data['polygon']:
+                                        if isinstance(point, tuple):
+                                            polygon_points.append(list(point))
+                                        else:
+                                            polygon_points.append(point)
+                                    self.roi = polygon_points # Многоугольник в формате list
+                                    self.roi_mode = "polygon"
+                            # Поддержка старого формата для обратной совместимости
+                            elif isinstance(roi_data, list):
+                                if len(roi_data) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
+                                    self.roi = tuple(roi_data)  # Преобразуем обратно в tuple
+                                    self.roi_mode = "rectangle"
+                                elif len(roi_data) > 4 and all(isinstance(point, list) and len(point) == 2 for point in roi_data):  # Многоугольник (список точек)
+                                    self.roi = roi_data
+                                    self.roi_mode = "polygon"
+                    
+                    # Загружаем режим ROI
+                    if 'roi_mode' in config['processing-config']:
+                        self.roi_mode = config['processing-config']['roi_mode']
+
+                    # Загружаем параметры обработки
+                    if 'params' in config['processing-config']:
+                        saved_params = config['processing-config']['params']
+                        for key in self.processing_params:
+                            if key in saved_params:
+                                self.processing_params[key] = float(saved_params[key])
+                        self._sync_ui_from_params()
 
     def save_processing_config(self):
         """Сохраняет конфигурацию обработки в файл"""
+        self._sync_params_from_ui()
+
         config = {
             'processing-config': {
-                'roi': list(self.roi) if self.roi else None  # Преобразуем tuple в список
+                'roi_mode': self.roi_mode,
+                'params': dict(self.processing_params),
             }
         }
+        
+        # Сохраняем ROI в зависимости от режима
+        if self.roi:
+            if self.roi_mode == "rectangle":
+                # Прямоугольник: сохраняем как list
+                config['processing-config']['roi'] = {
+                    'rectangle': list(self.roi)
+                }
+            elif self.roi_mode == "polygon":
+                # Многоугольник: сохраняем как список точек
+                # Убеждаемся, что каждая точка тоже является list, а не tuple
+                polygon_points = []
+                for point in self.roi:
+                    if isinstance(point, tuple):
+                        polygon_points.append(list(point))
+                    else:
+                        polygon_points.append(point)
+                config['processing-config']['roi'] = {
+                    'polygon': polygon_points
+                }
+        else:
+            config['processing-config']['roi'] = None
+        
+        os.makedirs(os.path.dirname(self.processing_config_file), exist_ok=True)
         with open(self.processing_config_file, "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
 
@@ -904,7 +1397,7 @@ class FreestyleParserApp:
                 '-ss', str(seek_time),
                 '-i', video_path,
                 '-vframes', '1',
-                '-vf', f'scale={CANVAS_WIDTH}:{CANVAS_HEIGHT}',
+                        '-vf', f'scale={self.canvas_width}:{CANVAS_HEIGHT}',
                 '-y',
                 canvas_path
             ]
@@ -918,7 +1411,31 @@ class FreestyleParserApp:
                     image = Image.open(canvas_path)
                     self.display_image(np.array(image))
                     # Если есть сохраненный ROI, показываем его
-                    self.draw_roi()
+                    if self.roi:
+                        if self.roi_mode == "rectangle":
+                            x1, y1, x2, y2 = self.roi
+                            self.canvas.create_rectangle(
+                                x1 * self.canvas_width / 100,
+                                y1 * CANVAS_HEIGHT / 100,
+                                x2 * self.canvas_width / 100,
+                                y2 * CANVAS_HEIGHT / 100,
+                                outline="red",
+                                tags="roi_rectangle"
+                            )
+                        elif self.roi_mode == "polygon":
+                            # Конвертируем точки из процентов в пиксели
+                            pixel_points = [(x * self.canvas_width / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
+                            
+                            # Рисуем точки
+                            for x, y in pixel_points:
+                                self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="red", tags="roi_points")
+                            
+                            # Рисуем линии многоугольника
+                            for i in range(len(pixel_points)):
+                                p1 = pixel_points[i]
+                                p2 = pixel_points[(i + 1) % len(pixel_points)]
+                                self.canvas.create_line(p1[0], p1[1], p2[0], p2[1], 
+                                                      fill="red", width=2, tags="roi_polygon")
                 # return canvas_path
             except subprocess.CalledProcessError as e:
                 print(f"Ошибка создания canvas.jpg (1): {e}")
@@ -936,13 +1453,32 @@ class FreestyleParserApp:
         files = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
         files = [os.path.join(self.output_folder, f) for f in files]
 
+        # Применяем фильтр по атлетам
         if self.filter_var.get() == "Все":
-            return sorted(files)
+            filtered_files = files
         elif self.filter_var.get() == "Неизвестно":
             assigned = set(sum(self.athlete_mapping.values(), []))
-            return sorted([f for f in files if f not in assigned])
+            filtered_files = [f for f in files if f not in assigned]
         else:
-            return sorted(self.athlete_mapping.get(self.filter_var.get(), []))
+            filtered_files = self.athlete_mapping.get(self.filter_var.get(), [])
+
+        # Применяем фильтры по рейтингу
+        if self.active_rating_filters:
+            rating_filtered_files = []
+            for file_path in filtered_files:
+                file_name = os.path.basename(file_path)
+                if file_name in self.attempt_ratings:
+                    rating = self.attempt_ratings[file_name]
+                    # Показываем файл, если он соответствует хотя бы одному активному фильтру
+                    if any(rating.get(filter_type, False) for filter_type in self.active_rating_filters):
+                        rating_filtered_files.append(file_path)
+                else:
+                    # Если у файла нет рейтинга, показываем его только если нет активных фильтров
+                    if not self.active_rating_filters:
+                        rating_filtered_files.append(file_path)
+            filtered_files = rating_filtered_files
+
+        return sorted(filtered_files)
 
     def on_attempt_drag_start(self, event, attempt):
         """Обработчик начала перетаскивания попытки"""
@@ -1008,23 +1544,6 @@ class FreestyleParserApp:
 
 
 
-    def extract_video_frame(self, video_path, output_path, timestamp=0):
-        """Извлекает кадр из видео в указанный момент времени"""
-        ffmpeg_path = get_ffmpeg_path()
-        if not ffmpeg_path:
-            raise Exception("FFmpeg не найден в системе или в папке bin")
-        
-        try:
-            subprocess.run([
-                ffmpeg_path,
-                '-ss', str(timestamp),
-                '-i', video_path,
-                '-vframes', '1',
-                '-q:v', '2',
-                output_path
-            ], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"Ошибка при извлечении кадра: {e.stderr.decode()}")
 
     def on_output_folder_changed(self):
         self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
@@ -1044,6 +1563,9 @@ class FreestyleParserApp:
 
         # Перезагружаем маппинг из новой папки
         self.load_athlete_mapping()
+        
+        # Загружаем рейтинги
+        self.load_ratings()
 
         # Обновляем интерфейс
         self.update_athlete_list()
@@ -1052,17 +1574,29 @@ class FreestyleParserApp:
 
 
 class GuiLogHandler(logging.Handler):
-    """Складывает логи в очередь; виджет Text трогает только главный поток
-    (emit вызывается в том числе из рабочего потока обработки)"""
+    """Обработчик логов для GUI"""
     def __init__(self, app):
         super().__init__()
         self.app = app
 
     def emit(self, record):
+        msg = self.format(record)
         try:
-            self.app.log_queue.put(self.format(record))
-        except Exception:
-            self.handleError(record)
+            self.app.root.after(0, lambda: self._append_log(msg))
+        except RuntimeError:
+            pass
+
+    def _append_log(self, msg):
+        self.app.log_text.configure(state='normal')
+        self.app.log_text.insert(tk.END, msg + '\n')
+
+        # Ограничиваем количество строк
+        lines = self.app.log_text.get('1.0', tk.END).splitlines()
+        if len(lines) > MAX_LOG_LINES:
+            self.app.log_text.delete('1.0', f'{len(lines) - MAX_LOG_LINES + 1}.0')
+
+        self.app.log_text.see(tk.END)
+        self.app.log_text.configure(state='disabled')
 
 if __name__ == "__main__":
     try:

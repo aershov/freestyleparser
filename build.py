@@ -27,7 +27,7 @@ def build_app():
         '--clean',
         '--add-data=requirements.txt:.',
         '--add-data=bin:bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
-        '--add-data=yolov8n.pt:.',  # модель YOLO внутри exe
+        '--add-data=models/yolo11s-seg.pt:./models',  # модель YOLO внутри exe
         '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',

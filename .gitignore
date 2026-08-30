@@ -4,5 +4,7 @@ build/
 __pycache__/
 venv/
 .freestyleparser/
-FreestyleParser.spec
+temp/
+*.zip
+.idea
 *.pyc

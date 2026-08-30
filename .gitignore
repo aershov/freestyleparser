@@ -1,8 +1,8 @@
-./dist
-./bin
-./build
-./__pycache__
-./venv
-./.FreestyleParser
+dist/
+bin/
+build/
+__pycache__/
+venv/
+.freestyleparser/
 FreestyleParser.spec
-yolov8n.pt
+*.pyc

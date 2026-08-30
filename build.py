@@ -24,10 +24,11 @@ def build_app():
     pyinstaller_args = [
         '--name=FreestyleParser',
         '--windowed',
+        '--clean',
         '--add-data=requirements.txt:.',
-        '--add-data=bin:bin',  # Добавляем бинарные файлы
-        '--add-data=yolov8n.pt:.',  # Добавляем модель
-        # '--add-data=yolov8s.pt:.',  # Добавляем бинарные файлы
+        '--add-data=bin:bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
+        '--add-data=yolov8n.pt:.',  # модель YOLO внутри exe
+        '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',
         '--hidden-import=numpy',
@@ -49,17 +50,12 @@ def build_app():
             '--osx-bundle-identifier=com.freestyleparser.app'
         ])
     
-    # Запускаем PyInstaller
+    # Запускаем PyInstaller (через sys.executable - работает и в venv без активации)
     try:
-        subprocess.run(['pyinstaller'] + pyinstaller_args, check=True)
+        subprocess.run([sys.executable, '-m', 'PyInstaller'] + pyinstaller_args, check=True)
         
         # Копируем дополнительные файлы
-        if system == 'Windows':
-            # Копируем DLL файлы для OpenCV
-            opencv_dll = os.path.join('venv', 'Lib', 'site-packages', 'cv2', '*.dll')
-            if os.path.exists(opencv_dll):
-                shutil.copy2(opencv_dll, 'dist')
-        elif system == 'Darwin':
+        if system == 'Darwin':
             # Подписываем приложение для macOS
             app_path = os.path.join('dist', 'FreestyleParser.app')
             if os.path.exists(app_path):

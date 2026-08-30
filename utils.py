@@ -25,6 +25,10 @@ CAMERA_PATHS = [
         "path": "DJI/MP4"
     },
     {
+        "name": "DJI Osmo Action 1",
+        "path": "DICM/100MEDIA"
+    },
+    {
         "name": "Canon Camera",
         "path": "DCIM/100CANON"
     },

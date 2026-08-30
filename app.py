@@ -13,7 +13,7 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video
+from splitter import process_video, DEFAULT_PROCESSING_PARAMS
 import sys
 import traceback
 
@@ -22,7 +22,6 @@ THUMB_Y = 120
 
 logging.basicConfig(level=logging.INFO)
 
-CANVAS_WIDTH = 480
 CANVAS_HEIGHT = 240
 
 MAX_LOG_LINES = 200
@@ -63,6 +62,7 @@ class FreestyleParserApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Freestyle Parser")
+        self.root.geometry("1605x900")
 
         # Инициализируем переменные
         current_date = datetime.date.today()
@@ -71,7 +71,7 @@ class FreestyleParserApp:
         if not os.path.exists(self._app_folder):
             os.makedirs(self._app_folder, exist_ok=True)
         self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")
-        self.processing_config_file = None
+        self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
         #TODO почистить это всё (
         self.roi = None  # Теперь это будет список точек многоугольника в процентах
         self.roi_points = []  # Точки многоугольника в пикселях canvas
@@ -88,6 +88,7 @@ class FreestyleParserApp:
         self.attempt_checkboxes = {}  # Словарь для хранения чекбоксов попыток
         self.attempt_ratings = {}  # Словарь для хранения рейтингов попыток: {attempt: {'up': bool, 'down': bool}}
         self.active_rating_filters = set()  # Множество активных фильтров по рейтингу
+        self.processing_params = DEFAULT_PROCESSING_PARAMS.copy()
 
         # self.on_output_folder_changed()
 
@@ -157,10 +158,17 @@ class FreestyleParserApp:
         """Обработчик изменения фильтра"""
         self.need_update_attempts = True  # Устанавливаем флаг обновления
 
+    @property
+    def canvas_width(self):
+        w = self.canvas.winfo_width()
+        return w if w > 1 else 480
+
     def start_processing(self):
         """Запускает обработку видео"""
 
+        self._sync_params_from_ui()
         # на случай, если папка по умолчанию, надо добавить проверку и делать это только если output_folder не exists
+        self.save_processing_config()
         self.on_output_folder_changed()
         if not self.selected_files:
             messagebox.showwarning("Предупреждение", "Сначала выберите файлы для обработки")
@@ -169,7 +177,6 @@ class FreestyleParserApp:
         if not self.roi:
             messagebox.showwarning("Предупреждение", "Сначала выберите область интереса")
             return
-        self.save_processing_config()  # Сохраняем ROI при изменении
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
@@ -237,7 +244,7 @@ class FreestyleParserApp:
         """Обрабатывает видео в отдельном потоке"""
         try:
             next_attempt_number = get_next_attempt_number(self.output_folder)
-            process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt), next_attempt_number)
+            process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt), next_attempt_number, params=self.processing_params)
             self.log(f"Файлы {self.selected_files} успешно обработаны.")
         except Exception as e:
             error_trace = traceback.format_exc()
@@ -404,25 +411,49 @@ class FreestyleParserApp:
         self.main_frame.add(self.top_frame)
 
         # === ЛЕВЫЙ БЛОК ===
-        self.left_frame = tk.Frame(self.top_frame)
-        self.top_frame.add(self.left_frame)
+        self.left_frame = tk.Frame(self.top_frame, width=460)
+        self.top_frame.add(self.left_frame, width=460, minsize=425)
 
         # --- Выбор файлов ---
         self.frame_files = tk.LabelFrame(self.left_frame, text="Файлы")
         self.frame_files.pack(pady=10, fill=tk.X)
 
-        self.label_files = tk.Label(self.frame_files, text="Выбранные файлы:")
+        files_inner = tk.Frame(self.frame_files)
+        files_inner.pack(fill=tk.X, padx=5, pady=5)
+
+        # Левая часть — входные файлы (фиксированная ширина)
+        files_left = tk.Frame(files_inner)
+        files_left.pack(side=tk.LEFT)
+
+        self.label_files = tk.Label(files_left, text="Входные файлы:")
         self.label_files.pack(anchor=tk.W)
 
-        self.listbox_files = tk.Listbox(self.frame_files, height=5, width=40)
-        self.listbox_files.pack(side=tk.LEFT, padx=5)
+        self.listbox_files = tk.Listbox(files_left, height=5, width=22)
+        self.listbox_files.pack(fill=tk.X, padx=5)
         self.listbox_files.bind('<<ListboxSelect>>', self.on_file_select)
 
-        self.button_select_files = tk.Button(self.frame_files, text="Выбрать файлы", command=self.select_files)
-        self.button_select_files.pack(pady=5)
+        self.button_select_files = tk.Button(files_left, text="Выбрать файлы", command=self.select_files)
+        self.button_select_files.pack(fill=tk.X, padx=5, pady=5)
 
-        self.button_show_screenshot = tk.Button(self.frame_files, text="Область интереса", command=self.show_next_frame)
-        self.button_show_screenshot.pack(pady=5)
+        # Правая часть — выходная папка
+        files_right = tk.Frame(files_inner)
+        files_right.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.label_output = tk.Label(files_right, text="Выходная папка:")
+        self.label_output.pack(anchor=tk.W)
+
+        self.entry_output = tk.Entry(files_right, width=22)
+        self.entry_output.pack(fill=tk.X, padx=5, pady=2)
+        self.entry_output.insert(0, os.path.basename(self.output_folder))
+
+        output_btn_inner = tk.Frame(files_right)
+        output_btn_inner.pack(fill=tk.X, padx=5, pady=5)
+
+        self.button_change_output = tk.Button(output_btn_inner, text="Изменить", command=self.change_output_folder)
+        self.button_change_output.pack(side=tk.LEFT, padx=2)
+
+        self.button_open_output = tk.Button(output_btn_inner, text="Открыть", command=self.open_output_folder)
+        self.button_open_output.pack(side=tk.LEFT, padx=2)
 
         # --- ROI Canvas ---
         self.frame_roi = tk.LabelFrame(self.left_frame, text="Область интереса")
@@ -447,33 +478,38 @@ class FreestyleParserApp:
         self.label_roi = tk.Label(self.frame_roi, text="Кликните по точкам многоугольника. Двойной клик завершает:")
         self.label_roi.pack()
 
-        self.canvas = tk.Canvas(self.frame_roi, width=CANVAS_WIDTH, height=CANVAS_HEIGHT, bg="black")
-        self.canvas.pack(pady=5)
+        self.canvas = tk.Canvas(self.frame_roi, height=CANVAS_HEIGHT, bg="black")
+        self.canvas.pack(pady=5, fill=tk.X)
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Double-Button-1>", self.finish_polygon)  # Двойной клик завершает многоугольник
 
-        # --- Выходная папка и управление ---
+        # --- Параметры обработки ---
         self.frame_output = tk.LabelFrame(self.left_frame, text="Настройки")
         self.frame_output.pack(pady=10, fill=tk.X)
 
-        self.label_output = tk.Label(self.frame_output, text="Выходная папка:")
-        self.label_output.pack(anchor=tk.W)
+        param_defs = [
+            ('min_pause_duration', 'Пауза между попытками'),
+            ('min_attempt_duration', 'Мин. длит. попытки'),
+            ('attempt_start_padding', 'Запас к началу'),
+            ('attempt_end_padding', 'Запас к концу'),
+            ('min_detection_strength', 'Мин. сила детекции (0-1)'),
+        ]
 
-        output_inner = tk.Frame(self.frame_output)
-        output_inner.pack(fill=tk.X)
-
-        self.entry_output = tk.Entry(output_inner, width=30)
-        self.entry_output.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.entry_output.insert(0, self.output_folder)
-
-        self.button_change_output = tk.Button(output_inner, text="Изменить", command=self.change_output_folder)
-        self.button_change_output.pack(side=tk.LEFT, padx=2)
-
-        self.button_open_output = tk.Button(output_inner, text="Открыть", command=self.open_output_folder)
-        self.button_open_output.pack(side=tk.LEFT, padx=2)
+        self.param_vars = {}
+        for i, (key, label_text) in enumerate(param_defs):
+            col = i % 2
+            if col == 0:
+                row_frame = tk.Frame(self.frame_output)
+                row_frame.pack(fill=tk.X, pady=2, padx=5)
+            label = tk.Label(row_frame, text=label_text, anchor=tk.W)
+            label.pack(side=tk.LEFT, padx=(0, 2))
+            var = tk.StringVar(value=str(self.processing_params[key]))
+            entry = tk.Entry(row_frame, textvariable=var, width=6)
+            entry.pack(side=tk.LEFT, padx=(0, 15))
+            self.param_vars[key] = var
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
@@ -495,7 +531,7 @@ class FreestyleParserApp:
 
         # --- Попытки ---
         self.frame_attempts = tk.LabelFrame(self.right_frame, text="Попытки")
-        self.right_frame.add(self.frame_attempts, width=800)  # 80% ширины
+        self.right_frame.add(self.frame_attempts, width=950)  # ~75% ширины
 
         # Область действий
         self.actions_frame = tk.Frame(self.frame_attempts)
@@ -936,7 +972,7 @@ class FreestyleParserApp:
             self.dragging = False
             self.end_x = event.x
             self.end_y = event.y
-            self.roi = (100 * self.start_x/ CANVAS_WIDTH, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / CANVAS_WIDTH, 100* self.end_y/ CANVAS_HEIGHT)
+            self.roi = (100 * self.start_x/ self.canvas_width, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / self.canvas_width, 100* self.end_y/ CANVAS_HEIGHT)
             self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
 
     def finish_polygon(self, event):
@@ -950,7 +986,7 @@ class FreestyleParserApp:
                                       fill="red", width=2, tags="roi_polygon")
             
             # Сохраняем ROI в процентах
-            self.roi = [[100 * x / CANVAS_WIDTH, 100 * y / CANVAS_HEIGHT] for x, y in self.roi_points]
+            self.roi = [[100 * x / self.canvas_width, 100 * y / CANVAS_HEIGHT] for x, y in self.roi_points]
             self.drawing_polygon = False
             self.log(f"Многоугольная ROI создана с {len(self.roi_points)} точками")
 
@@ -1025,7 +1061,7 @@ class FreestyleParserApp:
         if folder:
             self.output_folder = folder
             self.entry_output.delete(0, tk.END)
-            self.entry_output.insert(0, folder)
+            self.entry_output.insert(0, os.path.basename(folder))
 
             #
             self.on_output_folder_changed()
@@ -1033,6 +1069,20 @@ class FreestyleParserApp:
         else:
             messagebox.showerror("Ошибка", "Папка не найдена.")
 
+    def _sync_params_from_ui(self):
+        """Считывает значения параметров из UI в processing_params"""
+        for key, var in self.param_vars.items():
+            try:
+                val = float(var.get())
+                self.processing_params[key] = val
+            except ValueError:
+                self.log(f"Некорректное значение параметра {key}: {var.get()}")
+                var.set(str(self.processing_params[key]))
+
+    def _sync_ui_from_params(self):
+        """Обновляет UI из processing_params"""
+        for key, var in self.param_vars.items():
+            var.set(str(self.processing_params[key]))
 
     def generate_thumbnail(self, video_path, output_path, roi=None):
         """Создает превью для видео с учетом ROI"""
@@ -1122,7 +1172,7 @@ class FreestyleParserApp:
         self.canvas.image = self.photo
 
     def open_output_folder(self):
-        folder = self.entry_output.get()
+        folder = self.output_folder
         if os.path.exists(folder):
             if sys.platform == "darwin":
                 subprocess.Popen(["open", folder])
@@ -1148,9 +1198,15 @@ class FreestyleParserApp:
                 applescript = f'''
                 tell application "QuickTime Player"
                     activate
-                    set current_movie to open POSIX file "{abs_path}"
-                    set current time of current_movie to 0.7
-                    play current_movie
+                    open POSIX file "{abs_path}"
+                    delay 0.5
+                    tell document 1
+                        try
+                            set sound volume to 0.05
+                        end try
+                        set current time to 0.7
+                        play
+                    end tell
                 end tell
                 '''
                 subprocess.Popen(["osascript", "-e", applescript], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1250,11 +1306,22 @@ class FreestyleParserApp:
                     if 'roi_mode' in config['processing-config']:
                         self.roi_mode = config['processing-config']['roi_mode']
 
+                    # Загружаем параметры обработки
+                    if 'params' in config['processing-config']:
+                        saved_params = config['processing-config']['params']
+                        for key in self.processing_params:
+                            if key in saved_params:
+                                self.processing_params[key] = float(saved_params[key])
+                        self._sync_ui_from_params()
+
     def save_processing_config(self):
         """Сохраняет конфигурацию обработки в файл"""
+        self._sync_params_from_ui()
+
         config = {
             'processing-config': {
-                'roi_mode': self.roi_mode
+                'roi_mode': self.roi_mode,
+                'params': dict(self.processing_params),
             }
         }
         
@@ -1280,6 +1347,7 @@ class FreestyleParserApp:
         else:
             config['processing-config']['roi'] = None
         
+        os.makedirs(os.path.dirname(self.processing_config_file), exist_ok=True)
         with open(self.processing_config_file, "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
 
@@ -1314,7 +1382,7 @@ class FreestyleParserApp:
                 '-ss', str(seek_time),
                 '-i', video_path,
                 '-vframes', '1',
-                '-vf', f'scale={CANVAS_WIDTH}:{CANVAS_HEIGHT}',
+                        '-vf', f'scale={self.canvas_width}:{CANVAS_HEIGHT}',
                 '-y',
                 canvas_path
             ]
@@ -1332,16 +1400,16 @@ class FreestyleParserApp:
                         if self.roi_mode == "rectangle":
                             x1, y1, x2, y2 = self.roi
                             self.canvas.create_rectangle(
-                                x1 * CANVAS_WIDTH / 100,
+                                x1 * self.canvas_width / 100,
                                 y1 * CANVAS_HEIGHT / 100,
-                                x2 * CANVAS_WIDTH / 100,
+                                x2 * self.canvas_width / 100,
                                 y2 * CANVAS_HEIGHT / 100,
                                 outline="red",
                                 tags="roi_rectangle"
                             )
                         elif self.roi_mode == "polygon":
                             # Конвертируем точки из процентов в пиксели
-                            pixel_points = [(x * CANVAS_WIDTH / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
+                            pixel_points = [(x * self.canvas_width / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
                             
                             # Рисуем точки
                             for x, y in pixel_points:

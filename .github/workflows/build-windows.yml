@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  # нужно softprops/action-gh-release для создания релиза и загрузки ассетов;
+  # у GITHUB_TOKEN по умолчанию доступ только на чтение
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest

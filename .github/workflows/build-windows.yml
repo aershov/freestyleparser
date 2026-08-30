@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Консоль раннера в cp1252 - русские print()'ы скриптов падают с UnicodeEncodeError
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
 

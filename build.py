@@ -28,6 +28,7 @@ def build_app():
         '--add-data=requirements.txt:.',
         '--add-data=bin:bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
         '--add-data=models/yolo11s-seg.pt:./models',  # модель YOLO внутри exe
+        '--add-data=icon.ico:.',  # иконка окна приложения
         '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--collect-all=scipy',  # у scipy ленивые импорты (array_api_compat и т.п.) - иначе ModuleNotFoundError в exe
         '--hidden-import=PIL._tkinter_finder',

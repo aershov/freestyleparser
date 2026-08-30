@@ -95,10 +95,21 @@ class FreestyleParserApp:
 
         # Создаем интерфейс
         self.setup_ui()
+        self._setup_window_icon()
         if os.path.exists(self.output_folder):
             self.on_output_folder_changed()
         # Запускаем периодическое обновление
         self.root.after(1000, self.periodic_update)
+
+    def _setup_window_icon(self):
+        """Иконка окна: icon.ico рядом с app.py (в exe - из распакованного бандла)"""
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
+        try:
+            if os.path.exists(icon_path):
+                self._icon_image = ImageTk.PhotoImage(Image.open(icon_path))
+                self.root.iconphoto(True, self._icon_image)
+        except Exception as e:
+            print(f"Не удалось установить иконку окна: {e}")
 
     def periodic_update(self):
         """Периодическое обновление интерфейса"""

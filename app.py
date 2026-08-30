@@ -6,6 +6,7 @@ from PIL import Image, ImageTk
 import subprocess
 import datetime
 import threading
+import queue
 import yaml
 import logging
 import shutil
@@ -46,6 +47,10 @@ class FreestyleParserApp:
         self.selected_files = []
         self.processing = False
         self.need_update_attempts = False
+        self.need_update_ui_state = False
+        # Логи из рабочих потоков складываются в очередь, GUI вычитывает её в главном потоке
+        self.log_queue = queue.Queue()
+        self._progress_percent = 0.0
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value="Все")
@@ -65,6 +70,16 @@ class FreestyleParserApp:
         if self.need_update_attempts:
             self.update_attempt_thumbnails()
             self.need_update_attempts = False
+        if self.processing:
+            self.progress_var.set(min(self._progress_percent, 100.0))
+        if self.need_update_ui_state:
+            # Состояние обработки изменил рабочий поток - кнопки трогаем только здесь,
+            # в главном потоке
+            self.need_update_ui_state = False
+            self.button_process.config(state=tk.NORMAL)
+            self.button_stop.config(state=tk.DISABLED)
+            self.progress_var.set(100 if self._progress_percent >= 100 else 0)
+        self.flush_log_queue()
         self.root.after(1000, self.periodic_update)
 
     def on_attempt_drag_end(self, event, attempt):
@@ -135,6 +150,7 @@ class FreestyleParserApp:
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
+        self._progress_percent = 0.0
         self.progress_var.set(0)
         self.log(f"Запускаем процессинг файлов с roi={self.roi}")
         # Запускаем обработку в отдельном потоке
@@ -149,15 +165,30 @@ class FreestyleParserApp:
     def process_videos(self):
         """Обрабатывает видео в отдельном потоке"""
         try:
-            process_video(self.selected_files, self.output_folder, self.roi, lambda file: self.on_attempt_file_created(file))
-            self.log(f"Файлы {self.selected_files} успешно обработан.")
+            process_video(
+                self.selected_files,
+                self.output_folder,
+                self.roi,
+                self.on_attempt_file_created,
+                progress_callback=self.on_processing_progress,
+                should_continue=lambda: self.processing,
+            )
+            self.log("Обработка файлов завершена.")
         except Exception as e:
             error_trace = traceback.format_exc()
             self.log(f"Ошибка обработки: {e} {error_trace}")
         finally:
             self.processing = False
-            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            # Кнопки и прогресс обновляются в главном потоке через periodic_update
+            self.need_update_ui_state = True
+
+    def on_processing_progress(self, file_index, file_count, frame_index, total_frames):
+        """Прогресс обработки. Вызывается из рабочего потока, поэтому только считаем
+        процент - сам прогрессбар обновляет periodic_update в главном потоке."""
+        if file_count <= 0:
+            return
+        file_progress = frame_index / total_frames if total_frames > 0 else 0.0
+        self._progress_percent = 100.0 * (file_index + min(file_progress, 1.0)) / file_count
 
     def setup_logger(self):
         """Настройка логгера"""
@@ -453,6 +484,8 @@ class FreestyleParserApp:
             widget.destroy()
 
         # Получаем все попытки
+        if not os.path.isdir(self.output_folder):
+            return
         attempts = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
 
         # Фильтруем попытки
@@ -542,6 +575,28 @@ class FreestyleParserApp:
         if self.logger:
             self.logger.log(level, message)
 
+    def append_log_line(self, msg):
+        """Вставляет строку лога в окно. Только из главного потока."""
+        self.log_text.configure(state='normal')
+        self.log_text.insert(tk.END, msg + '\n')
+
+        # Ограничиваем количество строк
+        lines = self.log_text.get('1.0', tk.END).splitlines()
+        if len(lines) > MAX_LOG_LINES:
+            self.log_text.delete('1.0', f'{len(lines) - MAX_LOG_LINES + 1}.0')
+
+        self.log_text.see(tk.END)
+        self.log_text.configure(state='disabled')
+
+    def flush_log_queue(self):
+        """Вычитывает логи, накопленные рабочими потоками"""
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self.append_log_line(msg)
+        except queue.Empty:
+            pass
+
     def on_click(self, event):
         self.start_x = event.x
         self.start_y = event.y
@@ -555,8 +610,34 @@ class FreestyleParserApp:
     def on_release(self, event):
         self.end_x = event.x
         self.end_y = event.y
-        self.roi = (100 * self.start_x/ CANVAS_WIDTH, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / CANVAS_WIDTH, 100* self.end_y/ CANVAS_HEIGHT)
+        # Нормализуем прямоугольник: тянут справа-налево/снизу-вверх тоже валидны
+        x1, x2 = sorted((100 * self.start_x / CANVAS_WIDTH, 100 * self.end_x / CANVAS_WIDTH))
+        y1, y2 = sorted((100 * self.start_y / CANVAS_HEIGHT, 100 * self.end_y / CANVAS_HEIGHT))
+        x1, y1 = max(0.0, x1), max(0.0, y1)
+        x2, y2 = min(100.0, x2), min(100.0, y2)
+
+        self.canvas.delete("roi_rectangle")
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            # Слишком маленькая область - считаем это кликом, ROI не меняем
+            self.draw_roi()
+            return
+
+        self.roi = (x1, y1, x2, y2)
         self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
+
+    def draw_roi(self):
+        """Рисует текущий ROI на канвасе"""
+        if not self.roi:
+            return
+        x1, y1, x2, y2 = self.roi
+        self.canvas.create_rectangle(
+            x1 * CANVAS_WIDTH / 100,
+            y1 * CANVAS_HEIGHT / 100,
+            x2 * CANVAS_WIDTH / 100,
+            y2 * CANVAS_HEIGHT / 100,
+            outline="red",
+            tags="roi_rectangle"
+        )
 
     def on_file_select(self, event):
         """Обработчик выбора файла в списке"""
@@ -837,16 +918,7 @@ class FreestyleParserApp:
                     image = Image.open(canvas_path)
                     self.display_image(np.array(image))
                     # Если есть сохраненный ROI, показываем его
-                    if self.roi:
-                        x1, y1, x2, y2 = self.roi
-                        self.canvas.create_rectangle(
-                            x1 * CANVAS_WIDTH / 100,
-                            y1 * CANVAS_HEIGHT / 100,
-                            x2 * CANVAS_WIDTH / 100,
-                            y2 * CANVAS_HEIGHT / 100,
-                            outline="red",
-                            tags="roi_rectangle"
-                        )
+                    self.draw_roi()
                 # return canvas_path
             except subprocess.CalledProcessError as e:
                 print(f"Ошибка создания canvas.jpg (1): {e}")
@@ -980,23 +1052,17 @@ class FreestyleParserApp:
 
 
 class GuiLogHandler(logging.Handler):
-    """Обработчик логов для GUI"""
+    """Складывает логи в очередь; виджет Text трогает только главный поток
+    (emit вызывается в том числе из рабочего потока обработки)"""
     def __init__(self, app):
         super().__init__()
         self.app = app
 
     def emit(self, record):
-        msg = self.format(record)
-        self.app.log_text.configure(state='normal')
-        self.app.log_text.insert(tk.END, msg + '\n')
-
-        # Ограничиваем количество строк
-        lines = self.app.log_text.get('1.0', tk.END).splitlines()
-        if len(lines) > MAX_LOG_LINES:
-            self.app.log_text.delete('1.0', f'{len(lines) - MAX_LOG_LINES + 1}.0')
-
-        self.app.log_text.see(tk.END)
-        self.app.log_text.configure(state='disabled')
+        try:
+            self.app.log_queue.put(self.format(record))
+        except Exception:
+            self.handleError(record)
 
 if __name__ == "__main__":
     try:

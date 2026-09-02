@@ -43,6 +43,11 @@ def build_app():
         if os.path.exists('icon.ico'):
             pyinstaller_args.append('--icon=icon.ico')
         pyinstaller_args.append('--onefile')
+    elif system == 'Linux':
+        # Портативный бинарник: один файл без установки зависимостей.
+        # Иконку окна Tk берёт из icon.ico во время работы (--icon для ELF нет),
+        # ffmpeg/ffprobe уже внутри благодаря --add-data=bin:bin
+        pyinstaller_args.append('--onefile')
     elif system == 'Darwin':
         if os.path.exists('icon.icns'):
             pyinstaller_args.append('--icon=icon.icns')

@@ -32,6 +32,15 @@ FreestyleParser — это инструмент для автоматическ�
 
 > Tkinter входит в стандартную поставку Python и не требует отдельной установки.
 
+## Готовые сборки
+На странице [Releases](https://github.com/aershov/freestyleparser/releases) лежат портативные сборки — Python, модель YOLO и ffmpeg уже внутри, ничего устанавливать не нужно:
+- **Windows**: `FreestyleParser.exe` — запустить и работать.
+- **Linux** (Ubuntu 22.04+ и другие дистрибутивы с glibc ≥ 2.35): `FreestyleParser-linux-x64` — скачать, сделать исполняемым и запустить:
+  ```bash
+  chmod +x FreestyleParser-linux-x64
+  ./FreestyleParser-linux-x64
+  ```
+
 ## Установка
 1. Создайте виртуальное окружение:
    ```bash

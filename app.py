@@ -17,6 +17,8 @@ from splitter import process_video, DEFAULT_PROCESSING_PARAMS
 import sys
 import traceback
 
+APP_VERSION = "1.0.0.1"
+
 THUMB_X = 180
 THUMB_Y = 120
 
@@ -61,8 +63,15 @@ def create_polygon_mask(polygon_points, width, height):
 class FreestyleParserApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Freestyle Parser")
+        self.root.title(f"Freestyle Parser {APP_VERSION}")
         self.root.geometry("1605x900")
+
+        # Цвет фона кнопок по умолчанию: 'SystemButtonFace' существует только
+        # на Windows, на Linux/macOS Tk не знает такого имени цвета,
+        # поэтому берём фактическое значение из Tk
+        probe_button = tk.Button(root)
+        self.button_face_color = probe_button.cget('bg')
+        probe_button.destroy()
 
         # Инициализируем переменные
         current_date = datetime.date.today()
@@ -885,22 +894,22 @@ class FreestyleParserApp:
     def update_rating_button_style(self, up_button, down_button, rating_state):
         """Обновляет стиль кнопок рейтинга"""
         if rating_state['up']:
-            up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black', 
+            up_button.config(relief=tk.SUNKEN, bg=self.button_face_color, fg='black',
                            text='👍', font=('Arial', 9, 'normal'),
                            bd=2, highlightbackground='blue')
         else:
-            up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+            up_button.config(relief=tk.RAISED, bg=self.button_face_color, fg='black',
                            text='👍', font=('Arial', 9, 'normal'),
-                           bd=1, highlightbackground='SystemButtonFace')
-            
+                           bd=1, highlightbackground=self.button_face_color)
+
         if rating_state['down']:
-            down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+            down_button.config(relief=tk.SUNKEN, bg=self.button_face_color, fg='black',
                              text='👎', font=('Arial', 9, 'normal'),
                              bd=2, highlightbackground='blue')
         else:
-            down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+            down_button.config(relief=tk.RAISED, bg=self.button_face_color, fg='black',
                              text='👎', font=('Arial', 9, 'normal'),
-                             bd=1, highlightbackground='SystemButtonFace')
+                             bd=1, highlightbackground=self.button_face_color)
 
     def toggle_rating_filter(self, rating_type):
         """Переключает фильтр по рейтингу"""
@@ -918,22 +927,22 @@ class FreestyleParserApp:
     def update_filter_button_styles(self):
         """Обновляет стиль кнопок фильтров"""
         if "up" in self.active_rating_filters:
-            self.filter_up_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+            self.filter_up_button.config(relief=tk.SUNKEN, bg=self.button_face_color, fg='black',
                                        text='👍', font=('Arial', 11, 'normal'),
                                        bd=2, highlightbackground='blue')
         else:
-            self.filter_up_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+            self.filter_up_button.config(relief=tk.RAISED, bg=self.button_face_color, fg='black',
                                        text='👍', font=('Arial', 11, 'normal'),
-                                       bd=2, highlightbackground='SystemButtonFace')
-            
+                                       bd=2, highlightbackground=self.button_face_color)
+
         if "down" in self.active_rating_filters:
-            self.filter_down_button.config(relief=tk.SUNKEN, bg='SystemButtonFace', fg='black',
+            self.filter_down_button.config(relief=tk.SUNKEN, bg=self.button_face_color, fg='black',
                                          text='👎', font=('Arial', 11, 'normal'),
                                          bd=2, highlightbackground='blue')
         else:
-            self.filter_down_button.config(relief=tk.RAISED, bg='SystemButtonFace', fg='black',
+            self.filter_down_button.config(relief=tk.RAISED, bg=self.button_face_color, fg='black',
                                          text='👎', font=('Arial', 11, 'normal'),
-                                         bd=2, highlightbackground='SystemButtonFace')
+                                         bd=2, highlightbackground=self.button_face_color)
 
     def on_attempt_double_click(self, event, attempt):
         """Обработчик двойного клика по попытке"""

@@ -81,6 +81,31 @@ def download_ffmpeg():
         shutil.rmtree('temp')
         os.remove(zip_file)
     
+    elif system == 'Linux':
+        # Статические сборки BtbN - работают на любом x86_64 Linux без установки ffmpeg
+        url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz'
+
+        # Скачиваем архив
+        tar_file = 'ffmpeg.tar.xz'
+        download_file(url, tar_file)
+
+        # Распаковываем
+        with tarfile.open(tar_file, 'r:xz') as tar_ref:
+            tar_ref.extractall('temp')
+
+        # Копируем нужные файлы
+        shutil.copy2('temp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg', bin_dir)
+        shutil.copy2('temp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe', bin_dir)
+
+        # Делаем файлы исполняемыми (PyInstaller сохраняет права при упаковке
+        # и восстановлении onefile-бандла)
+        os.chmod(os.path.join(bin_dir, 'ffmpeg'), 0o755)
+        os.chmod(os.path.join(bin_dir, 'ffprobe'), 0o755)
+
+        # Удаляем временные файлы
+        shutil.rmtree('temp')
+        os.remove(tar_file)
+
     print("FFmpeg и FFprobe успешно скачаны в папку 'bin'")
 
 if __name__ == '__main__':

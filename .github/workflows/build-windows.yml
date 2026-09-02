@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE & Linux binary
 
 on:
   push:
@@ -51,3 +51,55 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/FreestyleParser.exe
+
+  build-linux:
+    # 22.04, а не latest (24.04): бинарь собранный на glibc 2.39 не запустится
+    # на Ubuntu 22.04; собранный на 2.35 работает и на 22.04, и на 24.04+
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Рантайм-библиотеки cv2 (libGL/libglib) в manylinux-колесе opencv не включены
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 xvfb
+
+      - name: Install dependencies
+        run: |
+          pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests scikit-learn==1.7.0
+          pip install pyinstaller==6.14.1
+
+      # Tkinter именно питона раннера попадёт в бинарник (PyInstaller пакует его tcl/tk),
+      # поэтому проверяем, что он реально работает, а не просто импортируется
+      - name: Smoke-test Tkinter
+        run: >-
+          xvfb-run -a python -c "import tkinter; root = tkinter.Tk();
+          print('Tk OK:', root.tk.call('tk', 'windowingsystem')); root.destroy()"
+
+      - name: Download FFmpeg
+        run: python download_ffmpeg.py
+
+      - name: Build binary
+        run: python build.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreestyleParser-linux-x64
+          path: dist/FreestyleParser
+          if-no-files-found: error
+
+      # В релиз кладём с явным именем, чтобы не путать с exe
+      - name: Rename binary for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cp dist/FreestyleParser dist/FreestyleParser-linux-x64
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FreestyleParser-linux-x64

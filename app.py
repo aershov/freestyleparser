@@ -158,6 +158,11 @@ class FreestyleParserApp:
         self.logger = None
         self.selected_files = []
         self.processing = False
+        # Раздельные флаги задач: скан и нарезка кандидатов могут идти одновременно
+        # (self.processing - общий флаг "идёт работа", сбрасывается кнопкой Остановить)
+        self.scan_running = False
+        self.cut_running = False
+        self._candidates_lock = threading.RLock()
         self.need_update_attempts = False
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self.athlete_widgets = []
@@ -465,16 +470,18 @@ class FreestyleParserApp:
             error_trace = traceback.format_exc()
             self.log(f"Ошибка обработки: {e} {error_trace}")
         finally:
-            self.processing = False
-            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            self.scan_running = False
+            self.processing = self.cut_running
+            self.root.after(0, lambda: self._after_worker_ui(self.processing))
 
     def process_scan(self):
         """Сканирует файлы и собирает кандидатов попыток (ручной режим).
         Кандидаты неточные (шаг SCAN_INTERVAL), нарезаются после подтверждения.
         Повторный скан ДОБАВЛЯЕТ новых кандидатов, не трогая существующие
         (уже отмеченные/нарезанные не пропадают) - удобно, если с первыми
-        параметрами что-то не нашлось."""
+        параметрами что-то не нашлось. Может идти одновременно с нарезкой
+        кандидатов (кнопка 'Нарезать выбранное')."""
+        self.scan_running = True
         try:
             existing = list(self.candidates)
             if existing:
@@ -493,34 +500,42 @@ class FreestyleParserApp:
         except Exception as e:
             self.log(f"Ошибка сканирования: {e} {traceback.format_exc()}", logging.ERROR)
         finally:
-            self.processing = False
-            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            self.scan_running = False
+            self.processing = self.cut_running
+            still_busy = self.processing
+            self.root.after(0, lambda: self._after_worker_ui(still_busy))
             self.root.after(0, self.update_attempt_thumbnails)
-            self.root.after(0, self.update_cut_button_state)
+
+    def _after_worker_ui(self, still_busy):
+        """Обновляет кнопки после завершения задачи; если работают другие - не трогаем."""
+        if not still_busy:
+            self.button_process.config(state=tk.NORMAL)
+            self.button_stop.config(state=tk.DISABLED)
+        self.update_cut_button_state()
 
     def on_candidate_found(self, attempt):
         """Callback сканирования (вызывается из рабочего потока): запоминаем кандидата.
         Ничего не режем - только микропревью и запись в состояние.
         Кандидаты, пересекающиеся с уже найденными, пропускаются."""
-        for c in self.candidates:
-            if c['file'] == attempt.source_video and \
-                    max(c['start'], attempt.start) < min(c['end'], attempt.end):
-                return self.processing  # дубль области - пропускаем
-        idx = len(self.candidates) + 1
-        thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
-        try:
-            cv2.imwrite(thumb_path, attempt.best_frame)
-        except Exception:
-            thumb_path = None
-        self.candidates.append({
-            'file': attempt.source_video,
-            'start': float(attempt.start),
-            'end': float(attempt.end),
-            'thumbnail': thumb_path,
-            'selected': True,
-            'status': 'pending',
-        })
+        with self._candidates_lock:
+            for c in self.candidates:
+                if c['file'] == attempt.source_video and \
+                        max(c['start'], attempt.start) < min(c['end'], attempt.end):
+                    return self.processing  # дубль области - пропускаем
+            idx = len(self.candidates) + 1
+            thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
+            try:
+                cv2.imwrite(thumb_path, attempt.best_frame)
+            except Exception:
+                thumb_path = None
+            self.candidates.append({
+                'file': attempt.source_video,
+                'start': float(attempt.start),
+                'end': float(attempt.end),
+                'thumbnail': thumb_path,
+                'selected': True,
+                'status': 'pending',
+            })
         self.need_update_attempts = True
         self.log(f"Кандидат #{idx}: {os.path.basename(attempt.source_video)} "
                  f"{attempt.start:.1f}s..{attempt.end:.1f}s")
@@ -543,13 +558,17 @@ class FreestyleParserApp:
             self.button_cut_selected.config(state=tk.DISABLED, text="✂️ Нарезать выбранное")
 
     def cut_selected_candidates(self):
-        """Нарезает выбранных кандидатов: точный анализ границ + вырезка"""
-        selected = [c for c in self.candidates if c['status'] == 'pending' and c.get('selected')]
+        """Нарезает выбранных кандидатов: точный анализ границ + вырезка.
+        Может запускаться во время сканирования - идут параллельно."""
+        with self._candidates_lock:
+            selected = [c for c in self.candidates
+                        if c['status'] == 'pending' and c.get('selected')]
         if not selected:
             messagebox.showwarning("Предупреждение", "Не выбрано ни одного кандидата")
             return
-        if self.processing:
+        if self.cut_running:
             return
+        self.cut_running = True
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
@@ -568,8 +587,9 @@ class FreestyleParserApp:
             scan_interval = float(self.processing_params.get('scan_interval', 2.5))
             margin = scan_interval + 1.0  # запас на неточность скана
             # окна уже нарезанных кандидатов (включая прошлые запуски) - чтобы не нарезать дубль
-            cut_windows = [(c['file'], c['start'], c['end'])
-                           for c in self.candidates if c['status'] == 'cut']
+            with self._candidates_lock:
+                cut_windows = [(c['file'], c['start'], c['end'])
+                               for c in self.candidates if c['status'] == 'cut']
             cut_count = 0
             for i, cand in enumerate(selected):
                 if not self.processing:
@@ -608,30 +628,34 @@ class FreestyleParserApp:
                 self.save_candidates()
             self.log(f"Нарезка завершена: попыток {cut_count} из {len(selected)} кандидатов")
         finally:
-            self.processing = False
-            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            self.cut_running = False
+            self.processing = self.scan_running
+            still_busy = self.processing
             self.need_update_attempts = True
-            self.root.after(0, self.update_cut_button_state)
+            self.root.after(0, lambda: self._after_worker_ui(still_busy))
 
     def clear_pending_candidates(self):
         """Удаляет всех неподтверждённых (ненарезанных) кандидатов - для чистого
         пересканирования с нуля. Уже нарезанные не трогаются."""
-        pending = [c for c in self.candidates if c['status'] == 'pending']
-        if not pending:
-            messagebox.showinfo("Кандидаты", "Нет кандидатов для очистки")
+        if self.cut_running:
+            messagebox.showinfo("Кандидаты", "Дождитесь завершения нарезки")
             return
-        if not messagebox.askyesno("Подтверждение",
-                                   f"Удалить {len(pending)} кандидатов (ненарезанных)?"):
-            return
-        for cand in pending:
-            thumb = cand.get('thumbnail')
-            if thumb and os.path.exists(thumb):
-                try:
-                    os.remove(thumb)
-                except OSError:
-                    pass
-        self.candidates = [c for c in self.candidates if c['status'] != 'pending']
+        with self._candidates_lock:
+            pending = [c for c in self.candidates if c['status'] == 'pending']
+            if not pending:
+                messagebox.showinfo("Кандидаты", "Нет кандидатов для очистки")
+                return
+            if not messagebox.askyesno("Подтверждение",
+                                       f"Удалить {len(pending)} кандидатов (ненарезанных)?"):
+                return
+            for cand in pending:
+                thumb = cand.get('thumbnail')
+                if thumb and os.path.exists(thumb):
+                    try:
+                        os.remove(thumb)
+                    except OSError:
+                        pass
+            self.candidates = [c for c in self.candidates if c['status'] != 'pending']
         self.candidate_vars = {}
         self.save_candidates()
         self.update_cut_button_state()
@@ -639,14 +663,15 @@ class FreestyleParserApp:
         self.log(f"Кандидаты очищены (удалено {len(pending)})")
 
     def save_candidates(self):
-        """Сохраняет кандидатов в candidates.yaml"""
-        if not self.candidates_file:
-            return
-        data = {'candidates': [
-            {'file': c['file'], 'start': c['start'], 'end': c['end'],
-             'thumbnail': c.get('thumbnail'), 'selected': bool(c.get('selected')),
-             'status': c['status']}
-            for c in self.candidates]}
+        """Сохраняет кандидатов в candidates.yaml (потокобезопасно)"""
+        with self._candidates_lock:
+            if not self.candidates_file:
+                return
+            data = {'candidates': [
+                {'file': c['file'], 'start': c['start'], 'end': c['end'],
+                 'thumbnail': c.get('thumbnail'), 'selected': bool(c.get('selected')),
+                 'status': c['status']}
+                for c in self.candidates]}
         try:
             os.makedirs(os.path.dirname(self.candidates_file), exist_ok=True)
             with open(self.candidates_file, 'w', encoding='utf-8') as f:
@@ -1796,10 +1821,7 @@ class FreestyleParserApp:
         self.processing = False
         self.log("Обработка прервана пользователем.")
 
-        # Блокируем кнопки
-        self.button_stop.config(state=tk.DISABLED)
-        self.button_process.config(state=tk.NORMAL)
-
+        # Кнопки переключат финальные блоки задач после остановки всех потоков
         self.progress_var.set(0)
 
     def load_processing_config(self):

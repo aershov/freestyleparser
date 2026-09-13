@@ -176,6 +176,7 @@ class FreestyleParserApp:
         self.slowmo_var = None  # tk.BooleanVar, создаётся в setup_ui
         self._active_slowmo_factor = 1  # коэффициент замедления текущей обработки
         self._audio_stream_cache = {}  # video_path -> bool (есть ли аудио-дорожка)
+        self._file_duration_cache = {}  # video_path -> длительность файла, с
         self.strategy_var = None  # 'auto' | 'manual', создаётся в setup_ui
         self.candidates = []  # кандидаты попыток ручного режима: {file,start,end,thumbnail,selected,status}
         self.candidate_vars = {}  # ключ кандидата -> tk.BooleanVar чекбокса
@@ -368,6 +369,42 @@ class FreestyleParserApp:
             self._audio_stream_cache[video_path] = has_audio_stream(video_path)
         return self._audio_stream_cache[video_path]
 
+    def _get_file_duration(self, video_path):
+        """Длительность видеофайла в секундах (с кэшем по файлу)"""
+        if video_path not in self._file_duration_cache:
+            try:
+                d = float(subprocess.check_output(
+                    [get_ffprobe_path(), '-v', 'error', '-show_entries', 'format=duration',
+                     '-of', 'csv=p=0', video_path], timeout=30).decode().strip())
+            except Exception:
+                d = 0.0
+            self._file_duration_cache[video_path] = d
+        return self._file_duration_cache[video_path]
+
+    def _estimate_output_bytes(self, video_path, duration_real):
+        """Оценка размера нарезанного видео по битрейту исходника.
+        Без слоумо - потоковое копирование: размер = битрейт * длительность.
+        Слоумо - перекодирование x264 crf18: по замеру на реальном 4K-исходнике
+        выход получается ~в 3 раза меньше битрейта камеры (эмпирический /3)."""
+        slowmo = 4 if (self.slowmo_var and self.slowmo_var.get()) else 1
+        try:
+            size = os.path.getsize(video_path)
+        except OSError:
+            return 0
+        fdur = self._get_file_duration(video_path)
+        if size <= 0 or fdur <= 0 or duration_real <= 0:
+            return 0
+        return size / fdur * duration_real * slowmo / (3.0 if slowmo > 1 else 1.0)
+
+    @staticmethod
+    def _fmt_size(nbytes):
+        """Человекочитаемый размер: КБ/МБ/ГБ"""
+        if nbytes >= 1024 ** 3:
+            return f"{nbytes / 1024 ** 3:.1f} ГБ"
+        if nbytes >= 1024 ** 2:
+            return f"{nbytes / 1024 ** 2:.0f} МБ"
+        return f"{nbytes / 1024:.0f} КБ"
+
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
         cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
@@ -550,12 +587,29 @@ class FreestyleParserApp:
         self.save_candidates()
 
     def update_cut_button_state(self):
-        """Обновляет кнопку нарезки выбранных кандидатов"""
-        n = sum(1 for c in self.candidates if c['status'] == 'pending' and c.get('selected'))
+        """Обновляет кнопку нарезки выбранных кандидатов: количество и примерный объём выхлопа"""
+        with self._candidates_lock:
+            selected = [c for c in self.candidates
+                        if c['status'] == 'pending' and c.get('selected')]
+        n = len(selected)
+        text = "✂️ Нарезать выбранное"
         if n > 0:
-            self.button_cut_selected.config(state=tk.NORMAL, text=f"✂️ Нарезать выбранное ({n})")
+            text += f" ({n})"
+            try:
+                start_pad = self.processing_params['attempt_start_padding']
+                end_pad = self.processing_params['attempt_end_padding']
+                scan_interval = float(self.processing_params.get('scan_interval', 2.5))
+                margin = scan_interval + 1.0  # как в _cut_candidates_thread
+                total = sum(self._estimate_output_bytes(
+                    c['file'], c['end'] - c['start'] + start_pad + end_pad + margin)
+                    for c in selected)
+                if total > 0:
+                    text += f" ≈{self._fmt_size(total)}"
+            except Exception:
+                pass
+            self.button_cut_selected.config(state=tk.NORMAL, text=text)
         else:
-            self.button_cut_selected.config(state=tk.DISABLED, text="✂️ Нарезать выбранное")
+            self.button_cut_selected.config(state=tk.DISABLED, text=text)
 
     def cut_selected_candidates(self):
         """Нарезает выбранных кандидатов: точный анализ границ + вырезка.
@@ -1067,11 +1121,6 @@ class FreestyleParserApp:
                                              command=self.cut_selected_candidates, state=tk.DISABLED)
         self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
 
-        # Очистка ненарезанных кандидатов (для пересканирования с нуля)
-        self.button_clear_candidates = tk.Button(self.actions_frame, text="🧹 Кандидаты",
-                                                 command=self.clear_pending_candidates)
-        self.button_clear_candidates.pack(side=tk.RIGHT, padx=5)
-
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
         self.attempts_scrollbar = ttk.Scrollbar(self.frame_attempts, orient="vertical", command=self.attempts_canvas.yview)
@@ -1259,24 +1308,33 @@ class FreestyleParserApp:
         pending = [c for c in self.candidates if c['status'] == 'pending']
         self.candidate_vars.clear()
         if pending:
-            sep = tk.Label(self.attempts_scrollable_frame,
-                           text=f"—— Кандидаты ({len(pending)}): снимите галочки с ненужных, затем «Нарезать выбранное» ——",
-                           fg="#555555")
-            sep.grid(row=row + 1, column=0, columnspan=max_cols, pady=(12, 2))
+            sep_frame = tk.Frame(self.attempts_scrollable_frame)
+            sep_frame.grid(row=row + 1, column=0, columnspan=max_cols, pady=(12, 2))
+            tk.Label(sep_frame,
+                     text=f"—— Кандидаты ({len(pending)}): снимите галочки с ненужных, "
+                          f"затем «Нарезать выбранное» ——",
+                     fg="#555555").pack(side=tk.LEFT)
+            # Очистка ненарезанных кандидатов (для пересканирования с нуля)
+            clear_btn = tk.Button(sep_frame, text="🧹", width=3, bd=1,
+                                  command=self.clear_pending_candidates)
+            clear_btn.pack(side=tk.LEFT, padx=8)
+            self._attach_tooltip(clear_btn, "Удалить всех ненарезанных кандидатов\n"
+                                            "(пересканировать с нуля)")
             crow, ccol = row + 2, 0
             for cand in pending:
                 frame = tk.Frame(self.attempts_scrollable_frame)
                 frame.grid(row=crow, column=ccol, padx=5, pady=5)
 
+                img_label = None
                 thumb = cand.get('thumbnail')
                 if thumb and os.path.exists(thumb):
                     try:
                         image = Image.open(thumb)
                         image = image.resize((200, 150), Image.Resampling.LANCZOS)
                         photo = ImageTk.PhotoImage(image)
-                        label = tk.Label(frame, image=photo)
-                        label.image = photo
-                        label.pack()
+                        img_label = tk.Label(frame, image=photo)
+                        img_label.image = photo
+                        img_label.pack()
                     except Exception as e:
                         self.log(f"Ошибка превью кандидата: {e}")
 
@@ -1288,8 +1346,25 @@ class FreestyleParserApp:
                                           command=lambda c=cand, v=var: self.on_candidate_checkbox_change(c, v))
                 checkbox.pack(side=tk.LEFT, padx=(0, 5))
 
-                tk.Label(name_frame, text=f"{os.path.basename(cand['file'])} "
-                                          f"{cand['start']:.0f}-{cand['end']:.0f}s").pack(side=tk.LEFT)
+                # Компактная подпись: имя без расширения, диапазон, оценка объёма выхлопа
+                stem = os.path.splitext(os.path.basename(cand['file']))[0]
+                est = self._estimate_output_bytes(
+                    cand['file'],
+                    cand['end'] - cand['start'] + self.processing_params['attempt_start_padding']
+                    + self.processing_params['attempt_end_padding']
+                    + float(self.processing_params.get('scan_interval', 2.5)) + 1.0)
+                size_txt = f" ≈{self._fmt_size(est)}" if est > 0 else ""
+                name_label = tk.Label(name_frame, text=f"{stem} {cand['start']:.0f}–"
+                                                       f"{cand['end']:.0f}s{size_txt}")
+                name_label.pack(side=tk.LEFT)
+
+                # Двойной клик - превью кандидата в полном размере
+                for w in (img_label, name_label):
+                    if w is not None:
+                        w.bind('<Double-Button-1>',
+                               lambda e, c=cand: self.show_candidate_preview(c))
+                        w.bind('<Button-3>',
+                               lambda e, c=cand: self.show_candidate_preview(c))
 
                 self.candidate_vars[self._candidate_key(cand)] = var
 
@@ -1464,6 +1539,60 @@ class FreestyleParserApp:
 
         # Открываем видео
         self.open_video(attempt)
+
+    def show_candidate_preview(self, cand):
+        """Превью кандидата в сохранённом (полном) размере - попапом.
+        Закрывается кликом или Esc."""
+        thumb = cand.get('thumbnail')
+        if not thumb or not os.path.exists(thumb):
+            messagebox.showinfo("Превью", "Превью кандидата не найдено")
+            return
+        try:
+            img = Image.open(thumb)
+        except Exception as e:
+            self.log(f"Не удалось открыть превью: {e}")
+            return
+        # Не выходим за пределы экрана
+        max_w = self.root.winfo_screenwidth() - 80
+        max_h = self.root.winfo_screenheight() - 120
+        if img.width > max_w or img.height > max_h:
+            img = img.copy()
+            img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+        top = tk.Toplevel(self.root)
+        stem = os.path.splitext(os.path.basename(cand['file']))[0]
+        top.title(f"{stem} {cand['start']:.0f}–{cand['end']:.0f}s")
+        photo = ImageTk.PhotoImage(img)
+        label = tk.Label(top, image=photo, cursor="hand2")
+        label.image = photo
+        label.pack()
+        top.resizable(False, False)
+        for seq in ('<Button-1>', '<Escape>', '<Return>'):
+            top.bind(seq, lambda e: top.destroy())
+        label.focus_set()
+        top.grab_set()
+
+    def _attach_tooltip(self, widget, text):
+        """Простой всплывающий хинт при наведении"""
+        tip = {'tw': None}
+
+        def enter(_):
+            if tip['tw']:
+                return
+            tw = tk.Toplevel(widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{widget.winfo_rootx() + 12}+"
+                           f"{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            tk.Label(tw, text=text, bg="#ffffe0", relief="solid", borderwidth=1,
+                     justify=tk.LEFT, font=('Arial', 9)).pack()
+            tip['tw'] = tw
+
+        def leave(_):
+            if tip['tw']:
+                tip['tw'].destroy()
+                tip['tw'] = None
+
+        widget.bind('<Enter>', enter)
+        widget.bind('<Leave>', leave)
 
     def show_attempt_file(self, attempt):
         """Открывает папку с файлом попытки и выделяет его"""

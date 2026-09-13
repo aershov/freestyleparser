@@ -14,7 +14,7 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model, SCAN_INTERVAL
+from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model
 import sys
 import traceback
 
@@ -471,9 +471,15 @@ class FreestyleParserApp:
 
     def process_scan(self):
         """Сканирует файлы и собирает кандидатов попыток (ручной режим).
-        Кандидаты неточные (шаг SCAN_INTERVAL), нарезаются после подтверждения."""
+        Кандидаты неточные (шаг SCAN_INTERVAL), нарезаются после подтверждения.
+        Повторный скан ДОБАВЛЯЕТ новых кандидатов, не трогая существующие
+        (уже отмеченные/нарезанные не пропадают) - удобно, если с первыми
+        параметрами что-то не нашлось."""
         try:
-            self._clear_candidates()
+            existing = list(self.candidates)
+            if existing:
+                self.log(f"Пересканирование: {len(existing)} существующих кандидатов сохраняются, "
+                         f"новые добавляются без дублей")
             process_video(self.selected_files, self.roi, self.on_candidate_found,
                           1, params=self.processing_params,
                           progress_callback=self.on_processing_progress,
@@ -482,7 +488,7 @@ class FreestyleParserApp:
                           scan_mode=True)
             self.save_candidates()
             pending = [c for c in self.candidates if c['status'] == 'pending']
-            self.log(f"Сканирование завершено: найдено {len(pending)} кандидатов. "
+            self.log(f"Сканирование завершено: всего кандидатов {len(pending)}. "
                      f"Снимите галочки с ненужных попыток и нажмите 'Нарезать выбранное'.")
         except Exception as e:
             self.log(f"Ошибка сканирования: {e} {traceback.format_exc()}", logging.ERROR)
@@ -495,7 +501,12 @@ class FreestyleParserApp:
 
     def on_candidate_found(self, attempt):
         """Callback сканирования (вызывается из рабочего потока): запоминаем кандидата.
-        Ничего не режем - только микропревью и запись в состояние."""
+        Ничего не режем - только микропревью и запись в состояние.
+        Кандидаты, пересекающиеся с уже найденными, пропускаются."""
+        for c in self.candidates:
+            if c['file'] == attempt.source_video and \
+                    max(c['start'], attempt.start) < min(c['end'], attempt.end):
+                return self.processing  # дубль области - пропускаем
         idx = len(self.candidates) + 1
         thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
         try:
@@ -554,11 +565,20 @@ class FreestyleParserApp:
             model = load_yolo_model()
             start_pad = self.processing_params['attempt_start_padding']
             end_pad = self.processing_params['attempt_end_padding']
-            margin = SCAN_INTERVAL + 1.0  # запас на неточность скана
+            scan_interval = float(self.processing_params.get('scan_interval', 2.5))
+            margin = scan_interval + 1.0  # запас на неточность скана
+            # окна уже нарезанных кандидатов (включая прошлые запуски) - чтобы не нарезать дубль
+            cut_windows = [(c['file'], c['start'], c['end'])
+                           for c in self.candidates if c['status'] == 'cut']
             cut_count = 0
             for i, cand in enumerate(selected):
                 if not self.processing:
                     break
+                if any(f == cand['file'] and max(s, cand['start']) < min(e, cand['end'])
+                       for f, s, e in cut_windows):
+                    self.log(f"Кандидат {i + 1}/{len(selected)} пересекается с уже нарезанной "
+                             f"попыткой - пропущен")
+                    continue
                 win_start = max(0.0, cand['start'] - start_pad - margin)
                 win_end = cand['end'] + end_pad + margin
                 next_num = get_next_attempt_number(self.output_folder)
@@ -582,6 +602,7 @@ class FreestyleParserApp:
                 if found:
                     cand['status'] = 'cut'
                     cut_count += len(found)
+                    cut_windows.append((cand['file'], cand['start'], cand['end']))
                 else:
                     self.log("В окне кандидата попыток не найдено - пропущен")
                 self.save_candidates()
@@ -593,18 +614,29 @@ class FreestyleParserApp:
             self.need_update_attempts = True
             self.root.after(0, self.update_cut_button_state)
 
-    def _clear_candidates(self):
-        """Удаляет всех кандидатов и их превью (перед новым сканированием)"""
-        for cand in self.candidates:
+    def clear_pending_candidates(self):
+        """Удаляет всех неподтверждённых (ненарезанных) кандидатов - для чистого
+        пересканирования с нуля. Уже нарезанные не трогаются."""
+        pending = [c for c in self.candidates if c['status'] == 'pending']
+        if not pending:
+            messagebox.showinfo("Кандидаты", "Нет кандидатов для очистки")
+            return
+        if not messagebox.askyesno("Подтверждение",
+                                   f"Удалить {len(pending)} кандидатов (ненарезанных)?"):
+            return
+        for cand in pending:
             thumb = cand.get('thumbnail')
             if thumb and os.path.exists(thumb):
                 try:
                     os.remove(thumb)
                 except OSError:
                     pass
-        self.candidates = []
+        self.candidates = [c for c in self.candidates if c['status'] != 'pending']
         self.candidate_vars = {}
         self.save_candidates()
+        self.update_cut_button_state()
+        self.update_attempt_thumbnails()
+        self.log(f"Кандидаты очищены (удалено {len(pending)})")
 
     def save_candidates(self):
         """Сохраняет кандидатов в candidates.yaml"""
@@ -911,6 +943,8 @@ class FreestyleParserApp:
             ('attempt_start_padding', 'Запас к началу'),
             ('attempt_end_padding', 'Запас к концу'),
             ('min_detection_strength', 'Мин. сила детекции (0-1)'),
+            ('scan_interval', 'Шаг скана, с'),
+            ('scan_threshold', 'Порог скана (0-1)'),
         ]
 
         self.param_vars = {}
@@ -1007,6 +1041,11 @@ class FreestyleParserApp:
         self.button_cut_selected = tk.Button(self.actions_frame, text="✂️ Нарезать выбранное",
                                              command=self.cut_selected_candidates, state=tk.DISABLED)
         self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
+
+        # Очистка ненарезанных кандидатов (для пересканирования с нуля)
+        self.button_clear_candidates = tk.Button(self.actions_frame, text="🧹 Кандидаты",
+                                                 command=self.clear_pending_candidates)
+        self.button_clear_candidates.pack(side=tk.RIGHT, padx=5)
 
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)

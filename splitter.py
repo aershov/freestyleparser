@@ -14,7 +14,8 @@ YOLO_MAX_WIDTH = 600  # уменьшаем кадр перед анализом 
 TARGET_ANALYSIS_FPS = 5  # Целевая частота анализа (сэмплов в секунду реального времени)
 MIN_DETECTION_TIME = 0.6  # Минимальное время (в секундах) с детекциями для начала попытки
 
-# Режим сканирования (ручной выбор попыток)
+# Режим сканирования (ручной выбор попыток): значения по умолчанию,
+# настраиваются в UI через params 'scan_interval' и 'scan_threshold'
 SCAN_INTERVAL = 2.5     # Шаг сканирования, секунд реального времени между сэмплами
 SCAN_CONFIDENCE = 0.25  # Пониженный порог YOLO для сканирования
 
@@ -24,6 +25,8 @@ DEFAULT_PROCESSING_PARAMS = {
     'attempt_start_padding': 2,    # Запас времени (в секундах) к началу попытки
     'attempt_end_padding': 0.5,    # Запас времени (в секундах) от конца попытки
     'min_detection_strength': 0.5, # Минимальная сила сигнала (0-1) для начала/продолжения попытки
+    'scan_interval': 2.5,          # Шаг сканирования (ручной режим), сек реального времени
+    'scan_threshold': 0.25,        # Порог YOLO при сканировании (ниже порога обычного анализа)
 }
 
 np.seterr(divide='ignore', invalid='ignore')
@@ -210,7 +213,8 @@ class _Detector:
         self.range_start = range_start
         self.range_end = range_end
 
-        self.conf_threshold = SCAN_CONFIDENCE if scan_mode else YOLO_CONFIDENCE_THRESHOLD
+        self.conf_threshold = (float(params.get('scan_threshold', SCAN_CONFIDENCE))
+                               if scan_mode else YOLO_CONFIDENCE_THRESHOLD)
         self.min_pause = params['min_pause_duration']
         self.window_size = max(2, int(round(MIN_DETECTION_TIME * self.rate)))
         self.pause_samples = max(1, self.min_pause * self.rate)  # float, как в оригинале
@@ -405,9 +409,9 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     should_continue() - если вернёт False, обработка останавливается (кнопка "Остановить").
     slowmo_factor - коэффициент замедления записи (например, 4 для слоумо 96 к/с,
     записанного как 24 к/с). Все времена - в реальных секундах.
-    scan_mode - режим сканирования: редкие сэмплы (SCAN_INTERVAL, точечный seek)
-    и пониженный порог; попытки возвращаются как кандидаты
-    (AttemptInfo.is_candidate=True), без точных границ.
+    scan_mode - режим сканирования: редкие сэмплы (шаг params['scan_interval'],
+    точечный seek) и пониженный порог params['scan_threshold'];
+    попытки возвращаются как кандидаты (AttemptInfo.is_candidate=True), без точных границ.
     model - предзагруженная модель YOLO (переиспользуется между вызовами).
     restrict_range - (start_real, end_real): анализировать только этот диапазон
     реального времени (для точной стадии ручного режима).
@@ -421,7 +425,8 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     video_files = sorted(input_paths, key=os.path.basename)
     attempt_number = begin_attempt_number
     file_count = len(video_files)
-    sample_rate = (1.0 / SCAN_INTERVAL) if scan_mode else TARGET_ANALYSIS_FPS
+    scan_interval = float(params.get('scan_interval', SCAN_INTERVAL))
+    sample_rate = (1.0 / scan_interval) if scan_mode else TARGET_ANALYSIS_FPS
     range_start, range_end = restrict_range if restrict_range else (None, None)
 
     for file_index, video_file in enumerate(video_files):

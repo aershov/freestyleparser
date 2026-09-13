@@ -1,5 +1,6 @@
 import numpy as np
 import tkinter as tk
+import calendar
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import cv2
 from PIL import Image, ImageTk
@@ -13,7 +14,7 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video, DEFAULT_PROCESSING_PARAMS
+from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model, SCAN_INTERVAL
 import sys
 import traceback
 
@@ -58,6 +59,78 @@ def create_polygon_mask(polygon_points, width, height):
     cv2.fillPoly(mask, [polygon_array], 255)
     return mask
 
+class DatePicker(tk.Toplevel):
+    """Простой модальный диалог выбора дня (без внешних зависимостей).
+    После wait_window(dialog) результат в dialog.result (datetime.date или None)."""
+
+    MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль',
+              'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
+    WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+
+    def __init__(self, parent, initial=None):
+        super().__init__(parent)
+        self.title("Выберите день")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result = None
+        if initial is not None:
+            self.year, self.month = initial.year, initial.month
+        else:
+            today = datetime.date.today()
+            self.year, self.month = today.year, today.month
+
+        header = tk.Frame(self)
+        header.pack(fill=tk.X, padx=8, pady=6)
+        tk.Button(header, text="◀", width=3, command=lambda: self._shift(-1)).pack(side=tk.LEFT)
+        self.month_label = tk.Label(header, width=16, font=('Arial', 11, 'bold'))
+        self.month_label.pack(side=tk.LEFT, expand=True)
+        tk.Button(header, text="▶", width=3, command=lambda: self._shift(1)).pack(side=tk.LEFT)
+
+        self.grid_frame = tk.Frame(self)
+        self.grid_frame.pack(padx=8, pady=4)
+
+        buttons = tk.Frame(self)
+        buttons.pack(fill=tk.X, padx=8, pady=6)
+        tk.Button(buttons, text="Сегодня", command=self._pick_today).pack(side=tk.LEFT)
+        tk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
+
+        self._render()
+        self.grab_set()
+
+    def _render(self):
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        self.month_label.config(text=f"{self.MONTHS[self.month - 1]} {self.year}")
+        for i, wd in enumerate(self.WEEKDAYS):
+            tk.Label(self.grid_frame, text=wd, width=4).grid(row=0, column=i)
+        today = datetime.date.today()
+        for r, week in enumerate(calendar.monthcalendar(self.year, self.month), start=1):
+            for c, day in enumerate(week):
+                if not day:
+                    tk.Label(self.grid_frame, width=4).grid(row=r, column=c)
+                    continue
+                d = datetime.date(self.year, self.month, day)
+                text = f"•{day}" if d == today else str(day)
+                tk.Button(self.grid_frame, text=text, width=4,
+                          command=lambda dd=d: self._pick(dd)).grid(row=r, column=c)
+
+    def _shift(self, delta):
+        m = self.month + delta
+        if m < 1:
+            m, self.year = 12, self.year - 1
+        elif m > 12:
+            m, self.year = 1, self.year + 1
+        self.month = m
+        self._render()
+
+    def _pick(self, d):
+        self.result = d
+        self.destroy()
+
+    def _pick_today(self):
+        self._pick(datetime.date.today())
+
+
 class FreestyleParserApp:
     def __init__(self, root):
         self.root = root
@@ -70,7 +143,12 @@ class FreestyleParserApp:
         self._app_folder = os.path.expanduser("~/.FreestyleParser")
         if not os.path.exists(self._app_folder):
             os.makedirs(self._app_folder, exist_ok=True)
-        self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")
+        # Рабочая папка: последняя использованная, иначе папка текущего дня
+        last_folder = self._load_last_folder()
+        if last_folder:
+            self.output_folder = last_folder
+        else:
+            self.output_folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{formatted_date}")
         self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
         #TODO почистить это всё (
         self.roi = None  # Теперь это будет список точек многоугольника в процентах
@@ -90,6 +168,14 @@ class FreestyleParserApp:
         self.active_rating_filters = set()  # Множество активных фильтров по рейтингу
         self.processing_params = DEFAULT_PROCESSING_PARAMS.copy()
         self._progress_percent = 0.0
+        self.slowmo_var = None  # tk.BooleanVar, создаётся в setup_ui
+        self._active_slowmo_factor = 1  # коэффициент замедления текущей обработки
+        self._audio_stream_cache = {}  # video_path -> bool (есть ли аудио-дорожка)
+        self.strategy_var = None  # 'auto' | 'manual', создаётся в setup_ui
+        self.candidates = []  # кандидаты попыток ручного режима: {file,start,end,thumbnail,selected,status}
+        self.candidate_vars = {}  # ключ кандидата -> tk.BooleanVar чекбокса
+        self.candidates_file = None  # путь candidates.yaml, обновляется в on_output_folder_changed
+        self._scan_found = 0
 
         # self.on_output_folder_changed()
 
@@ -98,6 +184,11 @@ class FreestyleParserApp:
         self._setup_window_icon()
         if os.path.exists(self.output_folder):
             self.on_output_folder_changed()
+        else:
+            # Папки нет - явно показываем это в интерфейсе
+            self.update_folder_status()
+            print(f"Рабочая папка не существует: {self.output_folder} - "
+                  f"выберите день (📅) или папку (Изменить)")
         # Запускаем периодическое обновление
         self.root.after(1000, self.periodic_update)
 
@@ -172,6 +263,68 @@ class FreestyleParserApp:
         """Обработчик изменения фильтра"""
         self.need_update_attempts = True  # Устанавливаем флаг обновления
 
+    def _settings_file(self):
+        return os.path.join(self._app_folder, "settings.yaml")
+
+    def _load_last_folder(self):
+        """Последняя рабочая папка из настроек (если ещё существует)"""
+        try:
+            f = self._settings_file()
+            if os.path.exists(f):
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh) or {}
+                p = data.get('last_output_folder')
+                if p and os.path.isdir(p):
+                    return p
+        except Exception:
+            pass
+        return None
+
+    def _save_settings(self):
+        """Сохраняет последнюю рабочую папку"""
+        try:
+            with open(self._settings_file(), "w", encoding="utf-8") as f:
+                yaml.dump({'last_output_folder': self.output_folder}, f, allow_unicode=True)
+        except Exception as e:
+            print(f"Не удалось сохранить настройки: {e}")
+
+    def _set_output_folder(self, folder, log_message=None):
+        """Переключает рабочую папку: UI, состояние, настройки"""
+        self.output_folder = folder
+        self.entry_output.config(state='normal')
+        self.entry_output.delete(0, tk.END)
+        self.entry_output.insert(0, os.path.basename(folder))
+        self.entry_output.config(state='readonly')
+        self._save_settings()
+        self.on_output_folder_changed()
+        self.log(log_message or f"Рабочая папка: {folder}")
+
+    def update_folder_status(self):
+        """Показывает состояние рабочей папки: создана или нет"""
+        if not hasattr(self, 'folder_status_label'):
+            return
+        if os.path.isdir(self.output_folder):
+            self.folder_status_label.config(text="✓ папка создана", fg="#2e7d32")
+            self.entry_output.config(bg='white')
+        else:
+            self.folder_status_label.config(
+                text="✗ папка не создана — выберите 📅 день или папку", fg="#c62828")
+            self.entry_output.config(bg='#ffdddd')
+
+    def choose_day_folder(self):
+        """Выбор папки дня через календарь: ~/Desktop/FreestyleParser/YYYY-MM-DD"""
+        dialog = DatePicker(self.root, datetime.date.today())
+        self.root.wait_window(dialog)
+        d = dialog.result
+        if d is None:
+            return
+        folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{d.isoformat()}")
+        self._set_output_folder(folder, f"Рабочая папка дня: {folder}")
+
+    def on_filter_change(self, event):
+        """Обработчик изменения фильтра"""
+        self.need_update_attempts = True  # Устанавливаем флаг обновления
+
     @property
     def canvas_width(self):
         w = self.canvas.winfo_width()
@@ -192,13 +345,23 @@ class FreestyleParserApp:
             messagebox.showwarning("Предупреждение", "Сначала выберите область интереса")
             return
         self.processing = True
+        self._active_slowmo_factor = 4 if (self.slowmo_var and self.slowmo_var.get()) else 1
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
         self._progress_percent = 0.0
         self.progress_var.set(0)
         self.log(f"Запускаем процессинг файлов с roi={self.roi}")
         # Запускаем обработку в отдельном потоке
-        threading.Thread(target=self.process_videos, daemon=True).start()
+        if self.strategy_var and self.strategy_var.get() == 'manual':
+            threading.Thread(target=self.process_scan, daemon=True).start()
+        else:
+            threading.Thread(target=self.process_videos, daemon=True).start()
+
+    def _video_has_audio(self, video_path):
+        """Проверяет наличие аудио-дорожки (с кэшем по файлу)"""
+        if video_path not in self._audio_stream_cache:
+            self._audio_stream_cache[video_path] = has_audio_stream(video_path)
+        return self._audio_stream_cache[video_path]
 
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
@@ -214,11 +377,29 @@ class FreestyleParserApp:
         if duration <= 0:
             self.log(f"Пропускаем попытку {attempt.number}: start={attempt.start:.2f}s >= end={attempt.end:.2f}s")
             return self.processing
-        self.log(f"Saving attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {duration:.2f}s)")
+        slowmo = self._active_slowmo_factor
+        if slowmo > 1:
+            # Слоумо: attempt.start/end в реальных секундах, файл длиннее реального
+            # времени в slowmo раз (таймстампы растянуты), поэтому файловое время =
+            # реальное * slowmo. Перекодируем с setpts, чтобы получить видео обычной
+            # скорости с полным fps съёмки (например, 96 к/с).
+            file_start = attempt.start * slowmo
+            self.log(f"Слоумо 1/{slowmo}: файл {file_start:.2f}s..{file_start + duration * slowmo:.2f}s, "
+                     f"перекодирование в обычную скорость")
+            cmd = [get_ffmpeg_path(), "-ss", f"{file_start:.3f}", "-i", attempt.source_video,
+                   "-t", f"{duration:.3f}",
+                   "-vf", f"setpts=PTS/{slowmo}",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            if self._video_has_audio(attempt.source_video):
+                cmd += ["-af", f"atempo={slowmo}", "-c:a", "aac"]
+            cmd += ["-y", output_file]
+        else:
+            cmd = [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
+                   "-t", str(duration), "-c", "copy", "-y", output_file]
         try:
             result = subprocess.run(
-                [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
-                 "-t", str(duration), "-c", "copy", "-y", output_file],
+                cmd,
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode != 0:
@@ -230,6 +411,21 @@ class FreestyleParserApp:
         except Exception as e:
             self.log(f"Ошибка запуска ffmpeg для попытки {attempt.number}: {e}", logging.ERROR)
             return self.processing
+
+        # Контрольная проверка: длительность выхода должна совпадать с ожидаемой.
+        # Расхождение означает, что вырезка попала не туда (например, неверный
+        # режим слоумо или кривые таймстампы исходника).
+        try:
+            out_duration = float(subprocess.check_output(
+                [get_ffprobe_path(), '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', output_file]).decode().strip())
+            if abs(out_duration - duration) > max(1.0, duration * 0.2):
+                self.log(f"ВНИМАНИЕ: попытка {attempt.number}: длительность результата "
+                         f"{out_duration:.2f}s сильно отличается от ожидаемой {duration:.2f}s - "
+                         f"проверьте режим слоумо", logging.WARNING)
+        except Exception:
+            pass
+
         # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
 
         self.need_update_attempts = True
@@ -256,13 +452,14 @@ class FreestyleParserApp:
 
 
     def process_videos(self):
-        """Обрабатывает видео в отдельном потоке"""
+        """Обрабатывает видео в отдельном потоке (авто-режим: нарезать всё)"""
         try:
             next_attempt_number = get_next_attempt_number(self.output_folder)
             process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
                           next_attempt_number, params=self.processing_params,
                           progress_callback=self.on_processing_progress,
-                          should_continue=lambda: self.processing)
+                          should_continue=lambda: self.processing,
+                          slowmo_factor=self._active_slowmo_factor)
             self.log(f"Файлы {self.selected_files} успешно обработаны.")
         except Exception as e:
             error_trace = traceback.format_exc()
@@ -271,6 +468,184 @@ class FreestyleParserApp:
             self.processing = False
             self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+
+    def process_scan(self):
+        """Сканирует файлы и собирает кандидатов попыток (ручной режим).
+        Кандидаты неточные (шаг SCAN_INTERVAL), нарезаются после подтверждения."""
+        try:
+            self._clear_candidates()
+            process_video(self.selected_files, self.roi, self.on_candidate_found,
+                          1, params=self.processing_params,
+                          progress_callback=self.on_processing_progress,
+                          should_continue=lambda: self.processing,
+                          slowmo_factor=self._active_slowmo_factor,
+                          scan_mode=True)
+            self.save_candidates()
+            pending = [c for c in self.candidates if c['status'] == 'pending']
+            self.log(f"Сканирование завершено: найдено {len(pending)} кандидатов. "
+                     f"Снимите галочки с ненужных попыток и нажмите 'Нарезать выбранное'.")
+        except Exception as e:
+            self.log(f"Ошибка сканирования: {e} {traceback.format_exc()}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            self.root.after(0, self.update_attempt_thumbnails)
+            self.root.after(0, self.update_cut_button_state)
+
+    def on_candidate_found(self, attempt):
+        """Callback сканирования (вызывается из рабочего потока): запоминаем кандидата.
+        Ничего не режем - только микропревью и запись в состояние."""
+        idx = len(self.candidates) + 1
+        thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
+        try:
+            cv2.imwrite(thumb_path, attempt.best_frame)
+        except Exception:
+            thumb_path = None
+        self.candidates.append({
+            'file': attempt.source_video,
+            'start': float(attempt.start),
+            'end': float(attempt.end),
+            'thumbnail': thumb_path,
+            'selected': True,
+            'status': 'pending',
+        })
+        self.need_update_attempts = True
+        self.log(f"Кандидат #{idx}: {os.path.basename(attempt.source_video)} "
+                 f"{attempt.start:.1f}s..{attempt.end:.1f}s")
+        return self.processing
+
+    def _candidate_key(self, cand):
+        return (cand['file'], round(cand['start'], 2))
+
+    def on_candidate_checkbox_change(self, cand, var):
+        cand['selected'] = var.get()
+        self.update_cut_button_state()
+        self.save_candidates()
+
+    def update_cut_button_state(self):
+        """Обновляет кнопку нарезки выбранных кандидатов"""
+        n = sum(1 for c in self.candidates if c['status'] == 'pending' and c.get('selected'))
+        if n > 0:
+            self.button_cut_selected.config(state=tk.NORMAL, text=f"✂️ Нарезать выбранное ({n})")
+        else:
+            self.button_cut_selected.config(state=tk.DISABLED, text="✂️ Нарезать выбранное")
+
+    def cut_selected_candidates(self):
+        """Нарезает выбранных кандидатов: точный анализ границ + вырезка"""
+        selected = [c for c in self.candidates if c['status'] == 'pending' and c.get('selected')]
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Не выбрано ни одного кандидата")
+            return
+        if self.processing:
+            return
+        self.processing = True
+        self.button_process.config(state=tk.DISABLED)
+        self.button_stop.config(state=tk.NORMAL)
+        self._progress_percent = 0.0
+        self.progress_var.set(0)
+        threading.Thread(target=self._cut_candidates_thread, args=(selected,), daemon=True).start()
+
+    def _cut_candidates_thread(self, selected):
+        """Точная стадия ручного режима: для каждого кандидата - полный анализ
+        в узком окне вокруг него и вырезка найденных попыток."""
+        try:
+            slowmo = self._active_slowmo_factor
+            model = load_yolo_model()
+            start_pad = self.processing_params['attempt_start_padding']
+            end_pad = self.processing_params['attempt_end_padding']
+            margin = SCAN_INTERVAL + 1.0  # запас на неточность скана
+            cut_count = 0
+            for i, cand in enumerate(selected):
+                if not self.processing:
+                    break
+                win_start = max(0.0, cand['start'] - start_pad - margin)
+                win_end = cand['end'] + end_pad + margin
+                next_num = get_next_attempt_number(self.output_folder)
+                self.log(f"Точный анализ кандидата {i + 1}/{len(selected)}: "
+                         f"{os.path.basename(cand['file'])} {cand['start']:.1f}s..{cand['end']:.1f}s")
+                found = []
+
+                def fine_callback(attempt, found=found):
+                    found.append(attempt)
+                    return self.on_attempt_file_created(attempt)
+
+                try:
+                    process_video([cand['file']], self.roi, fine_callback, next_num,
+                                  params=self.processing_params,
+                                  should_continue=lambda: self.processing,
+                                  slowmo_factor=slowmo,
+                                  model=model,
+                                  restrict_range=(win_start, win_end))
+                except Exception as e:
+                    self.log(f"Ошибка точного анализа: {e} {traceback.format_exc()}", logging.ERROR)
+                if found:
+                    cand['status'] = 'cut'
+                    cut_count += len(found)
+                else:
+                    self.log("В окне кандидата попыток не найдено - пропущен")
+                self.save_candidates()
+            self.log(f"Нарезка завершена: попыток {cut_count} из {len(selected)} кандидатов")
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self.button_process.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.button_stop.config(state=tk.DISABLED))
+            self.need_update_attempts = True
+            self.root.after(0, self.update_cut_button_state)
+
+    def _clear_candidates(self):
+        """Удаляет всех кандидатов и их превью (перед новым сканированием)"""
+        for cand in self.candidates:
+            thumb = cand.get('thumbnail')
+            if thumb and os.path.exists(thumb):
+                try:
+                    os.remove(thumb)
+                except OSError:
+                    pass
+        self.candidates = []
+        self.candidate_vars = {}
+        self.save_candidates()
+
+    def save_candidates(self):
+        """Сохраняет кандидатов в candidates.yaml"""
+        if not self.candidates_file:
+            return
+        data = {'candidates': [
+            {'file': c['file'], 'start': c['start'], 'end': c['end'],
+             'thumbnail': c.get('thumbnail'), 'selected': bool(c.get('selected')),
+             'status': c['status']}
+            for c in self.candidates]}
+        try:
+            os.makedirs(os.path.dirname(self.candidates_file), exist_ok=True)
+            with open(self.candidates_file, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True)
+        except Exception as e:
+            self.log(f"Ошибка сохранения кандидатов: {e}")
+
+    def load_candidates(self):
+        """Загружает кандидатов из candidates.yaml"""
+        self.candidates = []
+        self.candidate_vars = {}
+        if self.candidates_file and os.path.exists(self.candidates_file):
+            try:
+                with open(self.candidates_file, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                for c in data.get('candidates') or []:
+                    thumb = c.get('thumbnail')
+                    if thumb and not os.path.isabs(thumb):
+                        thumb = os.path.join(self.output_folder, thumb)
+                    if not thumb or not os.path.exists(thumb):
+                        continue
+                    self.candidates.append({
+                        'file': self.get_absolute_path(c.get('file', '')),
+                        'start': float(c.get('start', 0)),
+                        'end': float(c.get('end', 0)),
+                        'thumbnail': thumb,
+                        'selected': bool(c.get('selected')),
+                        'status': c.get('status', 'pending'),
+                    })
+            except Exception as e:
+                self.log(f"Ошибка загрузки кандидатов: {e}")
 
     def on_processing_progress(self, file_index, file_count, frame_index, total_frames):
         """Прогресс обработки. Вызывается из рабочего потока, поэтому только считаем
@@ -468,18 +843,32 @@ class FreestyleParserApp:
         self.label_output = tk.Label(files_right, text="Выходная папка:")
         self.label_output.pack(anchor=tk.W)
 
-        self.entry_output = tk.Entry(files_right, width=22)
-        self.entry_output.pack(fill=tk.X, padx=5, pady=2)
+        # Имя рабочей папки (только чтение) + кнопка открытия в той же строке
+        entry_row = tk.Frame(files_right)
+        entry_row.pack(fill=tk.X, padx=5, pady=2)
+
+        self.entry_output = tk.Entry(entry_row, width=11, state='readonly', justify='center')
+        self.entry_output.pack(side=tk.LEFT)
+        self.entry_output.config(state='normal')
         self.entry_output.insert(0, os.path.basename(self.output_folder))
+        self.entry_output.config(state='readonly')
+
+        self.button_open_output = tk.Button(entry_row, text="Открыть", command=self.open_output_folder)
+        self.button_open_output.pack(side=tk.LEFT, padx=(5, 0))
 
         output_btn_inner = tk.Frame(files_right)
         output_btn_inner.pack(fill=tk.X, padx=5, pady=5)
 
+        self.button_day_folder = tk.Button(output_btn_inner, text="📅",
+                                           command=self.choose_day_folder)
+        self.button_day_folder.pack(side=tk.LEFT, padx=2)
+
         self.button_change_output = tk.Button(output_btn_inner, text="Изменить", command=self.change_output_folder)
         self.button_change_output.pack(side=tk.LEFT, padx=2)
 
-        self.button_open_output = tk.Button(output_btn_inner, text="Открыть", command=self.open_output_folder)
-        self.button_open_output.pack(side=tk.LEFT, padx=2)
+        # Индикатор состояния рабочей папки
+        self.folder_status_label = tk.Label(files_right, text="", anchor=tk.W)
+        self.folder_status_label.pack(fill=tk.X, padx=5)
 
         # --- ROI Canvas ---
         self.frame_roi = tk.LabelFrame(self.left_frame, text="Область интереса")
@@ -536,6 +925,25 @@ class FreestyleParserApp:
             entry = tk.Entry(row_frame, textvariable=var, width=6)
             entry.pack(side=tk.LEFT, padx=(0, 15))
             self.param_vars[key] = var
+
+        # --- Слоумо ---
+        self.slowmo_var = tk.BooleanVar(value=False)
+        self.check_slowmo = tk.Checkbutton(
+            self.frame_output,
+            text="Слоумо видео 1/4 (напр. Panasonic GH4 96 к/с)",
+            variable=self.slowmo_var,
+            command=self.on_slowmo_toggle)
+        self.check_slowmo.pack(anchor=tk.W, padx=5, pady=(2, 0))
+
+        # --- Стратегия обработки ---
+        strategy_frame = tk.Frame(self.frame_output)
+        strategy_frame.pack(fill=tk.X, padx=5, pady=(2, 0))
+        tk.Label(strategy_frame, text="Стратегия:").pack(side=tk.LEFT, padx=(0, 5))
+        self.strategy_var = tk.StringVar(value='auto')
+        tk.Radiobutton(strategy_frame, text="Нарезать всё", variable=self.strategy_var,
+                       value='auto').pack(side=tk.LEFT)
+        tk.Radiobutton(strategy_frame, text="Выбрать вручную", variable=self.strategy_var,
+                       value='manual').pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
@@ -594,6 +1002,11 @@ class FreestyleParserApp:
         # Кнопка удаления
         self.delete_button = tk.Button(self.actions_frame, text="🗑️ Удалить", command=self.delete_selected_attempts)
         self.delete_button.pack(side=tk.RIGHT, padx=5)
+
+        # Кнопка нарезки выбранных кандидатов (ручной режим)
+        self.button_cut_selected = tk.Button(self.actions_frame, text="✂️ Нарезать выбранное",
+                                             command=self.cut_selected_candidates, state=tk.DISABLED)
+        self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
 
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
@@ -772,11 +1185,54 @@ class FreestyleParserApp:
                 except Exception as e:
                     self.log(f"Ошибка при создании превью для {attempt}: {str(e)}")
 
-            # Обновляем позицию для следующего превью
-            col += 1
-            if col >= max_cols:
-                col = 0
-                row += 1
+                # Обновляем позицию для следующего превью
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
+
+        # --- Кандидаты ручного режима (ещё не нарезанные) ---
+        pending = [c for c in self.candidates if c['status'] == 'pending']
+        self.candidate_vars.clear()
+        if pending:
+            sep = tk.Label(self.attempts_scrollable_frame,
+                           text=f"—— Кандидаты ({len(pending)}): снимите галочки с ненужных, затем «Нарезать выбранное» ——",
+                           fg="#555555")
+            sep.grid(row=row + 1, column=0, columnspan=max_cols, pady=(12, 2))
+            crow, ccol = row + 2, 0
+            for cand in pending:
+                frame = tk.Frame(self.attempts_scrollable_frame)
+                frame.grid(row=crow, column=ccol, padx=5, pady=5)
+
+                thumb = cand.get('thumbnail')
+                if thumb and os.path.exists(thumb):
+                    try:
+                        image = Image.open(thumb)
+                        image = image.resize((200, 150), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(image)
+                        label = tk.Label(frame, image=photo)
+                        label.image = photo
+                        label.pack()
+                    except Exception as e:
+                        self.log(f"Ошибка превью кандидата: {e}")
+
+                name_frame = tk.Frame(frame)
+                name_frame.pack()
+
+                var = tk.BooleanVar(value=bool(cand.get('selected')))
+                checkbox = tk.Checkbutton(name_frame, variable=var,
+                                          command=lambda c=cand, v=var: self.on_candidate_checkbox_change(c, v))
+                checkbox.pack(side=tk.LEFT, padx=(0, 5))
+
+                tk.Label(name_frame, text=f"{os.path.basename(cand['file'])} "
+                                          f"{cand['start']:.0f}-{cand['end']:.0f}s").pack(side=tk.LEFT)
+
+                self.candidate_vars[self._candidate_key(cand)] = var
+
+                ccol += 1
+                if ccol >= max_cols:
+                    ccol = 0
+                    crow += 1
 
     def on_attempt_checkbox_change(self, attempt, var):
         """Обработчик изменения состояния чекбокса попытки"""
@@ -1061,6 +1517,14 @@ class FreestyleParserApp:
 
         self.create_canvas_from_video(self.current_video_for_roi)
 
+    def on_slowmo_toggle(self):
+        """Обработчик переключения чекбокса слоумо"""
+        if self.slowmo_var.get():
+            self.log("Режим слоумо включён: видео 1/4 скорости (например, 96 к/с как 24 к/с). "
+                     "Попытки и параметры считаются в реальных секундах, вырезанные файлы будут обычной скорости.")
+        else:
+            self.log("Режим слоумо выключен.")
+
     def select_files(self):
         initial_dir = find_default_video_folder()
         files = filedialog.askopenfilenames(
@@ -1081,19 +1545,23 @@ class FreestyleParserApp:
             self.current_frame_position = 0.5
             self.create_canvas_from_video(self.current_video_for_roi)
 
-    def change_output_folder(self):
-        """Изменяет выходную папку"""
-        folder = filedialog.askdirectory(initialdir=os.path.expanduser(f"~/Desktop/FreestyleParser"))
-        if folder:
-            self.output_folder = folder
-            self.entry_output.delete(0, tk.END)
-            self.entry_output.insert(0, os.path.basename(folder))
+            # Пытаемся автоматически определить слоумо по метаданным
+            # (для Panasonic GH4 VFR метаданных нет - тогда вручную чекбоксом)
+            factor = detect_slowmo_factor(self.selected_files[0])
+            self.slowmo_var.set(factor > 1)
+            if factor > 1:
+                self.log(f"Обнаружено слоумо-видео (замедление 1/{factor}) - включён режим слоумо")
+            else:
+                self.log("Слоумо по метаданным не обнаружено. Если это слоумо 96 к/с (GH4) - "
+                         "включите галочку \"Слоумо видео 1/4\" вручную")
 
-            #
-            self.on_output_folder_changed()
-            self.log(f"Выходная папка изменена на: {folder}")
-        else:
-            messagebox.showerror("Ошибка", "Папка не найдена.")
+    def change_output_folder(self):
+        """Выбор произвольной рабочей папки через стандартный диалог ОС"""
+        initial = self.output_folder if os.path.isdir(self.output_folder) \
+            else os.path.expanduser("~/Desktop/FreestyleParser")
+        folder = filedialog.askdirectory(initialdir=initial)
+        if folder:
+            self._set_output_folder(folder, f"Выбрана произвольная папка: {folder}")
 
     def _sync_params_from_ui(self):
         """Считывает значения параметров из UI в processing_params"""
@@ -1340,6 +1808,16 @@ class FreestyleParserApp:
                                 self.processing_params[key] = float(saved_params[key])
                         self._sync_ui_from_params()
 
+                    # Загружаем флаг слоумо
+                    if self.slowmo_var is not None and 'slowmo_quarter' in config['processing-config']:
+                        self.slowmo_var.set(bool(config['processing-config']['slowmo_quarter']))
+
+                    # Загружаем стратегию обработки
+                    if self.strategy_var is not None and 'strategy' in config['processing-config']:
+                        strategy = config['processing-config']['strategy']
+                        if strategy in ('auto', 'manual'):
+                            self.strategy_var.set(strategy)
+
     def save_processing_config(self):
         """Сохраняет конфигурацию обработки в файл"""
         self._sync_params_from_ui()
@@ -1348,6 +1826,8 @@ class FreestyleParserApp:
             'processing-config': {
                 'roi_mode': self.roi_mode,
                 'params': dict(self.processing_params),
+                'slowmo_quarter': bool(self.slowmo_var.get()) if self.slowmo_var else False,
+                'strategy': self.strategy_var.get() if self.strategy_var else 'auto',
             }
         }
         
@@ -1377,6 +1857,51 @@ class FreestyleParserApp:
         with open(self.processing_config_file, "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
 
+
+    def show_canvas_with_roi(self, canvas_path):
+        """Показывает изображение canvas и сохранённый ROI поверх него"""
+        if not os.path.exists(canvas_path):
+            return False
+        try:
+            image = Image.open(canvas_path)
+            self.display_image(np.array(image))
+        except Exception as e:
+            self.log(f"Ошибка отображения canvas: {e}")
+            return False
+        # Если есть сохраненный ROI, показываем его
+        if self.roi:
+            if self.roi_mode == "rectangle":
+                x1, y1, x2, y2 = self.roi
+                self.canvas.create_rectangle(
+                    x1 * self.canvas_width / 100,
+                    y1 * CANVAS_HEIGHT / 100,
+                    x2 * self.canvas_width / 100,
+                    y2 * CANVAS_HEIGHT / 100,
+                    outline="red",
+                    tags="roi_rectangle"
+                )
+            elif self.roi_mode == "polygon":
+                # Конвертируем точки из процентов в пиксели
+                pixel_points = [(x * self.canvas_width / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
+
+                # Рисуем точки
+                for x, y in pixel_points:
+                    self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="red", tags="roi_points")
+
+                # Рисуем линии многоугольника
+                for i in range(len(pixel_points)):
+                    p1 = pixel_points[i]
+                    p2 = pixel_points[(i + 1) % len(pixel_points)]
+                    self.canvas.create_line(p1[0], p1[1], p2[0], p2[1],
+                                            fill="red", width=2, tags="roi_polygon")
+        return True
+
+    def refresh_canvas_from_folder(self):
+        """Показывает canvas.jpg текущей рабочей папки (или приложения) с сохранённым ROI"""
+        canvas_path = os.path.join(self.output_folder, "canvas.jpg")
+        if not os.path.exists(canvas_path):
+            canvas_path = os.path.join(self._app_folder, "canvas.jpg")
+        return self.show_canvas_with_roi(canvas_path)
 
     def create_canvas_from_video(self, video_path):
         if os.path.exists(self.output_folder):
@@ -1417,36 +1942,8 @@ class FreestyleParserApp:
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
                 # subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                # Показываем кадр на канвасе
-                if os.path.exists(canvas_path):
-                    image = Image.open(canvas_path)
-                    self.display_image(np.array(image))
-                    # Если есть сохраненный ROI, показываем его
-                    if self.roi:
-                        if self.roi_mode == "rectangle":
-                            x1, y1, x2, y2 = self.roi
-                            self.canvas.create_rectangle(
-                                x1 * self.canvas_width / 100,
-                                y1 * CANVAS_HEIGHT / 100,
-                                x2 * self.canvas_width / 100,
-                                y2 * CANVAS_HEIGHT / 100,
-                                outline="red",
-                                tags="roi_rectangle"
-                            )
-                        elif self.roi_mode == "polygon":
-                            # Конвертируем точки из процентов в пиксели
-                            pixel_points = [(x * self.canvas_width / 100, y * CANVAS_HEIGHT / 100) for x, y in self.roi]
-                            
-                            # Рисуем точки
-                            for x, y in pixel_points:
-                                self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="red", tags="roi_points")
-                            
-                            # Рисуем линии многоугольника
-                            for i in range(len(pixel_points)):
-                                p1 = pixel_points[i]
-                                p2 = pixel_points[(i + 1) % len(pixel_points)]
-                                self.canvas.create_line(p1[0], p1[1], p2[0], p2[1], 
-                                                      fill="red", width=2, tags="roi_polygon")
+                # Показываем кадр на канвасе и сохранённый ROI
+                self.show_canvas_with_roi(canvas_path)
                 # return canvas_path
             except subprocess.CalledProcessError as e:
                 print(f"Ошибка создания canvas.jpg (1): {e}")
@@ -1558,6 +2055,7 @@ class FreestyleParserApp:
 
     def on_output_folder_changed(self):
         self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
+        self.candidates_file = os.path.join(self.output_folder, "candidates.yaml")
         # Создаем выходную папку, если её нет
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder, exist_ok=True)
@@ -1572,6 +2070,10 @@ class FreestyleParserApp:
         if not self.logger:
             self.setup_logger()
 
+        # Загружаем кандидатов ручного режима
+        self.load_candidates()
+        self.update_cut_button_state()
+
         # Перезагружаем маппинг из новой папки
         self.load_athlete_mapping()
         
@@ -1581,6 +2083,9 @@ class FreestyleParserApp:
         # Обновляем интерфейс
         self.update_athlete_list()
         self.update_attempt_thumbnails()
+        self.update_folder_status()
+        # Показываем canvas и сохранённый ROI новой рабочей папки
+        self.refresh_canvas_from_folder()
 
 
 

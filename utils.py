@@ -2,6 +2,7 @@ import colorsys
 import platform
 import os
 import sys
+import json
 import subprocess
 import cv2
 import numpy as np
@@ -88,6 +89,65 @@ def get_ffprobe_path():
         return bin_path
 
     return None
+
+
+def _parse_rate(value):
+    """Разбирает строку вида '96/1' или '24.0' в float"""
+    try:
+        num, _, den = str(value).partition('/')
+        den = float(den) if den else 1.0
+        return float(num) / den if den else 0.0
+    except Exception:
+        return 0.0
+
+
+def _ffprobe_stream_info(video_path, entries):
+    """Возвращает json-инфо о первом видео-потоке через ffprobe или None"""
+    ffprobe = get_ffprobe_path()
+    if not ffprobe or not video_path or not os.path.exists(video_path):
+        return None
+    try:
+        cmd = [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+               '-show_entries', f'stream={entries}',
+               '-of', 'json', video_path]
+        out = subprocess.check_output(cmd, timeout=30).decode()
+        streams = (json.loads(out) or {}).get('streams') or []
+        return streams[0] if streams else None
+    except Exception:
+        return None
+
+
+def detect_slowmo_factor(video_path):
+    """Пытается определить по метаданным, является ли видео слоумо-записью.
+
+    Признак - VFR-файл: r_frame_rate существенно выше avg_frame_rate
+    (например, 96 к/с при 24 к/с воспроизведения). Возвращает целочисленный
+    коэффициент замедления (1 - обычное видео). Для файлов, где слоумо
+    зашито только в таймстампах контейнера (Panasonic GH4 VFR), метаданные
+    неотличимы от обычного 24 к/с - тогда вернётся 1 и нужен ручной чекбокс.
+    """
+    info = _ffprobe_stream_info(video_path, 'r_frame_rate,avg_frame_rate')
+    if not info:
+        return 1
+    r_rate = _parse_rate(info.get('r_frame_rate'))
+    avg_rate = _parse_rate(info.get('avg_frame_rate'))
+    if avg_rate > 1 and r_rate / avg_rate >= 1.5:
+        return max(1, int(round(r_rate / avg_rate)))
+    return 1
+
+
+def has_audio_stream(video_path):
+    """Проверяет наличие аудио-дорожки в видео через ffprobe"""
+    ffprobe = get_ffprobe_path()
+    if not ffprobe or not video_path or not os.path.exists(video_path):
+        return False
+    try:
+        cmd = [ffprobe, '-v', 'error', '-select_streams', 'a',
+               '-show_entries', 'stream=index',
+               '-of', 'csv=p=0', video_path]
+        return bool(subprocess.check_output(cmd, timeout=30).decode().strip())
+    except Exception:
+        return False
 
 
 def find_default_video_folder():

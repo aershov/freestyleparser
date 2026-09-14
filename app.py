@@ -622,12 +622,17 @@ class FreestyleParserApp:
             return
         if self.cut_running:
             return
+        # Слоумо берём из чекбокса именно сейчас (а не из прошлого запуска
+        # "Обработать"), чтобы нарезка кандидатов учитывала его.
+        self._active_slowmo_factor = 4 if (self.slowmo_var and self.slowmo_var.get()) else 1
         self.cut_running = True
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
         self._progress_percent = 0.0
         self.progress_var.set(0)
+        self.log(f"Нарезка {len(selected)} кандидатов, слоумо "
+                 f"{'1/4' if self._active_slowmo_factor > 1 else 'нет'}")
         threading.Thread(target=self._cut_candidates_thread, args=(selected,), daemon=True).start()
 
     def _cut_candidates_thread(self, selected):
@@ -645,18 +650,27 @@ class FreestyleParserApp:
                 cut_windows = [(c['file'], c['start'], c['end'])
                                for c in self.candidates if c['status'] == 'cut']
             cut_count = 0
+            total = len(selected)
+            stopped = False
             for i, cand in enumerate(selected):
                 if not self.processing:
+                    stopped = True
+                    remaining = total - i
+                    self.log(f"Нарезка остановлена: обработано {i} из {total}, "
+                             f"осталось {remaining} кандидатов. Повторный запуск "
+                             f"«Нарезать выбранное» продолжит с того же места.")
                     break
+                left = total - i
                 if any(f == cand['file'] and max(s, cand['start']) < min(e, cand['end'])
                        for f, s, e in cut_windows):
-                    self.log(f"Кандидат {i + 1}/{len(selected)} пересекается с уже нарезанной "
-                             f"попыткой - пропущен")
+                    self.log(f"[{i + 1}/{total}, осталось {left - 1}] Кандидат "
+                             f"{os.path.basename(cand['file'])} {cand['start']:.1f}s..{cand['end']:.1f}s "
+                             f"пересекается с уже нарезанной попыткой - пропущен")
                     continue
                 win_start = max(0.0, cand['start'] - start_pad - margin)
                 win_end = cand['end'] + end_pad + margin
                 next_num = get_next_attempt_number(self.output_folder)
-                self.log(f"Точный анализ кандидата {i + 1}/{len(selected)}: "
+                self.log(f"[{i + 1}/{total}, осталось {left - 1}] Точный анализ "
                          f"{os.path.basename(cand['file'])} {cand['start']:.1f}s..{cand['end']:.1f}s")
                 found = []
 
@@ -680,7 +694,8 @@ class FreestyleParserApp:
                 else:
                     self.log("В окне кандидата попыток не найдено - пропущен")
                 self.save_candidates()
-            self.log(f"Нарезка завершена: попыток {cut_count} из {len(selected)} кандидатов")
+            if not stopped:
+                self.log(f"Нарезка завершена: попыток {cut_count} из {total} кандидатов")
         finally:
             self.cut_running = False
             self.processing = self.scan_running
@@ -1116,9 +1131,13 @@ class FreestyleParserApp:
         self.delete_button = tk.Button(self.actions_frame, text="🗑️ Удалить", command=self.delete_selected_attempts)
         self.delete_button.pack(side=tk.RIGHT, padx=5)
 
-        # Кнопка нарезки выбранных кандидатов (ручной режим)
-        self.button_cut_selected = tk.Button(self.actions_frame, text="✂️ Нарезать выбранное",
-                                             command=self.cut_selected_candidates, state=tk.DISABLED)
+        # Кнопка нарезки выбранных кандидатов (ручной режим).
+        # Ярко выделена, чтобы читалась как кнопка, а не надпись.
+        self.button_cut_selected = tk.Button(
+            self.actions_frame, text="✂️ Нарезать выбранное",
+            command=self.cut_selected_candidates, state=tk.DISABLED,
+            relief=tk.RAISED, bd=2, bg="#dff0d8", activebackground="#c8e6c9",
+            font=('Arial', 10, 'bold'), padx=8, pady=2)
         self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
 
         # Создаем canvas и scrollbar для попыток

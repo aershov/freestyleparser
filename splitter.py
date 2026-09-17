@@ -6,13 +6,18 @@ from collections import deque
 from ultralytics import YOLO
 
 # Конфигурация YOLO
-YOLO_CONFIDENCE_THRESHOLD = 0.4  # Порог уверенности для детекции объектов (снижен с 0.6)
+YOLO_CONFIDENCE_THRESHOLD = 0.4  # Порог уверенности для детекции объектов
 YOLO_TARGET_CLASSES = ['person', 'boat', 'surfboard']  # Классы объектов для детекции
 YOLO_MAX_WIDTH = 600  # уменьшаем кадр перед анализом в YOLO до стольких пикселей
 
 # Конфигурация обработки видео
-TARGET_ANALYSIS_FPS = 5  # Целевая частота анализа (кадров в секунду), не зависит от fps видео
-MIN_DETECTION_TIME = 0.6  # Минимальное время (в секундах) с детекциями для начала попытки (снижен с 1.0)
+TARGET_ANALYSIS_FPS = 5  # Целевая частота анализа (сэмплов в секунду реального времени)
+MIN_DETECTION_TIME = 0.6  # Минимальное время (в секундах) с детекциями для начала попытки
+
+# Режим сканирования (ручной выбор попыток): значения по умолчанию,
+# настраиваются в UI через params 'scan_interval' и 'scan_threshold'
+SCAN_INTERVAL = 2.5     # Шаг сканирования, секунд реального времени между сэмплами
+SCAN_CONFIDENCE = 0.25  # Пониженный порог YOLO для сканирования
 
 DEFAULT_PROCESSING_PARAMS = {
     'min_attempt_duration': 5,     # Минимальная длительность попытки в секундах
@@ -20,13 +25,16 @@ DEFAULT_PROCESSING_PARAMS = {
     'attempt_start_padding': 2,    # Запас времени (в секундах) к началу попытки
     'attempt_end_padding': 0.5,    # Запас времени (в секундах) от конца попытки
     'min_detection_strength': 0.5, # Минимальная сила сигнала (0-1) для начала/продолжения попытки
+    'scan_interval': 2.5,          # Шаг сканирования (ручной режим), сек реального времени
+    'scan_threshold': 0.25,        # Порог YOLO при сканировании (ниже порога обычного анализа)
 }
 
 np.seterr(divide='ignore', invalid='ignore')
 
 class AttemptInfo:
 
-    def __init__(self, source_video, start, end, number, best_frame, person_frame, base_frame, person_bbox):
+    def __init__(self, source_video, start, end, number, best_frame, person_frame, base_frame, person_bbox,
+                 is_candidate=False):
         self.source_video = source_video
         self.start = start
         self.end = end
@@ -35,6 +43,7 @@ class AttemptInfo:
         self.person_frame = person_frame
         self.base_frame = base_frame
         self.person_bbox = person_bbox
+        self.is_candidate = is_candidate
 
     def duration(self):
         return self.end - self.start
@@ -57,16 +66,22 @@ def _iou(box1, box2):
     return inter / (a1 + a2 - inter)
 
 
-def _finalize_attempt(attempt_number, start_time, end_time, total_frames, fps,
+def load_yolo_model():
+    """Загружает модель YOLO (вынесено наружу, чтобы переиспользовать между вызовами)"""
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
+    return YOLO(model_path)
+
+
+def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
                       person_bbox, base_frame, best_frame, person_frame,
-                      fallback_frame, video_file, callback, params):
+                      fallback_frame, video_file, callback, params, scan_mode=False):
     """Создаёт попытку и вызывает callback. Возвращает (attempt, attempt_number) или (None, attempt_number) или (False, attempt_number) для стопа."""
     start_padding = params['attempt_start_padding']
     end_padding = params['attempt_end_padding']
     min_duration = params['min_attempt_duration']
 
     start1 = max(0, start_time - start_padding)
-    end1 = min(end_time + end_padding, total_frames / fps)
+    end1 = min(end_time + end_padding, real_duration)
 
     if end1 <= start1:
         safe_print(f"  [SKIP] Попытка #{attempt_number}: start ({start1:.2f}s) >= end ({end1:.2f}s)")
@@ -93,7 +108,8 @@ def _finalize_attempt(attempt_number, start_time, end_time, total_frames, fps,
                           person_frame=person_frame,
                           person_bbox=person_bbox,
                           source_video=video_file,
-                          start=start1, end=end1)
+                          start=start1, end=end1,
+                          is_candidate=scan_mode)
     attempt_number += 1
     need_stop = not callback(attempt)
     if need_stop:
@@ -112,33 +128,306 @@ def open_capture(video_file):
     return cv2.VideoCapture(video_file)
 
 
+def _seek_sample_iter(cap, fps_real, total_frames, sample_rate, range_start, range_end):
+    """Генератор сэмплов точечными seek'ами. Для редкой выборки (скан) намного
+    быстрее полного декодирования: каждый seek декодирует не больше кадров,
+    чем GOP. sample_rate - сэмплов в секунду реального времени."""
+    step = max(1, int(round(fps_real / sample_rate)))
+    safe_print(f"  Скан точечным seek: шаг {step} кадров, ~{sample_rate:.1f}/с реальных")
+    start_f = int(range_start * fps_real) if range_start and range_start > 0 else 0
+    end_f = total_frames if range_end is None else min(total_frames, int(range_end * fps_real))
+    pos = start_f
+    while pos < end_f:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        yield pos / fps_real, frame, pos, end_f
+        pos += step
+
+def _grab_sample_iter(cap, fps_container, fps_real, total_frames, frame_skip,
+                      range_start, range_end):
+    """Генератор сэмплов из полного декодирования (как раньше).
+    Декодируется каждый frame_skip-й кадр; сэмплы в реальных секундах."""
+    safe_print(f"  FPS: {fps_container:.1f}, реальный fps: {fps_real:.1f}, "
+               f"frame_skip: {frame_skip}, анализ: {fps_real / frame_skip:.1f}/с")
+    start_frame = 0
+    if range_start and range_start > 0:
+        start_frame = int(range_start * fps_real)
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            safe_print(f"  Старт с кадра {start_frame} (диапазон от {range_start:.1f}s)")
+    frame_index = start_frame
+    while True:
+        if not cap.grab():
+            break
+        frame_index += 1
+        if frame_index >= total_frames:
+            break
+        if frame_index % frame_skip:
+            continue
+        ret, frame = cap.retrieve()
+        if not ret:
+            break
+        real_sec = frame_index / fps_real
+        if range_end is not None and real_sec > range_end:
+            break
+        yield real_sec, frame, frame_index, total_frames
+
+
+def _keyframe_sample_iter(kf_samples, slowmo_factor, step, range_start, range_end):
+    """Генератор сэмплов из заранее извлечённых опорных кадров.
+    kf_samples - [(file_time, path)]; берётся каждый step-й кадр."""
+    if not kf_samples:
+        return
+    for i, (ftime, path) in enumerate(kf_samples):
+        if i % step:
+            continue
+        real_sec = ftime / slowmo_factor if slowmo_factor > 1 else ftime
+        if range_start and real_sec < range_start:
+            continue
+        if range_end is not None and real_sec > range_end:
+            break
+        frame = cv2.imread(path)
+        if frame is None:
+            continue
+        yield real_sec, frame, i + 1, len(kf_samples)
+
+
+class _Detector:
+    """Машина состояний детекции попыток на потоке сэмплов (реальное время + кадр)."""
+
+    def __init__(self, model, roi, video_file, analysis_rate, real_duration,
+                 params, min_strength, attempt_number, callback, scan_mode=False,
+                 range_start=None, range_end=None):
+        self.model = model
+        self.roi = roi
+        self.video_file = video_file
+        self.rate = analysis_rate  # сэмплов в секунду реального времени
+        self.real_duration = real_duration
+        self.params = params
+        self.min_strength = min_strength
+        self.attempt_number = attempt_number
+        self.callback = callback
+        self.scan_mode = scan_mode
+        self.range_start = range_start
+        self.range_end = range_end
+
+        self.conf_threshold = (float(params.get('scan_threshold', SCAN_CONFIDENCE))
+                               if scan_mode else YOLO_CONFIDENCE_THRESHOLD)
+        self.min_pause = params['min_pause_duration']
+        self.window_size = max(2, int(round(MIN_DETECTION_TIME * self.rate)))
+        self.pause_samples = max(1, self.min_pause * self.rate)  # float, как в оригинале
+
+        self.in_attempt = False
+        self.start_time = None
+        self.end_time = None
+        self.frames_in_attempt = 0
+        self.frames_out_of_attempt = 0
+        self.best_frame = None
+        self.best_frame_confidence = 0
+        self.person_frame = None
+        self.base_frame = None
+        self.person_bbox = None
+        self.person_conf = 0
+        self.last_person_bbox = None  # для fallback bbox когда person пропадает в брызгах
+        self.fallback_frame = None
+
+        self.detection_window = deque(maxlen=self.window_size)
+        self.bbox_history = deque(maxlen=self.window_size)  # [(x1,y1,x2,y2,conf), ...]
+
+    def process_sample(self, current_sec, frame):
+        """Обрабатывает один сэмпл. Возвращает AttemptInfo (попытка завершена),
+        False (остановка по запросу callback) или None."""
+        original_frame = frame.copy()
+
+        # Установка области интереса
+        if self.roi:
+            frame_height, frame_width = frame.shape[:2]
+            if len(self.roi) == 4:  # Прямоугольник
+                left, top, right, bottom = self.roi
+                x1_px = int(frame_width * left / 100)
+                y1_px = int(frame_height * top / 100)
+                x2_px = int(frame_width * right / 100)
+                y2_px = int(frame_height * bottom / 100)
+                frame = frame[y1_px:y2_px, x1_px:x2_px]
+                original_frame = original_frame[y1_px:y2_px, x1_px:x2_px]
+            elif len(self.roi) > 4:  # Многоугольник
+                polygon_points = [(int(frame_width * x / 100), int(frame_height * y / 100)) for x, y in self.roi]
+                mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                polygon_array = np.array(polygon_points, dtype=np.int32)
+                cv2.fillPoly(mask, [polygon_array], 255)
+                frame = cv2.bitwise_and(frame, frame, mask=mask)
+
+        # Масштабирование для YOLO
+        if frame.shape[1] > YOLO_MAX_WIDTH:
+            scale_factor = YOLO_MAX_WIDTH / frame.shape[1]
+            small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
+            small_frame_original = cv2.resize(original_frame, None, fx=scale_factor, fy=scale_factor)
+        else:
+            small_frame = frame.copy()
+            small_frame_original = original_frame.copy()
+        self.fallback_frame = small_frame_original
+
+        results = self.model(small_frame, verbose=False)
+
+        # Проверка наличия объектов в ТЕКУЩЕМ кадре
+        person_detected_in_frame = False
+        best_conf_in_frame = 0
+        best_box_in_frame = None
+        best_person_box = None
+        for r in results:
+            for box in r.boxes:
+                conf = float(box.conf[0].cpu().numpy())
+                cls = int(box.cls[0].cpu().numpy())
+                class_name = self.model.names[cls]
+                if class_name in YOLO_TARGET_CLASSES and conf >= self.conf_threshold:
+                    person_detected_in_frame = True
+                    if conf > best_conf_in_frame:
+                        best_conf_in_frame = conf
+                        best_box_in_frame = box
+                if class_name == 'person' and conf > self.person_conf:
+                    best_person_box = box
+                    self.person_conf = conf
+
+        # Обновляем лучший bbox для превью и историю
+        if best_box_in_frame is not None:
+            best_box_np = best_box_in_frame.xyxy[0].cpu().numpy()
+            bx1, by1, bx2, by2 = map(int, best_box_np)
+
+            # Отслеживаем person bbox отдельно (fallback для превью)
+            if best_person_box is not None:
+                self.last_person_bbox = best_person_box.xyxy[0].cpu().numpy()
+                best_person_box_np = self.last_person_bbox
+            else:
+                best_person_box_np = self.last_person_bbox if self.last_person_bbox is not None else best_box_np
+
+            self.person_bbox = best_person_box_np
+            self.bbox_history.append((bx1, by1, bx2, by2, best_conf_in_frame))
+
+            # Обновляем лучший кадр для превью (приоритет к person)
+            if best_person_box is not None:
+                ppx1, ppy1, ppx2, ppy2 = map(int, best_person_box_np)
+                self.person_frame = small_frame_original[ppy1:ppy2, ppx1:ppx2]
+            else:
+                self.person_frame = small_frame_original[by1:by2, bx1:bx2]
+
+            if best_conf_in_frame > self.best_frame_confidence:
+                self.best_frame_confidence = best_conf_in_frame
+                self.best_frame = small_frame_original
+
+            if self.person_conf > 0.5:
+                self.best_frame_confidence = self.person_conf
+                self.best_frame = small_frame_original
+
+        elif self.best_frame is None and small_frame_original is not None:
+            self.best_frame = small_frame_original
+            self.person_frame = small_frame_original
+
+        # Вычисляем detection strength: bbox motion (IoU) + confidence drift
+        detection_strength = 0.0
+        if person_detected_in_frame and len(self.bbox_history) >= 2:
+            ious = []
+            confs = []
+            for i in range(1, len(self.bbox_history)):
+                prev = self.bbox_history[i - 1]
+                curr = self.bbox_history[i]
+                ious.append(_iou(prev[0:4], curr[0:4]))
+                confs.append(abs(curr[4] - prev[4]))
+            avg_iou = sum(ious) / len(ious)
+            avg_conf_drift = sum(confs) / len(confs)
+            detection_strength = (1.0 - avg_iou) * 0.7 + min(avg_conf_drift * 10, 1.0) * 0.3
+
+        # Hysteresis: во время попытки порог strength ниже (ловим брызги/переходные моменты)
+        actual_min_strength = self.min_strength * 0.3 if self.in_attempt else self.min_strength
+        has_detections = person_detected_in_frame and detection_strength >= actual_min_strength
+
+        # запоминаем базовый фрейм без человека
+        if not self.in_attempt:
+            if self.base_frame is None:
+                self.base_frame = small_frame_original
+
+        if has_detections:
+            self.detection_window.append(1)
+            self.frames_in_attempt += 1
+            self.frames_out_of_attempt = 0
+            if not self.in_attempt:
+                # Debounce: требуем стабильных детекций перед стартом попытки
+                if len(self.detection_window) >= self.window_size and all(self.detection_window):
+                    detection_start_time = current_sec
+                    if detection_start_time - (self.end_time or 0) >= self.min_pause:
+                        self.in_attempt = True
+                        self.start_time = detection_start_time
+                        safe_print(f"  [START] Попытка #{self.attempt_number} на {self.start_time:.2f}s")
+        else:
+            self.detection_window.append(0)
+            self.frames_out_of_attempt += 1
+            if self.in_attempt and self.frames_out_of_attempt >= self.pause_samples:
+                self.in_attempt = False
+                self.best_frame_confidence = 0
+                self.detection_window.clear()
+                self.bbox_history.clear()
+                self.person_conf = 0
+                self.last_person_bbox = None
+                self.end_time = current_sec
+                return self._finalize(self.start_time, self.end_time)
+
+        return None
+
+    def _finalize(self, start_time, end_time):
+        """Финализирует попытку с учётом диапазона и длительности файла."""
+        end_limit = self.real_duration
+        if self.range_end is not None:
+            end_limit = min(end_limit, self.range_end)
+        result, self.attempt_number = _finalize_attempt(
+            self.attempt_number, start_time, end_time, end_limit,
+            self.person_bbox, self.base_frame, self.best_frame, self.person_frame,
+            self.fallback_frame, self.video_file, self.callback, self.params,
+            scan_mode=self.scan_mode)
+        if result is not None:
+            self.best_frame = None
+            self.base_frame = None
+            self.person_bbox = None
+        return result
+
+    def finish(self):
+        """Финализирует незакрытую попытку на конце файла/диапазона."""
+        if self.in_attempt and self.start_time is not None:
+            end_time = self.real_duration if self.range_end is None else min(self.real_duration, self.range_end)
+            safe_print(f"  [{os.path.basename(self.video_file)}] Финализация попытки #{self.attempt_number} на конце ({end_time:.1f}s)")
+            return self._finalize(self.start_time, end_time)
+        return None
+
 def process_video(input_paths, roi, callback, begin_attempt_number=1, params=None,
-                  progress_callback=None, should_continue=None):
+                  progress_callback=None, should_continue=None, slowmo_factor=1,
+                  scan_mode=False, model=None, restrict_range=None):
     """Обрабатывает видео и вырезает попытки.
 
     callback(attempt: AttemptInfo) вызывается после обнаружения каждой попытки;
     если вернёт False - обработка останавливается.
-    progress_callback(file_index, file_count, frame_index, total_frames) - прогресс обработки.
+    progress_callback(file_index, file_count, sample_index, sample_count) - прогресс.
     should_continue() - если вернёт False, обработка останавливается (кнопка "Остановить").
+    slowmo_factor - коэффициент замедления записи (например, 4 для слоумо 96 к/с,
+    записанного как 24 к/с). Все времена - в реальных секундах.
+    scan_mode - режим сканирования: редкие сэмплы (шаг params['scan_interval'],
+    точечный seek) и пониженный порог params['scan_threshold'];
+    попытки возвращаются как кандидаты (AttemptInfo.is_candidate=True), без точных границ.
+    model - предзагруженная модель YOLO (переиспользуется между вызовами).
+    restrict_range - (start_real, end_real): анализировать только этот диапазон
+    реального времени (для точной стадии ручного режима).
     """
     if params is None:
         params = DEFAULT_PROCESSING_PARAMS.copy()
-
-    min_pause_duration = params['min_pause_duration']
     min_strength = params.get('min_detection_strength', 0.5)
+    if model is None:
+        model = load_yolo_model()
 
-    # Загрузка модели YOLO
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '', 'models/yolo11s-seg.pt')
-    model = YOLO(model_path)
-
-    video_files = input_paths
+    video_files = sorted(input_paths, key=os.path.basename)
     attempt_number = begin_attempt_number
-    # Сортировка файлов по дате создания
-    # video_files.sort(key=os.path.getctime)
-    video_files.sort(key=os.path.basename, reverse=False)
-
-    # Создание выходной папки, если она не существует
-    # os.makedirs(output_folder, exist_ok=True)
+    file_count = len(video_files)
+    scan_interval = float(params.get('scan_interval', SCAN_INTERVAL))
+    sample_rate = (1.0 / scan_interval) if scan_mode else TARGET_ANALYSIS_FPS
+    range_start, range_end = restrict_range if restrict_range else (None, None)
 
     for file_index, video_file in enumerate(video_files):
         safe_print(f"Processing {video_file}...")
@@ -146,214 +435,54 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         if not cap.isOpened():
             safe_print(f"  Не удалось открыть файл: {video_file}")
             continue
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_limit = total_frames
-        frame_skip = max(1, int(round(fps / TARGET_ANALYSIS_FPS)))
-        safe_print(f"  FPS: {fps}, frame_skip: {frame_skip}, analysis rate: {fps / frame_skip:.1f} fps")
+        fps_real = fps_container * slowmo_factor if slowmo_factor > 1 else fps_container
+        real_duration = total_frames / fps_real if fps_real > 0 else 0.0
+        if slowmo_factor > 1:
+            safe_print(f"  Слоумо-видео (замедление 1/{slowmo_factor}): "
+                       f"fps контейнера {fps_container:.1f} -> реальный fps {fps_real:.1f}")
 
-        in_attempt = False
-        start_time = None
-        end_time = None
-        frames_in_attempt = 0
-        frames_out_of_attempt = 0
+        if scan_mode:
+            # Скан: редкие сэмплы точечным seek - не декодируем весь файл
+            sample_iter = _seek_sample_iter(cap, fps_real, total_frames, sample_rate,
+                                            range_start, range_end)
+            analysis_rate = sample_rate
+            sample_count = int(real_duration * sample_rate) + 1
+        else:
+            # Полный декод с прореживанием (как раньше)
+            frame_skip = max(1, int(round(fps_real / sample_rate)))
+            analysis_rate = fps_real / frame_skip
+            sample_iter = _grab_sample_iter(cap, fps_container, fps_real, total_frames,
+                                            frame_skip, range_start, range_end)
+            sample_count = total_frames
 
-        best_frame = None
-        best_frame_confidence = 0
-        person_frame = None
-        base_frame = None
-        person_bbox = None
-        person_conf = 0
-        last_person_bbox = None  # для fallback bbox когда person пропадает в брызгах
-        small_frame_original = None
+        detector = _Detector(model, roi, video_file,
+                             analysis_rate=analysis_rate,
+                             real_duration=real_duration,
+                             params=params, min_strength=min_strength,
+                             attempt_number=attempt_number, callback=callback,
+                             scan_mode=scan_mode,
+                             range_start=range_start, range_end=range_end)
 
-        detection_window_size = max(1, int(MIN_DETECTION_TIME * TARGET_ANALYSIS_FPS))
-        detection_window = deque(maxlen=detection_window_size)
-        bbox_history = deque(maxlen=detection_window_size)  # [(frame_num, x1,y1,x2,y2, conf), ...]
-
-        frame_index = 0  # номер последнего прочитанного кадра (1-based, как CAP_PROP_POS_FRAMES)
-        while True:
+        sample_index = 0
+        for real_sec, frame, pos, pos_total in sample_iter:
             if should_continue is not None and not should_continue():
                 safe_print("  Остановка обработки по запросу пользователя")
                 cap.release()
                 return
+            sample_index += 1
+            if progress_callback is not None:
+                progress_callback(file_index, file_count, sample_index, sample_count)
 
-            # grab() не декодирует кадр - намного быстрее read() для пропускаемых кадров
-            if not cap.grab():
-                break
-            frame_index += 1
-            if frame_index >= frame_limit:
-                break
+            result = detector.process_sample(real_sec, frame)
+            if result is False:
+                cap.release()
+                return
 
-            current_frame_num = frame_index
-            if current_frame_num % frame_skip == 0:
-                ret, frame = cap.retrieve()
-                if not ret:
-                    break
-                # Время считаем по счётчику кадров: CAP_PROP_POS_MSEC ненадёжен у некоторых бэкендов
-                current_sec = frame_index / fps
-                if progress_callback is not None:
-                    progress_callback(file_index, len(video_files), frame_index, total_frames)
-                if in_attempt and current_frame_num % (frame_skip * 50) == 0:
-                    safe_print(f"  [{os.path.basename(video_file)}] frame {current_frame_num}/{total_frames}, {current_sec:.1f}s, in attempt #{attempt_number}")
-                elif current_frame_num % (frame_skip * 100) == 0:
-                    safe_print(f"  [{os.path.basename(video_file)}] frame {current_frame_num}/{total_frames}, {current_sec:.1f}s")
-
-                original_frame = frame.copy()
-                
-                # Установка области интереса
-                if roi:
-                    frame_height, frame_width = frame.shape[:2]
-                    
-                    if len(roi) == 4:  # Прямоугольник
-                        left, top, right, bottom = roi
-                        x1_px = int(frame_width * left / 100)
-                        y1_px = int(frame_height * top / 100)
-                        x2_px = int(frame_width * right / 100)
-                        y2_px = int(frame_height * bottom / 100)
-                        frame = frame[y1_px:y2_px, x1_px:x2_px]
-                        original_frame = original_frame[y1_px:y2_px, x1_px:x2_px]
-                    elif len(roi) > 4:  # Многоугольник
-                        polygon_points = [(int(frame_width * x / 100), int(frame_height * y / 100)) for x, y in roi]
-                        mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-                        polygon_array = np.array(polygon_points, dtype=np.int32)
-                        cv2.fillPoly(mask, [polygon_array], 255)
-                        frame = cv2.bitwise_and(frame, frame, mask=mask)
-
-                # Масштабирование для YOLO
-                if frame.shape[1] > YOLO_MAX_WIDTH:
-                    scale_factor = YOLO_MAX_WIDTH / frame.shape[1]
-                    small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
-                    small_frame_original = cv2.resize(original_frame, None, fx=scale_factor, fy=scale_factor)
-                else:
-                    small_frame = frame.copy()
-                    small_frame_original = original_frame.copy()
-
-                results = model(small_frame, verbose=False)
-
-                # Проверка наличия объектов в ТЕКУЩЕМ кадре
-                person_detected_in_frame = False
-                best_conf_in_frame = 0
-                best_box_in_frame = None
-                best_person_box = None
-                for r in results:
-                    for box in r.boxes:
-                        conf = float(box.conf[0].cpu().numpy())
-                        cls = int(box.cls[0].cpu().numpy())
-                        class_name = model.names[cls]
-                        if class_name in YOLO_TARGET_CLASSES and conf >= YOLO_CONFIDENCE_THRESHOLD:
-                            person_detected_in_frame = True
-                            if conf > best_conf_in_frame:
-                                best_conf_in_frame = conf
-                                best_box_in_frame = box
-                        if class_name == 'person' and conf > person_conf:
-                            best_person_box = box
-                            person_conf = conf
-
-                # Обновляем лучший bbox для превью и историю
-                best_box_np = None
-                if best_box_in_frame is not None:
-                    best_box_np = best_box_in_frame.xyxy[0].cpu().numpy()
-                    bx1, by1, bx2, by2 = map(int, best_box_np)
-
-                    # Отслеживаем person bbox отдельно (fallback для превью)
-                    if best_person_box is not None:
-                        last_person_bbox = best_person_box.xyxy[0].cpu().numpy()
-                        best_person_box_np = last_person_bbox
-                    else:
-                        best_person_box_np = last_person_bbox if last_person_bbox is not None else best_box_np
-
-                    person_bbox = best_person_box_np
-                    bbox_history.append((current_frame_num, bx1, by1, bx2, by2, best_conf_in_frame))
-
-                    # Обновляем лучший кадр для превью (приоритет к person)
-                    if best_person_box is not None:
-                        ppx1, ppy1, ppx2, ppy2 = map(int, best_person_box_np)
-                        person_frame = small_frame_original[ppy1:ppy2, ppx1:ppx2]
-                    else:
-                        person_frame = small_frame_original[by1:by2, bx1:bx2]
-
-                    if best_conf_in_frame > best_frame_confidence:
-                        best_frame_confidence = best_conf_in_frame
-                        best_frame = small_frame_original
-
-                    if person_conf > 0.5:
-                        best_frame_confidence = person_conf
-                        best_frame = small_frame_original
-
-                elif best_frame is None and small_frame_original is not None:
-                    best_frame = small_frame_original
-                    person_frame = small_frame_original
-
-                # Вычисляем detection strength: bbox motion (IoU) + confidence drift
-                detection_strength = 0.0
-                if person_detected_in_frame and len(bbox_history) >= 2:
-                    ious = []
-                    confs = []
-                    for i in range(1, len(bbox_history)):
-                        prev = bbox_history[i - 1]
-                        curr = bbox_history[i]
-                        ious.append(_iou(prev[1:5], curr[1:5]))
-                        confs.append(abs(curr[5] - prev[5]))
-                    avg_iou = sum(ious) / len(ious)
-                    avg_conf_drift = sum(confs) / len(confs)
-                    detection_strength = (1.0 - avg_iou) * 0.7 + min(avg_conf_drift * 10, 1.0) * 0.3
-
-                # Hysteresis: во время попытки порог strength ниже (ловим брызги/переходные моменты)
-                actual_min_strength = min_strength * 0.3 if in_attempt else min_strength
-                has_detections = person_detected_in_frame and detection_strength >= actual_min_strength
-
-                # запоминаем базовый фрейм без человека
-                if not in_attempt:
-                    if base_frame is None:
-                        base_frame = small_frame_original
-
-                if has_detections:
-                    detection_window.append(1)
-                    frames_in_attempt += 1
-                    frames_out_of_attempt = 0
-                    if not in_attempt:
-                        # Debounce: требуем стабильных детекций перед стартом попытки
-                        if len(detection_window) >= detection_window_size and all(detection_window):
-                            detection_start_time = current_sec
-                            if detection_start_time - (end_time or 0) >= min_pause_duration:
-                                in_attempt = True
-                                start_time = detection_start_time
-                                safe_print(f"  [START] Попытка #{attempt_number} на {start_time:.2f}s")
-                else:
-                    detection_window.append(0)
-                    frames_out_of_attempt += 1
-                    if in_attempt and frames_out_of_attempt >= min_pause_duration * fps / frame_skip:
-                        in_attempt = False
-                        best_frame_confidence = 0
-                        detection_window.clear()
-                        bbox_history.clear()
-                        person_conf = 0
-                        last_person_bbox = None
-                        end_time = current_sec
-
-                        result, attempt_number = _finalize_attempt(
-                            attempt_number, start_time, end_time, total_frames, fps,
-                            person_bbox, base_frame, best_frame, person_frame,
-                            small_frame_original, video_file, callback, params)
-                        if result is not None:
-                            best_frame = None
-                            base_frame = None
-                            person_bbox = None
-                        if result is False:
-                            cap.release()
-                            return
-
-        if in_attempt and start_time is not None:
-            end_time = total_frames / fps
-            safe_print(f"  [{os.path.basename(video_file)}] Финализация попытки #{attempt_number} на конце видео ({end_time:.1f}s)")
-            result, attempt_number = _finalize_attempt(
-                attempt_number, start_time, end_time, total_frames, fps,
-                person_bbox, base_frame, best_frame, person_frame,
-                small_frame_original, video_file, callback, params)
-
-        if total_frames and frame_index < total_frames * 0.95:
-            safe_print(f"  ВНИМАНИЕ: прочитано {frame_index} кадров из {total_frames} "
-                       f"заявленных - файл, возможно, обработан не полностью")
-
+        result = detector.finish()
+        attempt_number = detector.attempt_number
         cap.release()
+        if result is False:
+            return

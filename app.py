@@ -14,7 +14,7 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model
+from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model, AttemptInfo
 import sys
 import traceback
 
@@ -165,6 +165,10 @@ class FreestyleParserApp:
         self._candidates_lock = threading.RLock()
         self.need_update_attempts = False
         self.athlete_mapping = {}  # Инициализируем пустой словарь
+        self._thumb_model = None   # кеш YOLO для умных превью
+        self._embedder = None      # кеш OSNet-эмбеддера для профилей из клипов
+        self.attempt_assignments = {}  # авто-привязки: {attempt: {athlete, sim, second}}
+        self._assignments_lock = threading.Lock()
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value="Все")
         self.selected_attempts = set()  # Множество выбранных попыток
@@ -359,9 +363,24 @@ class FreestyleParserApp:
         self.log(f"Запускаем процессинг файлов с roi={self.roi}")
         # Запускаем обработку в отдельном потоке
         if self.strategy_var and self.strategy_var.get() == 'manual':
-            threading.Thread(target=self.process_scan, daemon=True).start()
+            self._start_worker(self.process_scan)
+        elif self.strategy_var and self.strategy_var.get() == 'attempts':
+            self._start_worker(self.process_attempts)
         else:
-            threading.Thread(target=self.process_videos, daemon=True).start()
+            self._start_worker(self.process_videos)
+
+    def _start_worker(self, target):
+        """Запускает поток обработки со страховкой: любая ошибка внутри воркера
+        логируется и гарантированно возвращает кнопки в активное состояние."""
+        def run():
+            try:
+                target()
+            except Exception:
+                self.log("Ошибка потока обработки: " + traceback.format_exc(),
+                         logging.ERROR)
+                self.processing = False
+                self.root.after(0, lambda: self._after_worker_ui(False))
+        threading.Thread(target=run, daemon=True).start()
 
     def _video_has_audio(self, video_path):
         """Проверяет наличие аудио-дорожки (с кэшем по файлу)"""
@@ -421,21 +440,26 @@ class FreestyleParserApp:
             return self.processing
         slowmo = self._active_slowmo_factor
         if slowmo > 1:
-            # Слоумо: attempt.start/end в реальных секундах, файл длиннее реального
-            # времени в slowmo раз (таймстампы растянуты), поэтому файловое время =
-            # реальное * slowmo. Перекодируем с setpts, чтобы получить видео обычной
-            # скорости с полным fps съёмки (например, 96 к/с).
-            file_start = attempt.start * slowmo
-            self.log(f"Слоумо 1/{slowmo}: файл {file_start:.2f}s..{file_start + duration * slowmo:.2f}s, "
-                     f"перекодирование в обычную скорость")
-            cmd = [get_ffmpeg_path(), "-ss", f"{file_start:.3f}", "-i", attempt.source_video,
+            # Слоумо: кадры в контейнере идут с интервалом 1/24с, а поток H.264
+            # содержит 96 уникальных кадров в секунду. Сжимаем таймстампы в
+            # slowmo раз (-itsscale) и выставляем timescale = 96000, чтобы
+            # плеер воспроизводил попытку на реальной скорости (96 к/с)
+            # без перекодирования. -ss/-t задаются в реальных секундах.
+            ts = int(slowmo * 24) * 1000  # 96000 для 96 fps
+            self.log(f"Слоумо 1/{slowmo}: remux {attempt.start:.2f}s..{attempt.start + duration:.2f}s "
+                     f"(реальных), stream copy (itsscale={1 / slowmo}, timescale={ts})")
+            cmd = [get_ffmpeg_path(),
+                   "-itsscale", f"{1 / slowmo}",
+                   "-i", attempt.source_video,
+                   "-ss", f"{attempt.start:.3f}",
                    "-t", f"{duration:.3f}",
-                   "-vf", f"setpts=PTS/{slowmo}",
-                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                   "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+                   "-c", "copy",
+                   "-video_track_timescale", str(ts),
+                   "-map", "0:v:0",
+                   "-movflags", "+faststart",
+                   "-y", output_file]
             if self._video_has_audio(attempt.source_video):
-                cmd += ["-af", f"atempo={slowmo}", "-c:a", "aac"]
-            cmd += ["-y", output_file]
+                cmd += ["-map", "0:a:0?"]
         else:
             cmd = [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
                    "-t", str(duration), "-c", "copy", "-y", output_file]
@@ -549,6 +573,246 @@ class FreestyleParserApp:
             self.button_process.config(state=tk.NORMAL)
             self.button_stop.config(state=tk.DISABLED)
         self.update_cut_button_state()
+
+    # === Режим 'Попытки (атриб.)': сплиттер попыток + автоатрибуция ===
+
+    ATTEMPT_SIM_THRESHOLD = 0.88   # минимальная похожесть для автоатрибуции
+    ATTEMPT_SIM_MARGIN = 0.03      # отрыв от второго кандидата
+    W_REID, W_BOAT = 0.7, 0.3      # вклад OSNet и лодки в похожесть
+
+    def _roi_bbox_percentages(self):
+        """BBox ROI в процентах (L, T, R, B) из прямоугольника или полигона."""
+        if len(self.roi) == 4:
+            return tuple(self.roi)
+        xs = [p[0] for p in self.roi]
+        ys = [p[1] for p in self.roi]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _next_attempt_number(self):
+        """Следующий свободный номер попытки в папке дня."""
+        nums = []
+        if os.path.exists(self.output_folder):
+            for f in os.listdir(self.output_folder):
+                if f.endswith('.mp4') and f[:4].isdigit():
+                    nums.append(int(f[:4]))
+        return max(nums, default=0) + 1
+
+    def _load_profile_store(self):
+        """Профили попыток дня: {basename: {'vest': vec, 'boat': vec}}."""
+        store_file = os.path.join(self.output_folder, 'attempt_profiles.npz')
+        if not os.path.exists(store_file):
+            return {}
+        d = np.load(store_file, allow_pickle=True)
+        store = {}
+        for i, name in enumerate(d['names']):
+            store[str(name)] = {'vest': d['vest'][i], 'boat': d['boat'][i]}
+        return store
+
+    def _save_profile_store(self, store):
+        store_file = os.path.join(self.output_folder, 'attempt_profiles.npz')
+        names = list(store.keys())
+        np.savez(store_file,
+                 names=np.array(names),
+                 vest=np.array([store[n]['vest'] for n in names]),
+                 boat=np.array([store[n]['boat'] for n in names]))
+
+    def _athlete_banks(self, store):
+        """Банки атлетов из подтверждённого маппинга (усреднённые профили)."""
+        banks = {}
+        for athlete, files in self.athlete_mapping.items():
+            entries = [store[os.path.basename(f)] for f in files
+                       if os.path.basename(f) in store]
+            if not entries:
+                continue
+            vest = np.mean([e['vest'] for e in entries], axis=0)
+            vest = vest / max(np.linalg.norm(vest), 1e-9)
+            boat = np.mean([e['boat'] for e in entries], axis=0)
+            banks[athlete] = {'vest': vest, 'boat': boat / max(boat.sum(), 1e-9)}
+        return banks
+
+    def _attempt_athlete_sim(self, profile, bank):
+        """Похожесть попытки и банка: OSNet + совпадение доминантного бина лодки."""
+        # errstate: spurious overflow/divide-by-zero warning от Accelerate BLAS
+        # (macOS) на матмуле таких размеров - результат корректен, проверено
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            s_reid = float(profile['vest'] @ bank['vest'])
+        b = profile['boat']
+        if b.sum() <= 0:
+            return s_reid * self.W_REID / (self.W_REID + self.W_BOAT), None
+        bp = b / b.sum()
+        top = int(np.argmax(bp))
+        bt = int(np.argmax(bank['boat']))
+        dist = min(abs(top - bt), 18 - abs(top - bt))
+        s_boat = 1.0 if dist <= 1 else 0.0
+        return self.W_REID * s_reid + self.W_BOAT * s_boat, s_reid
+
+    def process_attempts(self):
+        """Стратегия 'Попытки (атриб.)': сплиттер попыток (YOLO-seg + трекинг),
+        нарезка попыток и автоатрибуция по банкам подтверждённых атлетов."""
+        try:
+            import attempts_v2
+            roi_bbox = self._roi_bbox_percentages()
+            store = self._load_profile_store()
+            # Удаляем записи, для которых нет .mp4 файлов (старые попытки из прошлых запусков)
+            stale = [n for n in store if not os.path.exists(os.path.join(self.output_folder, n))]
+            if stale:
+                self.log(f"Удаляю {len(stale)} устаревших записей из store: {', '.join(stale)}")
+                for n in stale:
+                    del store[n]
+            # мёртвые привязки маппинга - до построения банков и нумерации,
+            # иначе новая попытка с тем же номером унаследует чужую привязку
+            self._prune_athlete_mapping()
+            banks = self._athlete_banks(store)
+            if banks:
+                self.log(f"Банки атлетов: {', '.join(banks.keys())}")
+            else:
+                self.log("Банков атлетов пока нет - попытки будут нарезаны без атрибуции "
+                         "(после привязки попыток к атлетам атрибуция заработает)")
+            number = self._next_attempt_number()
+            start_pad = float(self.processing_params.get('attempt_start_padding', 2))
+            # запас на вход атлета в ROI, как в точном анализе старого пайплайна
+            margin = float(self.processing_params.get('scan_interval', 2.5)) + 1.0
+            end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
+            found_in_file = [0]
+
+            def on_attempt_found(r):
+                """Прогрессивная нарезка: попытка режется сразу после закрытия."""
+                nonlocal number
+                # preroll = start_pad (2с до входа) — даёт каякеру появиться во 2й секунде
+                preroll = max(0.0, r['start'] - start_pad)
+                # thumbnail: кадр, где атлет ближе всего к центру ROI
+                # (attempts_v2 считает thumb_t по дистанции bbox-центра)
+                thumb_t = r.get('thumb_t') or r['start']
+                src = cv2.VideoCapture(r['source'])
+                src.set(cv2.CAP_PROP_POS_MSEC, thumb_t * self._active_slowmo_factor * 1000)
+                ok, best_frame = src.read()
+                src.release()
+                if not ok:
+                    best_frame = np.zeros((360, 640, 3), np.uint8)
+                info = AttemptInfo(r['source'], preroll,
+                                   r['end'] + end_pad, number,
+                                   best_frame, None, None, None)
+                self.on_attempt_file_created(info)
+                out_name = f"{number:04d}.mp4"
+                number += 1
+                found_in_file[0] += 1
+                self.log(f"  Попытка {out_name}: {r['start']:.1f}-{r['end']:.1f}с "
+                         f"(лодка {r['boat_top'] * 10 if r['boat_top'] is not None else '-'}°)")
+                if r['reid'] is None:
+                    return
+                if not os.path.exists(os.path.join(self.output_folder, out_name)):
+                    return
+                vest_full = np.concatenate([r['vest'], r['reid']]) \
+                    if r['vest'] is not None else r['reid']
+                n = np.linalg.norm(vest_full)
+                store[out_name] = {
+                    'vest': vest_full / max(n, 1e-9),
+                    'boat': r['boat'] if r['boat'] is not None else np.zeros(18)}
+                # предложение атлета сразу по факту появления попытки:
+                # банки из текущего (в т.ч. только что подтверждённого) маппинга
+                self.refresh_auto_assignments(store=store)
+
+            for file_index, video_path in enumerate(self.selected_files):
+                if not self.processing:
+                    break
+                base = os.path.splitext(os.path.basename(video_path))[0]
+                self.log(f"[{file_index + 1}/{len(self.selected_files)}] "
+                         f"Поиск попыток: {os.path.basename(video_path)} ...")
+                tmp_dir = os.path.join(self.output_folder, f".attempts_tmp_{base}")
+                try:
+                    pstats = {}
+                    results = attempts_v2.process_video(
+                        video_path, tmp_dir, roi=roi_bbox,
+                        should_continue=lambda: self.processing,
+                        stats_out=pstats,
+                        slowmo_factor=self._active_slowmo_factor,
+                        min_pause=float(self.processing_params.get('min_pause_duration', 2.5)),
+                        min_attempt_duration=float(self.processing_params.get('min_attempt_duration', 3.0)),
+                        attempt_found_cb=lambda r, src=video_path: on_attempt_found({**r, 'source': src}),
+                        log_cb=self.log,
+                        progress_cb=lambda fi, tf, fi_=file_index, nf=len(self.selected_files):
+                            self.on_processing_progress(fi_, nf, fi, tf))
+                except Exception as e:
+                    self.log(f"Ошибка обработки {base}: {e}", logging.ERROR)
+                    continue
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                self._save_profile_store(store)
+                if not results and self.processing:
+                    pr = pstats.get('presence_ratio', 0.0)
+                    self.log(f"  Попыток не найдено. Главный атлет присутствовал в ROI "
+                             f"в {pr * 100:.0f}% времени. Если попытки в файле точно есть - "
+                             f"проверьте ROI (атлет должен быть целиком внутри области) "
+                             f"и пороги (мин. длительность попытки)", logging.WARNING)
+
+                self._save_profile_store(store)
+
+            # автоатрибуция новых попыток
+            self._auto_assign_attempts(store, banks)
+        except Exception as e:
+            self.log(f"Ошибка режима попыток: {e} {traceback.format_exc()}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self._after_worker_ui(False))
+            self.root.after(0, self.update_attempt_thumbnails)
+            self.root.after(0, self.update_athlete_list)
+
+    def _try_auto_assign(self, store, name, banks):
+        """Уверенное авто-присвоение одной попытки (под lock вызывающего).
+        True - присвоена (провизорная привязка сохранена сразу)."""
+        sims = {a: self._attempt_athlete_sim(store[name], b)[0]
+                for a, b in banks.items()}
+        srt = sorted(sims.items(), key=lambda kv: -kv[1])
+        best, best_sim = srt[0]
+        second_sim = srt[1][1] if len(srt) >= 2 else 0.0
+        if best_sim >= self.ATTEMPT_SIM_THRESHOLD and best_sim - second_sim >= self.ATTEMPT_SIM_MARGIN:
+            self.attempt_assignments[name] = {'athlete': best,
+                                              'sim': round(best_sim, 3),
+                                              'second': round(second_sim, 3)}
+            self._save_assignments()
+            self.need_update_attempts = True  # плитки обновятся постепенно
+            self.log(f"  Автоатрибуция: {name} → {best} (sim={best_sim:.2f}) "
+                     f"- подтвердите на сетке превью")
+            return True
+        hint = ', '.join(f'{a}={s:.2f}' for a, s in srt[:2])
+        self.log(f"  {name}: требует подтверждения ({hint})")
+        return False
+
+    def _auto_assign_attempts(self, store, banks):
+        """Автоприсвоение новых попыток: уверенные - в provизорные привязки
+        (assignments.yaml, до подтверждения пользователем), спорные - в лог.
+        Банки строятся только из подтверждённого маппинга, поэтому ошибка
+        авто-привязки не отравляет дальнейшую атрибуцию.
+        Вызывается в конце прогона и после каждого подтверждения."""
+        if not banks:
+            return
+        with self._assignments_lock:
+            assigned_names = {os.path.basename(f)
+                              for files in self.athlete_mapping.values() for f in files}
+            fresh = [n for n in store
+                     if n not in assigned_names and n not in self.attempt_assignments]
+            n_auto = 0
+            for name in fresh:
+                if self._try_auto_assign(store, name, banks):
+                    n_auto += 1
+        if fresh:
+            self.log(f"Автоатрибуция: предложено {n_auto} из {len(fresh)}")
+
+    def refresh_auto_assignments(self, store=None):
+        """Пересобирает банки (по подтверждённому маппингу) и немедленно
+        перепредлагает авто-привязки - подтверждение учитывается сразу.
+        store=None -> загрузить с диска; иначе используется живой store
+        (вызов из on_attempt_found в рабочем потоке)."""
+        try:
+            if store is None:
+                store = self._load_profile_store()
+            banks = self._athlete_banks(store)
+            if banks:
+                self._auto_assign_attempts(store, banks)
+        except Exception as e:
+            self.log(f"Ошибка пересчёта автоатрибуции: {e}", logging.ERROR)
+
 
     def on_candidate_found(self, attempt):
         """Callback сканирования (вызывается из рабочего потока): запоминаем кандидата.
@@ -738,7 +1002,9 @@ class FreestyleParserApp:
                 return
             data = {'candidates': [
                 {'file': c['file'], 'start': c['start'], 'end': c['end'],
-                 'thumbnail': c.get('thumbnail'), 'selected': bool(c.get('selected')),
+                 'thumbnail': self.get_relative_path(c['thumbnail'])
+                 if c.get('thumbnail') else None,
+                 'selected': bool(c.get('selected')),
                  'status': c['status']}
                 for c in self.candidates]}
         try:
@@ -835,9 +1101,109 @@ class FreestyleParserApp:
                 self.athlete_mapping = {}
         else:
             self.athlete_mapping = {}
+        self._prune_athlete_mapping()
+
+    def _prune_athlete_mapping(self):
+        """Убирает из маппинга привязки к несуществующим файлам.
+        Пустые атлеты не удаляются (атлет мог быть только что создан)."""
+        pruned = []
+        for athlete in list(self.athlete_mapping.keys()):
+            kept = [name for name in self.athlete_mapping[athlete]
+                    if os.path.exists(os.path.join(self.output_folder, name))]
+            pruned += [f"{athlete}: {name}"
+                       for name in self.athlete_mapping[athlete] if name not in kept]
+            self.athlete_mapping[athlete] = kept
+        if pruned:
+            self.log(f"Убраны мёртвые привязки маппинга: {', '.join(pruned)}")
+            self.save_athlete_mapping()
+        return pruned
+
+    def _load_assignments(self):
+        """Загружает авто-привязки (провизорные, до подтверждения пользователем)."""
+        f = os.path.join(self.output_folder, "assignments.yaml")
+        if os.path.exists(f):
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    self.attempt_assignments = yaml.safe_load(fh) or {}
+            except Exception as e:
+                self.log(f"Ошибка загрузки assignments: {e}")
+                self.attempt_assignments = {}
+        else:
+            self.attempt_assignments = {}
+
+    def _save_assignments(self):
+        f = os.path.join(self.output_folder, "assignments.yaml")
+        try:
+            with open(f, 'w', encoding='utf-8') as fh:
+                yaml.dump(self.attempt_assignments, fh,
+                          default_flow_style=False, allow_unicode=True)
+        except Exception as e:
+            self.log(f"Ошибка сохранения assignments: {e}")
+
+    def confirm_assignment(self, attempt, athlete_name=None):
+        """Подтверждает привязку попытки (auto -> confirmed в mapping.yaml)."""
+        a = self.attempt_assignments.get(attempt)
+        athlete = athlete_name or (a or {}).get('athlete')
+        if not athlete:
+            return
+        self.attempt_assignments.pop(attempt, None)
+        if athlete not in self.athlete_mapping:
+            self.athlete_mapping[athlete] = []
+        if attempt not in self.athlete_mapping[athlete]:
+            self.athlete_mapping[athlete].append(attempt)
+        self._save_assignments()
+        self.save_athlete_mapping()
+        self.log(f"Подтверждено: {attempt} → {athlete}")
+        self._refresh_attempt_tile(attempt)
+        self.update_athlete_list()
+        self.refresh_auto_assignments()
+
+    def remove_assignment(self, attempt):
+        """Снимает любую привязку попытки (и авто, и подтверждённую)."""
+        changed = self.attempt_assignments.pop(attempt, None) is not None
+        for attempts in self.athlete_mapping.values():
+            if attempt in attempts:
+                attempts.remove(attempt)
+                changed = True
+        if changed:
+            self._save_assignments()
+            self.save_athlete_mapping()
+            self.log(f"Привязка снята: {attempt}")
+            self._refresh_attempt_tile(attempt)
+            self.update_athlete_list()
+            self.refresh_auto_assignments()
+
+    def confirm_all_auto_assignments(self):
+        """Подтверждает авто-привязки одним кликом. При активном фильтре -
+        только видимые попытки, скрытые остаются провизорными."""
+        if not self.attempt_assignments:
+            messagebox.showinfo("Информация", "Нет авто-привязок для подтверждения.")
+            return
+        visible = {os.path.basename(f) for f in self.get_filtered_attempts()}
+        n = 0
+        touched = []
+        for attempt, a in list(self.attempt_assignments.items()):
+            if attempt not in visible:
+                continue
+            athlete = a.get('athlete')
+            if not athlete:
+                continue
+            self.attempt_assignments.pop(attempt, None)
+            if athlete not in self.athlete_mapping:
+                self.athlete_mapping[athlete] = []
+            if attempt not in self.athlete_mapping[athlete]:
+                self.athlete_mapping[athlete].append(attempt)
+            touched.append(attempt)
+            n += 1
+        self._save_assignments()
+        self.save_athlete_mapping()
+        self.log(f"Подтверждено авто-привязок: {n}")
+        for attempt in touched:
+            self._refresh_attempt_tile(attempt)
+        self.update_athlete_list()
+        self.refresh_auto_assignments()
 
     def save_athlete_mapping(self):
-        """Сохраняет маппинг атлетов в файл"""
         mapping_file = os.path.join(self.output_folder, "mapping.yaml")
         try:
             # Преобразуем абсолютные пути в относительные
@@ -889,7 +1255,11 @@ class FreestyleParserApp:
             self.log(f"Добавлен новый атлет: {name}")
 
     def assign_attempt_to_athlete(self, filename, athlete_name):
-        """Привязывает попытку к атлету"""
+        """Привязывает попытку к атлету (ручное действие = подтверждённая)."""
+        # Ручная привязка снимает провизорную
+        if self.attempt_assignments.pop(filename, None) is not None:
+            self._save_assignments()
+
         # Удаляем попытку из всех атлетов
         for attempts in self.athlete_mapping.values():
             if filename in attempts:
@@ -906,8 +1276,9 @@ class FreestyleParserApp:
         self.save_athlete_mapping()
 
         # Обновляем отображение
-        self.update_attempt_thumbnails()
+        self._refresh_attempt_tile(filename)
         self.update_athlete_list()
+        self.refresh_auto_assignments()
 
     def update_athlete_list(self):
         """Обновляет список атлетов"""
@@ -1072,6 +1443,8 @@ class FreestyleParserApp:
                        value='auto').pack(side=tk.LEFT)
         tk.Radiobutton(strategy_frame, text="Выбрать вручную", variable=self.strategy_var,
                        value='manual').pack(side=tk.LEFT, padx=(5, 0))
+        tk.Radiobutton(strategy_frame, text="Попытки (атриб.)", variable=self.strategy_var,
+                       value='attempts').pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
@@ -1102,6 +1475,12 @@ class FreestyleParserApp:
         # Счетчик выбранных попыток
         self.selected_count_label = tk.Label(self.actions_frame, text="Выбрано: 0")
         self.selected_count_label.pack(side=tk.LEFT, padx=5)
+
+        # Экспорт выбранных попыток (видео + превью) в стороннюю папку
+        self.export_button = tk.Button(self.actions_frame, text="Экспорт в...",
+                                       state=tk.DISABLED,
+                                       command=self.export_selected_attempts)
+        self.export_button.pack(side=tk.LEFT, padx=5)
 
         # Фильтры по меткам
         self.rating_filters_frame = tk.Frame(self.actions_frame)
@@ -1173,6 +1552,25 @@ class FreestyleParserApp:
                                                command=lambda: self.set_filter("Неизвестно"))
         self.filter_unknown_button.pack(fill=tk.X, pady=2)
 
+        self.filter_confirm_button = tk.Button(self.filter_buttons_frame, text="На подтверждение",
+                                               command=lambda: self.set_filter("На подтверждение"))
+        self.filter_confirm_button.pack(fill=tk.X, pady=2)
+
+        self.confirm_auto_button = tk.Button(self.filter_buttons_frame,
+                                             text="Подтвердить все авто",
+                                             command=self.confirm_all_auto_assignments)
+        self.confirm_auto_button.pack(fill=tk.X, pady=2)
+
+        self.regenerate_thumbs_button = tk.Button(self.filter_buttons_frame,
+                                                  text="Обновить превью",
+                                                  command=self.start_thumbnail_regeneration)
+        self.regenerate_thumbs_button.pack(fill=tk.X, pady=2)
+
+        self.bank_detect_button = tk.Button(self.filter_buttons_frame,
+                                            text="Детекция по банкам",
+                                            command=self.start_bank_detection)
+        self.bank_detect_button.pack(fill=tk.X, pady=2)
+
         # Контейнер для списка атлетов
         self.athletes_container = tk.Frame(self.frame_athletes)
         self.athletes_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -1218,9 +1616,13 @@ class FreestyleParserApp:
 
     def update_attempt_thumbnails(self):
         """Обновляет превью попыток"""
+        # сохраняем позицию скролла, чтобы перерисовка её не сбрасывала
+        scroll_pos = self.attempts_canvas.yview()
         # Очищаем текущие превью
         for widget in self.attempts_scrollable_frame.winfo_children():
             widget.destroy()
+        self._attempt_labels = {}
+        self._attempt_attr_frames = {}
 
         # Получаем отфильтрованные попытки
         filtered_files = self.get_filtered_attempts()
@@ -1233,7 +1635,7 @@ class FreestyleParserApp:
         self.attempt_checkboxes.clear()
 
         # Обновляем счетчик
-        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+        self._update_selected_count()
 
         # Сортируем попытки по имени
         attempts.sort()
@@ -1242,6 +1644,19 @@ class FreestyleParserApp:
         row = 0
         col = 0
         max_cols = 4  # Фиксированное количество колонок
+
+        # вероятности атрибуции - один расчёт на всё обновление сетки
+        sims_cache = {}
+        try:
+            store = self._load_profile_store()
+            banks = self._athlete_banks(store)
+            for a in attempts:
+                if a in store and banks:
+                    sims_cache[a] = sorted(
+                        ((ath, self._attempt_athlete_sim(store[a], b)[0])
+                         for ath, b in banks.items()), key=lambda kv: -kv[1])
+        except Exception:
+            sims_cache = {}
 
         for attempt in attempts:
             # Создаем фрейм для превью
@@ -1309,6 +1724,19 @@ class FreestyleParserApp:
                     # Добавляем обработчики событий
                     label.bind('<Button-1>', lambda e, a=attempt: self.on_attempt_drag_start(e, a))
                     label.bind('<Double-Button-1>', lambda e, a=attempt: self.on_attempt_double_click(e, a))
+
+                    # Статус атрибуции: подтверждено / авто / нет + быстрые действия
+                    self._attempt_labels[attempt] = label
+                    assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
+                                             if attempt in files), None)
+                    auto = self.attempt_assignments.get(attempt)
+                    srt = sims_cache.get(attempt, [])
+                    self._build_attr_row(frame, attempt, srt)
+
+                    # tooltip: кандидаты атрибуции с процентами
+                    tip = self._attribution_tip(attempt, assigned_athlete, srt)
+                    if tip:
+                        self._bind_tooltip(label, tip)
                     label.bind('<ButtonRelease-1>', lambda e, a=attempt: self.on_attempt_drag_end(e, a))
 
                     # Добавляем контекстное меню
@@ -1400,7 +1828,96 @@ class FreestyleParserApp:
             self.selected_attempts.discard(attempt)
         
         # Обновляем счетчик
-        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+        self._update_selected_count()
+
+    def _update_selected_count(self):
+        """Счётчик выбранных попыток + суммарный размер файлов на диске."""
+        total = 0
+        for name in self.selected_attempts:
+            try:
+                total += os.path.getsize(os.path.join(self.output_folder, name))
+            except OSError:
+                pass
+        if total >= 1024 ** 3:
+            size = f"{total / 1024 ** 3:.1f} ГБ"
+        elif total >= 1024 ** 2:
+            size = f"{total / 1024 ** 2:.0f} МБ"
+        else:
+            size = f"{total / 1024:.0f} КБ"
+        self.selected_count_label.config(
+            text=f"Выбрано: {len(self.selected_attempts)} ({size})")
+        btn = getattr(self, 'export_button', None)
+        if btn is not None:
+            btn.config(state=tk.NORMAL if self.selected_attempts else tk.DISABLED)
+
+    def export_selected_attempts(self):
+        """Кнопка 'Экспорт в...': выбор папки и копирование выбранных
+        клипов (+ превью jpg) в воркере с прогрессом в логе."""
+        if not self.selected_attempts:
+            return
+        dst = filedialog.askdirectory(title="Куда экспортировать попытки")
+        if not dst:
+            return
+        names = sorted(self.selected_attempts)
+        total = sum((os.path.getsize(os.path.join(self.output_folder, n))
+                     for n in names
+                     if os.path.exists(os.path.join(self.output_folder, n))), 0)
+        size = f"{total / 1024 ** 3:.1f} ГБ" if total >= 1024 ** 3 \
+            else f"{total / 1024 ** 2:.0f} МБ"
+        if not messagebox.askyesno(
+                "Экспорт",
+                f"Скопировать {len(names)} видео (+превью, {size}) в:\n{dst}?"):
+            return
+        self._export_names = names
+        self._export_dst = dst
+        self.processing = True
+        self.button_process.config(state=tk.DISABLED)
+        self.button_stop.config(state=tk.NORMAL)
+        self._start_worker(self._export_worker)
+
+    def _export_worker(self):
+        """Копирование выбранных попыток: mp4 + jpg в папку назначения."""
+        names = getattr(self, '_export_names', [])
+        dst = getattr(self, '_export_dst', None)
+        try:
+            if not names or not dst:
+                return
+            done = 0
+            for i, name in enumerate(names):
+                if not self.processing:
+                    break
+                src_mp4 = os.path.join(self.output_folder, name)
+                try:
+                    shutil.copy2(src_mp4, os.path.join(dst, name))
+                    src_jpg = os.path.join(self.output_folder,
+                                           os.path.splitext(name)[0] + '.jpg')
+                    if os.path.exists(src_jpg):
+                        shutil.copy2(src_jpg, os.path.join(dst, os.path.basename(src_jpg)))
+                except Exception as e:
+                    self.log(f"  Ошибка копирования {name}: {e}", logging.ERROR)
+                    continue
+                done += 1
+                self.log(f"Экспорт {done}/{len(names)}: {name}")
+            self.log(f"Экспорт завершён: {done} из {len(names)} → {dst}")
+            if done:
+                self._reveal_in_finder(dst)
+        except Exception as e:
+            self.log(f"Ошибка экспорта: {e}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self._after_worker_ui(False))
+
+    def _reveal_in_finder(self, path):
+        """Открывает папку в системном файловом менеджере."""
+        try:
+            if sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            elif os.name == 'nt':
+                os.startfile(path)
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            self.log(f"Не удалось открыть папку {path}: {e}", logging.WARNING)
 
     def delete_selected_attempts(self):
         """Удаляет выбранные попытки"""
@@ -1435,7 +1952,16 @@ class FreestyleParserApp:
                     for athlete_name, attempts_list in self.athlete_mapping.items():
                         if attempt in attempts_list:
                             attempts_list.remove(attempt)
-                    
+
+                    # Удаляем из авто-привязок, рейтингов и хранилища профилей
+                    if self.attempt_assignments.pop(attempt, None) is not None:
+                        self._save_assignments()
+                    self.attempt_ratings.pop(attempt, None)
+                    profile_store = self._load_profile_store()
+                    if attempt in profile_store:
+                        del profile_store[attempt]
+                        self._save_profile_store(profile_store)
+
                     self.log(f"Удален файл: {attempt}")
                     
                 except Exception as e:
@@ -1443,14 +1969,18 @@ class FreestyleParserApp:
             
             # Очищаем выбранные попытки
             self.selected_attempts.clear()
-            
+
+            # Сохраняем почищенные маппинг и рейтинги
+            self.save_athlete_mapping()
+            self.save_ratings()
+
             # Обновляем счетчик
-            self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
-            
+            self._update_selected_count()
+
             # Обновляем интерфейс
             self.update_attempt_thumbnails()
             self.update_athlete_list()
-            
+
             messagebox.showinfo("Успех", f"Удалено {deleted_count} попыток")
 
     def select_all_attempts(self):
@@ -1468,7 +1998,7 @@ class FreestyleParserApp:
                 checkbox_var.set(True)
         
         # Обновляем счетчик
-        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+        self._update_selected_count()
 
     def deselect_all_attempts(self):
         """Снимает выделение со всех попыток"""
@@ -1480,7 +2010,7 @@ class FreestyleParserApp:
             checkbox_var.set(False)
         
         # Обновляем счетчик
-        self.selected_count_label.config(text=f"Выбрано: {len(self.selected_attempts)}")
+        self._update_selected_count()
 
     def toggle_attempt_rating(self, attempt, rating_type):
         """Переключает рейтинг попытки"""
@@ -1839,9 +2369,8 @@ class FreestyleParserApp:
                     # Для превью показываем полный кадр без маски
                     # Маска применяется только при обработке для детекции
                     # Здесь мы просто используем полный кадр для красивого превью
-                    
-                    # Изменяем размер и сохраняем
-                    frame = cv2.resize(frame, (THUMB_X, THUMB_Y))
+
+                    # Полный кадр - единообразно с превью при обработке
                     cv2.imwrite(output_path, frame)
 
                 # Удаляем временный файл
@@ -1869,6 +2398,320 @@ class FreestyleParserApp:
         except subprocess.CalledProcessError as e:
             self.log(f"Ошибка создания скриншота: {e}")
             return False
+
+    def smart_thumbnail(self, video_path, output_path):
+        """Превью попытки: кадр, где каякер ближе к центру кадра и крупнее.
+        Прогоняет YOLO по сэмплам клипа (~2/с, до 120 сэмплов)."""
+        try:
+            if self._thumb_model is None:
+                self._thumb_model = load_yolo_model()
+            model = self._thumb_model
+            cap = cv2.VideoCapture(self.get_absolute_path(video_path))
+            if not cap.isOpened():
+                return False
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = n_frames / fps if fps > 0 else 0.0
+            step_s = 0.5
+            n_samples = min(int(duration / step_s) + 1, 120)
+            step = max(1, round(n_frames / max(n_samples, 1)))
+            best = None  # (score, frame)
+            fi = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if fi % step == 0:
+                    small = cv2.resize(frame, None, fx=0.4, fy=0.4)
+                    res = model(small, verbose=False)[0]
+                    H, W = frame.shape[:2]
+                    for box in res.boxes:
+                        if int(box.cls[0]) != 0 or float(box.conf[0]) < 0.4:
+                            continue
+                        x1, y1, x2, y2 = [c / 0.4 for c in box.xyxy[0].cpu().numpy()]
+                        cx, cy = (x1 + x2) / 2 / W, (y1 + y2) / 2 / H
+                        dist = ((abs(cx - 0.5) * 2) ** 2 + (abs(cy - 0.5) * 2) ** 2) ** 0.5
+                        area = max((x2 - x1) / W * (y2 - y1) / H, 1e-6)
+                        score = float(box.conf[0]) * (1.0 - dist) * (area ** 0.25)
+                        if best is None or score > best[0]:
+                            best = (score, frame.copy())
+                fi += 1
+            cap.release()
+            if best is None:
+                return self.generate_thumbnail(os.path.basename(video_path),
+                                               output_path, self.roi)
+            # полный кадр FHD - как при обработке (UI сам масштабирует для показа)
+            cv2.imwrite(output_path, best[1])
+            return True
+        except Exception as e:
+            self.log(f"Ошибка умного превью {video_path}: {e}", logging.ERROR)
+            return False
+
+    def regenerate_all_thumbnails(self):
+        """Пересоздаёт превью всех попыток через smart_thumbnail (в воркере)."""
+        try:
+            if not os.path.exists(self.output_folder):
+                return
+            files = sorted(f for f in os.listdir(self.output_folder)
+                           if f.endswith(".mp4"))
+            for i, name in enumerate(files):
+                if not self.processing:
+                    break
+                jpg = os.path.join(self.output_folder,
+                                   f"{os.path.splitext(name)[0]}.jpg")
+                if os.path.exists(jpg):
+                    os.remove(jpg)
+                self.smart_thumbnail(name, jpg)
+                self.log(f"Превью {i + 1}/{len(files)}: {name}")
+        except Exception as e:
+            self.log(f"Ошибка регенерации превью: {e}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self._after_worker_ui(False))
+            self.root.after(0, self.update_attempt_thumbnails)
+
+    def start_thumbnail_regeneration(self):
+        """Кнопка 'Обновить превью': блокирует кнопки и запускает воркер."""
+        self.processing = True
+        self.button_process.config(state=tk.DISABLED)
+        self.button_stop.config(state=tk.NORMAL)
+        self._start_worker(self.regenerate_all_thumbnails)
+
+    def start_bank_detection(self):
+        """Кнопка 'Детекция по банкам': автоатрибуция непривязанных попыток
+        без пересканирования видео (для текущей и прошлых папок)."""
+        if self.processing:
+            messagebox.showinfo("Информация", "Идёт обработка - дождитесь завершения.")
+            return
+        if not any(files for files in self.athlete_mapping.values()):
+            messagebox.showinfo(
+                "Информация",
+                "Сначала привяжите несколько попыток к атлетам (кнопка ✓ или селектор):\n"
+                "банки строятся из подтверждённых привязок.")
+            return
+        self.processing = True
+        self.button_process.config(state=tk.DISABLED)
+        self.button_stop.config(state=tk.NORMAL)
+        self._start_worker(self._bank_detection_worker)
+
+    def _profile_from_clip(self, name):
+        """Короткая схема: профиль попытки из готового клипа (YOLO + OSNet
+        на 2-3 лучших кропах)."""
+        import attempts_v2
+        if self._thumb_model is None:
+            self._thumb_model = load_yolo_model()
+        if self._embedder is None:
+            self._embedder = attempts_v2.Embedder(attempts_v2.default_device())
+        return attempts_v2.profile_from_clip(self.get_absolute_path(name),
+                                             model=self._thumb_model,
+                                             embedder=self._embedder)
+
+    def _bank_detection_worker(self):
+        """Детекция атлетов по банкам: профили попыток берутся из
+        attempt_profiles.npz, отсутствующие досчитываются из клипов
+        (2-3 кадра), попытки предлагаются по мере обработки - плитки
+        обновляются постепенно (need_update_attempts + periodic_update)."""
+        try:
+            import attempts_v2
+            self._prune_athlete_mapping()
+            store = self._load_profile_store()
+            clips = sorted(f for f in os.listdir(self.output_folder)
+                           if f.endswith(".mp4") and f[:4].isdigit())
+            missing = [n for n in clips
+                       if n not in store
+                       or float(np.linalg.norm(
+                           store[n]['vest'][attempts_v2.VEST_DIM:])) < 1e-6]
+            if missing:
+                self.log(f"Попыток без профиля: {len(missing)} - короткая схема "
+                         f"(2-3 кадра из клипа на попытку)")
+            # прошлые провизорные привязки пересматриваем вместе с новыми
+            with self._assignments_lock:
+                if self.attempt_assignments:
+                    self.attempt_assignments = {}
+                    self._save_assignments()
+                    self.log("Прошлые авто-привязки сняты - пересматриваю по банкам")
+            self.need_update_attempts = True
+            banks = self._athlete_banks(store)
+            if not banks:
+                self.log("Банки пусты: у подтверждённых попыток нет профилей",
+                         logging.WARNING)
+                return
+            self.log(f"Банки атлетов: {', '.join(banks.keys())}")
+            assigned_names = {os.path.basename(f)
+                              for files in self.athlete_mapping.values()
+                              for f in files}
+            n_auto = 0
+            for name in clips:
+                if not self.processing:
+                    break
+                with self._assignments_lock:
+                    if name in assigned_names or name in self.attempt_assignments:
+                        continue
+                if name not in store or \
+                        float(np.linalg.norm(
+                            store[name]['vest'][attempts_v2.VEST_DIM:])) < 1e-6:
+                    prof = self._profile_from_clip(name)
+                    if prof is None:
+                        self.log(f"  {name}: атлет в клипе не найден - пропущена")
+                        continue
+                    store[name] = prof
+                    self._save_profile_store(store)
+                    self.log(f"  Профиль из клипа: {name}")
+                with self._assignments_lock:
+                    if self._try_auto_assign(store, name, banks):
+                        n_auto += 1
+            self.log(f"Детекция по банкам: предложено {n_auto}")
+        except Exception as e:
+            self.log(f"Ошибка детекции по банкам: {e} {traceback.format_exc()}",
+                     logging.ERROR)
+        finally:
+            self.processing = False
+            self.need_update_attempts = True
+            self.root.after(0, lambda: self._after_worker_ui(False))
+            self.root.after(0, self.update_athlete_list)
+
+    def _on_selector_assign(self, attempt, choice):
+        """Выбор атлета в селекторе на плитке превью."""
+        if choice == '— снять':
+            self.remove_assignment(attempt)
+        else:
+            self.assign_attempt_to_athlete(attempt, choice)
+
+    def _attribution_tip(self, attempt, assigned_athlete, srt):
+        """Текст tooltip: кандидаты атрибуции с процентами (или текущий статус)."""
+        if assigned_athlete:
+            return f"{assigned_athlete} — подтверждено"
+        if not srt:
+            return None
+        tip = ', '.join(f'{a} {s * 100:.0f}%' for a, s in srt[:2])
+        auto = self.attempt_assignments.get(attempt)
+        if auto and len(srt) > 1:
+            tip += f"\nвторой кандидат: {srt[1][0]} {srt[1][1] * 100:.0f}%"
+        return tip
+
+    def _bind_tooltip(self, widget, text):
+        """Простой tooltip при наведении."""
+        tip_win = {'w': None}
+
+        def enter(_):
+            if tip_win['w']:
+                return
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 5
+            w = tk.Toplevel(widget)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            tk.Label(w, text=text, bg='#ffffe0', relief=tk.SOLID, bd=1,
+                     font=('Arial', 9), justify=tk.LEFT).pack()
+            tip_win['w'] = w
+
+        def leave(_):
+            if tip_win['w']:
+                tip_win['w'].destroy()
+                tip_win['w'] = None
+
+        widget.bind('<Enter>', enter)
+        widget.bind('<Leave>', leave)
+
+    def _build_attr_row(self, parent, attempt, srt):
+        """Строка атрибуции на плитке: статус + быстрая кнопка ✓ + селектор
+        атлетов (отсортирован по вероятности)."""
+        attr_frame = tk.Frame(parent)
+        attr_frame.pack(fill=tk.X)
+        self._attempt_attr_frames[attempt] = attr_frame
+        assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
+                                 if attempt in files), None)
+        auto = self.attempt_assignments.get(attempt)
+        if assigned_athlete:
+            status = tk.Label(attr_frame, text=f"{assigned_athlete} ✓",
+                              bg='#4caf50', fg='white',
+                              font=('Arial', 9, 'bold'))
+        elif auto:
+            status = tk.Label(attr_frame,
+                              text=f"{auto.get('athlete', '?')} "
+                                   f"{auto.get('sim', 0) * 100:.0f}%",
+                              bg='#ff9800', fg='white',
+                              font=('Arial', 9, 'bold'))
+        else:
+            status = tk.Label(attr_frame, text="не разобрано", bg='#9e9e9e',
+                              fg='white', font=('Arial', 9))
+        status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        if auto and not assigned_athlete:
+            ok = tk.Label(attr_frame, text="✓", width=2,
+                          bg='#4caf50', fg='white',
+                          font=('Arial', 9, 'bold'), cursor='hand2')
+            ok.bind('<Button-1>', lambda e, a=attempt, b=auto.get('athlete'):
+                    self.confirm_assignment(a, b))
+            ok.pack(side=tk.LEFT)
+
+        athletes_sorted = [ath for ath, _ in srt]
+        athletes_sorted += [ath for ath in self.athlete_mapping
+                            if ath not in athletes_sorted]
+        if athletes_sorted:
+            choices = ['— снять'] + athletes_sorted
+            current = assigned_athlete or (auto or {}).get('athlete') or choices[0]
+            sel_var = tk.StringVar(value=current)
+            om = tk.OptionMenu(attr_frame, sel_var, *choices,
+                               command=lambda ch, a=attempt:
+                               self._on_selector_assign(a, ch))
+            om.config(font=('Arial', 8), bd=0)
+            om.pack(fill=tk.X)
+        return attr_frame
+
+    def _get_attempt_sims(self, attempt):
+        """Похожести попытки на банки атлетов, по убыванию."""
+        try:
+            store = self._load_profile_store()
+            banks = self._athlete_banks(store)
+            if attempt in store and banks:
+                return sorted(((ath, self._attempt_athlete_sim(store[attempt], b)[0])
+                               for ath, b in banks.items()), key=lambda kv: -kv[1])
+        except Exception:
+            pass
+        return []
+
+    def _refresh_attempt_tile(self, attempt):
+        """Обновляет строку атрибуции одной плитки, не пересобирая сетку
+        (скролл сохраняется)."""
+        attr_frame = self._attempt_attr_frames.get(attempt)
+        label = self._attempt_labels.get(attempt)
+        if not attr_frame or not attr_frame.winfo_exists():
+            self.update_attempt_thumbnails()
+            return
+        for w in attr_frame.winfo_children():
+            w.destroy()
+        srt = self._get_attempt_sims(attempt)
+        self._build_attr_row(attr_frame, attempt, srt)
+        if label is not None and label.winfo_exists():
+            assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
+                                     if attempt in files), None)
+            tip = self._attribution_tip(attempt, assigned_athlete, srt)
+            if tip:
+                self._bind_tooltip(label, tip)
+
+    def show_attempt_context_menu(self, event, attempt):
+        """Контекстное меню плитки: подтвердить / привязать / снять."""
+        assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
+                                 if attempt in files), None)
+        auto = self.attempt_assignments.get(attempt)
+        menu = tk.Menu(self.root, tearoff=0)
+        if auto and not assigned_athlete:
+            menu.add_command(label=f"Подтвердить: {auto.get('athlete')}",
+                             command=lambda a=attempt, b=auto.get('athlete'):
+                             self.confirm_assignment(a, b))
+        athletes = [ath for ath, _ in self._get_attempt_sims(attempt)]
+        athletes += [ath for ath in self.athlete_mapping if ath not in athletes]
+        for ath in athletes:
+            if ath != assigned_athlete:
+                menu.add_command(label=f"Привязать: {ath}",
+                                 command=lambda a=attempt, b=ath:
+                                 self.assign_attempt_to_athlete(a, b))
+        if assigned_athlete or auto:
+            menu.add_separator()
+            menu.add_command(label="Снять привязку",
+                             command=lambda a=attempt: self.remove_assignment(a))
+        if menu.index(tk.END) is not None and menu.index(tk.END) > 0:
+            menu.tk_popup(event.x_root, event.y_root)
 
     def display_image(self, cv_image):
         bgr_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
@@ -2170,14 +3013,31 @@ class FreestyleParserApp:
         files = [f for f in os.listdir(self.output_folder) if f.endswith(".mp4")]
         files = [os.path.join(self.output_folder, f) for f in files]
 
-        # Применяем фильтр по атлетам
+        # Применяем фильтр по атлетам (mapping хранит базовые имена файлов,
+        # сравниваем по basename; во всех ветках возвращаем полные пути)
         if self.filter_var.get() == "Все":
             filtered_files = files
         elif self.filter_var.get() == "Неизвестно":
-            assigned = set(sum(self.athlete_mapping.values(), []))
-            filtered_files = [f for f in files if f not in assigned]
+            assigned = {os.path.basename(a)
+                        for atts in self.athlete_mapping.values() for a in atts}
+            filtered_files = [f for f in files
+                              if os.path.basename(f) not in assigned]
+        elif self.filter_var.get() == "На подтверждение":
+            # нет привязки вообще + авто-привязки (провизорные)
+            assigned = {os.path.basename(a)
+                        for atts in self.athlete_mapping.values() for a in atts}
+            filtered_files = [f for f in files
+                              if os.path.basename(f) in self.attempt_assignments
+                              or os.path.basename(f) not in assigned]
         else:
-            filtered_files = self.athlete_mapping.get(self.filter_var.get(), [])
+            athlete = self.filter_var.get()
+            # подтверждённые + неподтверждённые с предложенной авто-детекцией
+            names = list(self.athlete_mapping.get(athlete, []))
+            names += [n for n, a in self.attempt_assignments.items()
+                      if a.get('athlete') == athlete and n not in names]
+            filtered_files = [os.path.join(self.output_folder, a)
+                              for a in sorted(set(names))
+                              if os.path.exists(os.path.join(self.output_folder, a))]
 
         # Применяем фильтры по рейтингу
         if self.active_rating_filters:
@@ -2285,6 +3145,7 @@ class FreestyleParserApp:
 
         # Перезагружаем маппинг из новой папки
         self.load_athlete_mapping()
+        self._load_assignments()
         
         # Загружаем рейтинги
         self.load_ratings()

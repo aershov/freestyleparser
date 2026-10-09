@@ -158,6 +158,7 @@ class Attempt:
         self.last_tile_time = -1000.0
         self.thumb_dist = None  # превью: норм. дистанция центра bbox до центра ROI
         self.thumb_t = None     # превью: время лучшего сэмпла (реальные секунды)
+        self.last_embed_t = None  # время последнего OSNet-эмбеддинга (троттлинг)
 
     def close(self, end):
         self.end = end
@@ -222,7 +223,8 @@ def _probe_keyframe_grid(path, fps_container, total_frames, probe_seconds=8.0):
 def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
                   trace=False, progress_cb=None, should_continue=None,
                   stats_out=None, slowmo_factor=1, attempt_found_cb=None,
-                  log_cb=None, min_pause=None, min_attempt_duration=None):
+                  log_cb=None, min_pause=None, min_attempt_duration=None,
+                  collect_tiles=True, reid_embed_rate=None):
     """Обрабатывает видео: сплиттер попыток + профили атлетов.
 
     roi: (left, top, right, bottom) в процентах кадра.
@@ -232,6 +234,8 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
     определяет и закрытие попытки, и окно склейки оверсплитов.
     min_attempt_duration: минимальная длительность серии присутствия для
     подтверждения попытки (из настроек приложения).
+    reid_embed_rate: сколько OSNet-эмбеддингов в секунду реального времени
+    копить в профиль попытки (None/5 = каждый сэмпл; меньше = быстрее).
     progress_cb(frame_index, total_frames) — опционально.
     should_continue() -> bool — возврат False останавливает обработку.
     attempt_found_cb(attempt_dict) — вызывается, как только попытка закрыта.
@@ -588,9 +592,14 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
                 attempt.thumb_t = time_s
 
             if embedder is not None:
-                crop = frame[max(y1, 0):y2, max(x1, 0):x2]
-                if crop.size:
-                    attempt.dino.add(embedder.embed(crop), vq)
+                # троттлинг OSNet: не чаще reid_embed_rate раз в секунду реала
+                interval = 1.0 / max(0.01, reid_embed_rate if reid_embed_rate else 5.0)
+                if attempt.last_embed_t is None or \
+                        time_s - attempt.last_embed_t >= interval - 1e-6:
+                    crop = frame[max(y1, 0):y2, max(x1, 0):x2]
+                    if crop.size:
+                        attempt.dino.add(embedder.embed(crop), vq)
+                        attempt.last_embed_t = time_s
 
             # лодка: ближайшая чистая детекция к главному атлету
             best_b = None
@@ -610,7 +619,8 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
             if best_b is not None:
                 attempt.boat_bins += best_b[1] * best_b[0]
 
-            if len(attempt.tiles) < 400 and (len(attempt.tiles) == 0 or time_s - attempt.last_tile_time >= 0.4):
+            if collect_tiles and len(attempt.tiles) < 400 and \
+                    (len(attempt.tiles) == 0 or time_s - attempt.last_tile_time >= 0.4):
                 c = frame[max(y1, 0):y2, max(x1, 0):x2]
                 if c.size:
                     attempt.tiles.append(cv2.resize(c, (160, 120)))
@@ -652,16 +662,19 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
 
     # мозаики главных атлетов
     mosaics_dir = os.path.join(output, 'mosaics')
-    os.makedirs(mosaics_dir, exist_ok=True)
-    for i, a in enumerate(result):
-        step = max(1, len(a['tiles']) // 6)
-        tiles = a['tiles'][::step][:6]
-        while len(tiles) < 6:
-            tiles.append(np.zeros((120, 160, 3), np.uint8))
-        mos = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
-        cv2.putText(mos, f'attempt{i}_{a["start"]:.0f}-{a["end"]:.0f}s', (5, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-        cv2.imwrite(os.path.join(mosaics_dir, f'attempt{i:02d}.jpg'), mos)
+    if any(a['tiles'] for a in result):
+        os.makedirs(mosaics_dir, exist_ok=True)
+        for i, a in enumerate(result):
+            if not a['tiles']:
+                continue
+            step = max(1, len(a['tiles']) // 6)
+            tiles = a['tiles'][::step][:6]
+            while len(tiles) < 6:
+                tiles.append(np.zeros((120, 160, 3), np.uint8))
+            mos = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
+            cv2.putText(mos, f'attempt{i}_{a["start"]:.0f}-{a["end"]:.0f}s', (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+            cv2.imwrite(os.path.join(mosaics_dir, f'attempt{i:02d}.jpg'), mos)
 
     with open(os.path.join(output, 'attempts.json'), 'w') as f:
         json.dump([{'start': r['start'], 'end': r['end']} for r in result], f, indent=1)

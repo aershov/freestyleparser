@@ -98,19 +98,23 @@ class AthleteWidget(tk.Frame):
             bg='#f0f0f0',
             activebackground='#e0e0e0'
         )
-        self.button.pack(fill=tk.X, expand=True)
-        
+        self.button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Кнопка удаления (видна только у пустых атлетов - без попыток)
+        self.del_btn = tk.Button(self, text='✕', width=2, bd=1,
+                                 fg='#b00020', command=self.delete_athlete)
+
         # Привязываем обработчики событий
         self.button.bind('<Button-1>', self.on_button_press)
         self.button.bind('<B1-Motion>', self.on_drag)
         self.button.bind('<ButtonRelease-1>', self.on_button_release)
         self.button.bind('<Button-3>', self.show_context_menu)
-        
+
         # Добавляем подсказку
         self.tooltip = None
         self.button.bind('<Enter>', self.show_tooltip)
         self.button.bind('<Leave>', self.hide_tooltip)
-        
+
         # Добавляем счетчик попыток
         self.update_attempt_count()
     
@@ -194,6 +198,10 @@ class AthleteWidget(tk.Frame):
             self.tooltip = None
     
     def update_attempt_count(self):
-        """Обновляет счетчик попыток"""
+        """Обновляет счетчик попыток и видимость кнопки удаления"""
         attempts = self.master_app.athlete_mapping.get(self.name, [])
         self.button.configure(text=f"{self.name} ({len(attempts)})")
+        if attempts:
+            self.del_btn.pack_forget()
+        else:
+            self.del_btn.pack(side=tk.RIGHT, padx=(2, 0))

@@ -8,3 +8,4 @@ temp/
 *.zip
 .idea
 *.pyc
+.DS_Store

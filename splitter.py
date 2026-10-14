@@ -253,7 +253,9 @@ class _Detector:
         # Установка области интереса
         if self.roi:
             frame_height, frame_width = frame.shape[:2]
-            if len(self.roi) == 4:  # Прямоугольник
+            # Прямоугольник - 4 скаляра; полигон из 4 точек тоже даёт len==4,
+            # поэтому различаем по типу элементов
+            if len(self.roi) == 4 and all(isinstance(v, (int, float)) for v in self.roi):
                 left, top, right, bottom = self.roi
                 x1_px = int(frame_width * left / 100)
                 y1_px = int(frame_height * top / 100)
@@ -261,7 +263,8 @@ class _Detector:
                 y2_px = int(frame_height * bottom / 100)
                 frame = frame[y1_px:y2_px, x1_px:x2_px]
                 original_frame = original_frame[y1_px:y2_px, x1_px:x2_px]
-            elif len(self.roi) > 4:  # Многоугольник
+            elif all(isinstance(p, (list, tuple)) and len(p) == 2 for p in self.roi):
+                # Многоугольник
                 polygon_points = [(int(frame_width * x / 100), int(frame_height * y / 100)) for x, y in self.roi]
                 mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
                 polygon_array = np.array(polygon_points, dtype=np.int32)

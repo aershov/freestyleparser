@@ -31,6 +31,8 @@ def build_app():
         '--add-data=icon.ico:.',  # иконка окна приложения
         '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--collect-all=scipy',  # у scipy ленивые импорты (array_api_compat и т.п.) - иначе ModuleNotFoundError в exe
+        '--collect-all=supervision',  # ByteTrack в attempts_v2; пакет импортируется только из воркеров - PyInstaller его не видит сам
+        '--collect-all=lap',  # C-расширение, нужное supervision.ByteTrack
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',
         '--hidden-import=numpy',

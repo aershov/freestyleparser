@@ -68,10 +68,17 @@ def _iou(box1, box2):
     return inter / (a1 + a2 - inter)
 
 
+_YOLO_MODEL = None
+
+
 def load_yolo_model():
-    """Загружает модель YOLO (вынесено наружу, чтобы переиспользовать между вызовами)"""
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
-    return YOLO(model_path)
+    """Загружает модель YOLO с кешем: загрузка занимает секунды,
+    переиспользуем между файлами/потоками (модель stateless)."""
+    global _YOLO_MODEL
+    if _YOLO_MODEL is None:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
+        _YOLO_MODEL = YOLO(model_path)
+    return _YOLO_MODEL
 
 
 def _finalize_attempt(attempt_number, start_time, end_time, real_duration,

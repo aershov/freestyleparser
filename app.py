@@ -9,6 +9,7 @@ import datetime
 import threading
 import yaml
 import logging
+import re
 import shutil
 from utils import *
 import time
@@ -20,7 +21,7 @@ import traceback
 
 APP_VERSION = "1.0.0.1"
 
-THUMB_X = 180
+THUMB_X = 180  # (не используется: превью хранятся полным кадром, UI масштабирует)
 THUMB_Y = 120
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +29,15 @@ logging.basicConfig(level=logging.INFO)
 CANVAS_HEIGHT = 240
 
 MAX_LOG_LINES = 200
+
+def _live_num_str(num):
+    """Номер live-попытки в формате файла (0005)."""
+    return f"{num:04d}"
+
+def _natural_key(path):
+    """Натуральный ключ сортировки файлов: CAM2 перед CAM10."""
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', name)]
 
 def point_in_polygon(point, polygon):
     """
@@ -202,6 +212,13 @@ class FreestyleParserApp:
         self.candidate_vars = {}  # ключ кандидата -> tk.BooleanVar чекбокса
         self.candidates_file = None  # путь candidates.yaml, обновляется в on_output_folder_changed
         self._scan_found = 0
+        # Режим «Просмотр без сохранения»: попытки живут в памяти, на диск
+        # пишутся только превью live_NNNN.jpg; сохранение - по кнопкам в плеере
+        self.live_attempts = []  # {'num','file','start','end','thumb','saved'}
+        self.live_vars = {}  # num -> tk.BooleanVar чекбокса «сохранить»
+        self._live_lock = threading.Lock()
+        self._live_next_num = 0
+        self._live_player_opened = False
 
         # self.on_output_folder_changed()
 
@@ -230,18 +247,23 @@ class FreestyleParserApp:
             print(f"Не удалось установить иконку окна: {e}")
 
     def periodic_update(self):
-        """Периодическое обновление интерфейса"""
-        if self.need_update_attempts:
-            self.update_attempt_thumbnails()
-            self.need_update_attempts = False
-        if self.need_update_segments:
-            self.need_update_segments = False
-            self.update_segments_panel()
-        if self.need_update_files:
-            self.need_update_files = False
-            self._render_file_list()
-        if self.processing:
-            self.progress_var.set(min(self._progress_percent, 100.0))
+        """Периодическое обновление интерфейса (таймер живёт даже при
+        ошибке отрисовки - иначе панель попыток замирает до перезапуска)"""
+        try:
+            if self.need_update_attempts:
+                self.update_attempt_thumbnails()
+                self.need_update_attempts = False
+            if self.need_update_segments:
+                self.need_update_segments = False
+                self.update_segments_panel()
+            if self.need_update_files:
+                self.need_update_files = False
+                self._render_file_list()
+            if self.processing:
+                self.progress_var.set(min(self._progress_percent, 100.0))
+        except Exception:
+            self.log("Ошибка обновления интерфейса: " + traceback.format_exc(),
+                     logging.ERROR)
         self.root.after(1000, self.periodic_update)
 
     def on_attempt_drag_end(self, event, attempt):
@@ -321,6 +343,14 @@ class FreestyleParserApp:
         except Exception as e:
             print(f"Не удалось сохранить настройки: {e}")
 
+    def _set_selected_files(self, files):
+        """Единая точка установки списка файлов: натуральная сортировка
+        (иначе порядок кликов в диалоге/порядок в yaml непредсказуем)
+        + перерисовка списка."""
+        self.selected_files = sorted([f for f in files if isinstance(f, str)],
+                                     key=_natural_key)
+        self._render_file_list()
+
     def _restore_selected_files(self):
         """Восстанавливает выбор файлов этого дня (processing.yaml в папке дня):
         недоделанная работа видна сразу; отсутствующие файлы - красным."""
@@ -330,10 +360,9 @@ class FreestyleParserApp:
             files = (config.get('processing-config') or {}).get('selected_files') or []
         except Exception:
             files = []
-        self.selected_files = [f for f in files if isinstance(f, str)]
+        self._set_selected_files(files)
         if not self.selected_files:
             return
-        self._render_file_list()
         existing = [f for f in self.selected_files if os.path.exists(f)]
         if existing:
             try:
@@ -574,6 +603,66 @@ class FreestyleParserApp:
             return f"{nbytes / 1024 ** 2:.0f} МБ"
         return f"{nbytes / 1024:.0f} КБ"
 
+    def _remux_clip(self, source_video, start_real, duration_real, output_file,
+                    slowmo, label):
+        """Вырезка интервала из исходника в output_file (ffmpeg stream copy;
+        для слоумо - сжатие таймстампов, см. on_attempt_file_created).
+        Возвращает True при успехе."""
+        if slowmo > 1:
+            # Слоумо: кадры в контейнере идут с интервалом 1/24с, а поток H.264
+            # содержит 96 уникальных кадров в секунду. Сжимаем таймстампы в
+            # slowmo раз (-itsscale) и выставляем timescale = 96000, чтобы
+            # плеер воспроизводил попытку на реальной скорости (96 к/с)
+            # без перекодирования. -ss/-t задаются в реальных секундах.
+            ts = int(slowmo * 24) * 1000  # 96000 для 96 fps
+            self.log(f"Слоумо 1/{slowmo}: remux {start_real:.2f}s.."
+                     f"{start_real + duration_real:.2f}s (реальных), stream copy "
+                     f"(itsscale={1 / slowmo}, timescale={ts})")
+            cmd = [get_ffmpeg_path(),
+                   "-itsscale", f"{1 / slowmo}",
+                   "-i", source_video,
+                   "-ss", f"{start_real:.3f}",
+                   "-t", f"{duration_real:.3f}",
+                   "-c", "copy",
+                   "-video_track_timescale", str(ts),
+                   "-map", "0:v:0",
+                   "-movflags", "+faststart",
+                   "-y", output_file]
+            if self._video_has_audio(source_video):
+                cmd += ["-map", "0:a:0?"]
+        else:
+            cmd = [get_ffmpeg_path(), "-ss", str(start_real), "-i", source_video,
+                   "-t", str(duration_real), "-c", "copy", "-y", output_file]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                self.log(f"Ошибка ffmpeg для {label}: {result.stderr[-500:]}", logging.ERROR)
+                return False
+        except subprocess.TimeoutExpired:
+            self.log(f"Таймаут ffmpeg для {label} (>300с)", logging.ERROR)
+            return False
+        except Exception as e:
+            self.log(f"Ошибка запуска ffmpeg для {label}: {e}", logging.ERROR)
+            return False
+
+        # Контрольная проверка: длительность выхода должна совпадать с ожидаемой.
+        # Расхождение означает, что вырезка попала не туда (например, неверный
+        # режим слоумо или кривые таймстампы исходника).
+        try:
+            out_duration = float(subprocess.check_output(
+                [get_ffprobe_path(), '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', output_file]).decode().strip())
+            if abs(out_duration - duration_real) > max(1.0, duration_real * 0.2):
+                self.log(f"ВНИМАНИЕ: {label}: длительность результата "
+                         f"{out_duration:.2f}s сильно отличается от ожидаемой "
+                         f"{duration_real:.2f}s - проверьте режим слоумо", logging.WARNING)
+        except Exception:
+            pass
+        return True
+
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
         cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
@@ -589,60 +678,10 @@ class FreestyleParserApp:
             self.log(f"Пропускаем попытку {attempt.number}: start={attempt.start:.2f}s >= end={attempt.end:.2f}s")
             return self.processing
         slowmo = self._active_slowmo_factor
-        if slowmo > 1:
-            # Слоумо: кадры в контейнере идут с интервалом 1/24с, а поток H.264
-            # содержит 96 уникальных кадров в секунду. Сжимаем таймстампы в
-            # slowmo раз (-itsscale) и выставляем timescale = 96000, чтобы
-            # плеер воспроизводил попытку на реальной скорости (96 к/с)
-            # без перекодирования. -ss/-t задаются в реальных секундах.
-            ts = int(slowmo * 24) * 1000  # 96000 для 96 fps
-            self.log(f"Слоумо 1/{slowmo}: remux {attempt.start:.2f}s..{attempt.start + duration:.2f}s "
-                     f"(реальных), stream copy (itsscale={1 / slowmo}, timescale={ts})")
-            cmd = [get_ffmpeg_path(),
-                   "-itsscale", f"{1 / slowmo}",
-                   "-i", attempt.source_video,
-                   "-ss", f"{attempt.start:.3f}",
-                   "-t", f"{duration:.3f}",
-                   "-c", "copy",
-                   "-video_track_timescale", str(ts),
-                   "-map", "0:v:0",
-                   "-movflags", "+faststart",
-                   "-y", output_file]
-            if self._video_has_audio(attempt.source_video):
-                cmd += ["-map", "0:a:0?"]
-        else:
-            cmd = [get_ffmpeg_path(), "-ss", str(attempt.start), "-i", attempt.source_video,
-                   "-t", str(duration), "-c", "copy", "-y", output_file]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=300
-            )
-            if result.returncode != 0:
-                self.log(f"Ошибка ffmpeg для попытки {attempt.number}: {result.stderr[-500:]}", logging.ERROR)
-                return self.processing
-        except subprocess.TimeoutExpired:
-            self.log(f"Таймаут ffmpeg для попытки {attempt.number} (>300с)", logging.ERROR)
+        if not self._remux_clip(attempt.source_video, attempt.start, duration,
+                                output_file, slowmo,
+                                f"попытка {attempt.number:04d}"):
             return self.processing
-        except Exception as e:
-            self.log(f"Ошибка запуска ffmpeg для попытки {attempt.number}: {e}", logging.ERROR)
-            return self.processing
-
-        # Контрольная проверка: длительность выхода должна совпадать с ожидаемой.
-        # Расхождение означает, что вырезка попала не туда (например, неверный
-        # режим слоумо или кривые таймстампы исходника).
-        try:
-            out_duration = float(subprocess.check_output(
-                [get_ffprobe_path(), '-v', 'error', '-show_entries', 'format=duration',
-                 '-of', 'default=noprint_wrappers=1:nokey=1', output_file]).decode().strip())
-            if abs(out_duration - duration) > max(1.0, duration * 0.2):
-                self.log(f"ВНИМАНИЕ: попытка {attempt.number}: длительность результата "
-                         f"{out_duration:.2f}s сильно отличается от ожидаемой {duration:.2f}s - "
-                         f"проверьте режим слоумо", logging.WARNING)
-        except Exception:
-            pass
-
-        # self.log(f"Saved attempt {attempt.number} from {attempt.start:.2f}s to {attempt.end:.2f}s (duration: {attempt.duration():.2f}s)")
 
         self.need_update_attempts = True
         self.log(f"Видео попытки готово: {output_file}")
@@ -697,7 +736,7 @@ class FreestyleParserApp:
         Повторный скан ДОБАВЛЯЕТ новых кандидатов, не трогая существующие
         (уже отмеченные/нарезанные не пропадают) - удобно, если с первыми
         параметрами что-то не нашлось. Может идти одновременно с нарезкой
-        кандидатов (кнопка 'Нарезать выбранное')."""
+        кандидатов (кнопка «Нарезать»)."""
         self.scan_running = True
         t0 = time.time()
         try:
@@ -719,7 +758,7 @@ class FreestyleParserApp:
                                          self.selected_files, t0, self.processing)
             pending = [c for c in self.candidates if c['status'] == 'pending']
             self.log(f"Сканирование завершено: всего кандидатов {len(pending)}. "
-                     f"Снимите галочки с ненужных попыток и нажмите 'Нарезать выбранное'.")
+                     f"Снимите галочки с ненужных попыток и нажмите «Нарезать».")
         except Exception as e:
             self.log(f"Ошибка сканирования: {e} {traceback.format_exc()}", logging.ERROR)
         finally:
@@ -733,8 +772,272 @@ class FreestyleParserApp:
         """Обновляет кнопки после завершения задачи; если работают другие - не трогаем."""
         if not still_busy:
             self.button_process.config(state=tk.NORMAL)
+            self.button_live.config(state=tk.NORMAL)
             self.button_stop.config(state=tk.DISABLED)
         self.update_cut_button_state()
+
+    # === Режим «Просмотр без сохранения» ===
+
+    def start_live_preview(self):
+        """Запуск скана без сохранения: попытки живут в памяти, просмотр
+        в плеере, сохранение - по кнопкам/хоткеям плеера."""
+        self._sync_params_from_ui()
+        self.save_processing_config()
+        if not self.selected_files:
+            messagebox.showwarning("Предупреждение", "Сначала выберите файлы для обработки")
+            return
+        if not self.roi:
+            messagebox.showwarning("Предупреждение", "Сначала выберите область интереса")
+            return
+        with self._live_lock:
+            self.live_attempts = []
+        self._live_player_opened = False
+        self._live_next_num = self._next_attempt_number()
+        self.processing = True
+        self._active_slowmo_factor = self._ui_slowmo_factor()
+        # «Определять атлетов» ON -> точный сплиттер (attempts_v2, тяжёлый),
+        # OFF -> грубый скан сэмплами раз в scan_interval (splitter.py, быстрый).
+        # Эмбеддинги в live-режиме всё равно никуда не идут (атрибуции тут нет),
+        # так что OFF - предпочтительный вариант для быстрого просмотра
+        coarse = not (self.athletes_var and self.athletes_var.get())
+        self.button_process.config(state=tk.DISABLED)
+        self.button_live.config(state=tk.DISABLED)
+        self.button_stop.config(state=tk.NORMAL)
+        self._progress_percent = 0.0
+        self.progress_var.set(0)
+        self.log(f"Просмотр без сохранения ({'грубый скан' if coarse else 'точный сплиттер'}): "
+                 f"сканирую {len(self.selected_files)} файл(ов), "
+                 f"нумерация попыток с {_live_num_str(self._live_next_num)}")
+        self._start_worker(self._live_scan_worker_coarse if coarse
+                           else self._live_scan_worker)
+
+    def _live_scan_worker_coarse(self):
+        """Грубый скан (галочка «Определять атлетов» выключена).
+        Тот же движок, что ручной скан кандидатов: сэмплы раз в scan_interval
+        секунд, YOLO с пониженным порогом, без эмбеддингов и точной доводки.
+        Найденные интервалы регистрируются как live-попытки."""
+        t0 = time.time()
+        try:
+            factor = self._active_slowmo_factor
+
+            def on_found(attempt):
+                return self._live_found_coarse(attempt, factor)
+
+            process_video(self.selected_files, self.roi, on_found, 1,
+                          params=self.processing_params,
+                          progress_callback=self.on_processing_progress,
+                          should_continue=lambda: self.processing,
+                          slowmo_factor=factor,
+                          scan_mode=True)
+            # NB: файлы НЕ помечаем processed - ничего не сохранено
+            with self._live_lock:
+                n_total = len(self.live_attempts)
+            self.log(f"Грубый скан завершён за {time.time() - t0:.1f}с: "
+                     f"найдено попыток {n_total} (интервалы неточные ±{self.processing_params.get('scan_interval', 2.5):.1f}с)")
+        except Exception as e:
+            self.log(f"Ошибка грубого скана просмотра: {e} {traceback.format_exc()}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self._after_worker_ui(False))
+            self.root.after(0, self.update_attempt_thumbnails)
+
+    def _live_found_coarse(self, attempt, factor):
+        """Callback грубого скана: AttemptInfo -> live-попытка.
+        Возвращает should_continue."""
+        if not self.processing:
+            return False
+        if attempt.source_video not in self.selected_files:
+            return self.processing
+        with self._live_lock:
+            num = self._live_next_num
+            self._live_next_num += 1
+            la = {'num': num,
+                  'file': attempt.source_video,
+                  'start': float(attempt.start),
+                  'end': float(attempt.end),
+                  'thumb_t': float(attempt.start),
+                  'thumb': None,
+                  'saved': False}
+            thumb_path = os.path.join(self.output_folder, f"live_{num:04d}.jpg")
+            la['thumb'] = thumb_path
+            self.live_attempts.append(la)
+        frame = getattr(attempt, 'best_frame', None)
+        if frame is None:
+            src = cv2.VideoCapture(attempt.source_video)
+            src.set(cv2.CAP_PROP_POS_MSEC, float(attempt.start) * factor * 1000)
+            ok, frame = src.read()
+            src.release()
+            if not ok:
+                frame = np.zeros((360, 640, 3), np.uint8)
+        if frame is not None:
+            try:
+                cv2.imwrite(thumb_path, frame)
+            except Exception as e:
+                self.log(f"Не удалось записать превью {thumb_path}: {e}", logging.WARNING)
+                la['thumb'] = None
+        self.need_update_attempts = True
+        self.log(f"  Попытка {_live_num_str(num)}: {os.path.basename(attempt.source_video)} "
+                 f"{la['start']:.1f}с..{la['end']:.1f}с (грубый скан, не сохранена)")
+        self.root.after(0, self._maybe_open_live_player)
+        return self.processing
+
+    def _live_scan_worker(self):
+        """Скан выбранных файлов сплиттером попыток БЕЗ нарезки.
+        Найденные попытки: thumb live_NNNN.jpg + запись в self.live_attempts."""
+        t0 = time.time()
+        try:
+            import attempts_v2
+            roi_bbox = self._roi_bbox_percentages()
+            start_pad = float(self.processing_params.get('attempt_start_padding', 2))
+            end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
+            factor = self._active_slowmo_factor
+            for file_index, video_path in enumerate(self.selected_files):
+                if not self.processing:
+                    break
+                base = os.path.splitext(os.path.basename(video_path))[0]
+                self.log(f"[{file_index + 1}/{len(self.selected_files)}] "
+                         f"Поиск попыток: {os.path.basename(video_path)} ...")
+                tmp_dir = os.path.join(self.output_folder, f".attempts_tmp_{base}")
+
+                def on_found(r, src_path=video_path):
+                    return self._live_found_attempt(src_path, r, factor)
+
+                try:
+                    pstats = {}
+                    attempts_v2.process_video(
+                        video_path, tmp_dir, roi=roi_bbox,
+                        should_continue=lambda: self.processing,
+                        stats_out=pstats,
+                        slowmo_factor=factor,
+                        min_pause=float(self.processing_params.get('min_pause_duration', 2.5)),
+                        min_attempt_duration=float(self.processing_params.get('min_attempt_duration', 3.0)),
+                        reid_embed_rate=float(self.processing_params.get('reid_embed_rate', 5)),
+                        attempt_found_cb=on_found,
+                        log_cb=self.log,
+                        progress_cb=lambda fi, tf, fi_=file_index, nf=len(self.selected_files):
+                            self.on_processing_progress(fi_, nf, fi, tf))
+                except Exception as e:
+                    self.log(f"Ошибка скана {base}: {e}", logging.ERROR)
+                    continue
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+            # NB: файлы НЕ помечаем processed - ничего не сохранено,
+            # пользователь может потом нарезать их обычным режимом
+            with self._live_lock:
+                n_total = len(self.live_attempts)
+            self.log(f"Просмотр без сохранения завершён за {time.time() - t0:.1f}с: "
+                     f"найдено попыток {n_total} (сохранено пока не было)")
+        except Exception as e:
+            self.log(f"Ошибка режима просмотра: {e} {traceback.format_exc()}", logging.ERROR)
+        finally:
+            self.processing = False
+            self.root.after(0, lambda: self._after_worker_ui(False))
+            self.root.after(0, self.update_attempt_thumbnails)
+
+    def _live_found_attempt(self, src_path, r, factor):
+        """Callback сплиттера: регистрируем попытку в памяти + thumb.
+        Возвращает should_continue."""
+        if not self.processing:
+            return False
+        start_pad = float(self.processing_params.get('attempt_start_padding', 2))
+        thumb_t = r.get('thumb_t') or r['start']
+        # thumb: кадр, где атлет ближе всего к центру ROI (для плитки панели)
+        src = cv2.VideoCapture(src_path)
+        src.set(cv2.CAP_PROP_POS_MSEC, thumb_t * factor * 1000)
+        ok, best_frame = src.read()
+        src.release()
+        if not ok:
+            best_frame = np.zeros((360, 640, 3), np.uint8)
+        with self._live_lock:
+            num = self._live_next_num
+            self._live_next_num += 1
+            la = {
+                'num': num,
+                'file': src_path,
+                'start': float(r['start']),
+                'end': float(r['end']),
+                'thumb_t': float(thumb_t),
+                'thumb': os.path.join(self.output_folder, f"live_{num:04d}.jpg"),
+                'saved': False,
+            }
+            self.live_attempts.append(la)
+        cv2.imwrite(la['thumb'], best_frame)
+        self.need_update_attempts = True
+        self.log(f"  Попытка {_live_num_str(num)}: {r['start']:.1f}-{r['end']:.1f}с "
+                 f"(не сохранена, смотрим в плеере)")
+        self.root.after(0, self._maybe_open_live_player)
+        return self.processing
+
+    def _maybe_open_live_player(self):
+        """Автооткрытие плеера на первой найденной попытке (один раз за скан)."""
+        if self._live_player_opened:
+            return
+        with self._live_lock:
+            if not self.live_attempts:
+                return
+            self._live_player_opened = True
+        try:
+            self.open_live_attempt(0)
+        except Exception as e:
+            self.log(f"Не удалось открыть плеер: {e}", logging.ERROR)
+
+    def open_live_attempt(self, idx):
+        """Открыть плеер на попытке live_attempts[idx] (по двойному клику тоже)."""
+        with self._live_lock:
+            if not (0 <= idx < len(self.live_attempts)):
+                return
+            la = self.live_attempts[idx]
+        view_start = max(0.0, la['start'] - float(self.processing_params.get('attempt_start_padding', 2)))
+        title = (f"Попытка {_live_num_str(la['num'])} · клип {la['start']:.0f}–{la['end']:.0f}с "
+                 f"— просмотр без сохранения")
+        # плеер сам пересчитает границы через _load_live_entry; здесь только файл
+        self._preview_popup = VideoPreviewPopup(
+            self, la['file'], view_start * self._active_slowmo_factor,
+            title, factor=self._active_slowmo_factor, attempt=None,
+            live=True, live_index=idx)
+
+    def save_live_attempt(self, la):
+        """Сохранение live-попытки на диск (из кнопок/хоткеев плеера). True - успех."""
+        with self._live_lock:
+            if la.get('saved'):
+                return True
+        src = la['file']
+        if not os.path.exists(src):
+            self.log(f"Исходник не найден: {src}", logging.ERROR)
+            return False
+        num = la['num']
+        start_pad = float(self.processing_params.get('attempt_start_padding', 2))
+        end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
+        preroll = max(0.0, la['start'] - start_pad)
+        duration = la['end'] - preroll + end_pad
+        output_file = os.path.join(self.output_folder, f"{num:04d}.mp4")
+        if os.path.exists(output_file):
+            self.log(f"{_live_num_str(num)} уже есть на диске - пропускаю")
+            la['saved'] = True
+            self.need_update_attempts = True
+            return True
+        slowmo = self._active_slowmo_factor
+        if not self._remux_clip(src, preroll, duration, output_file, slowmo,
+                                f"попытка {_live_num_str(num)} (из плеера)"):
+            return False
+        # jpg: live-превью уже снят с нужного кадра - копируем
+        jpg_out = os.path.join(self.output_folder, f"{num:04d}.jpg")
+        try:
+            if la['thumb'] and os.path.exists(la['thumb']):
+                shutil.copyfile(la['thumb'], jpg_out)
+            else:
+                cap = cv2.VideoCapture(src)
+                cap.set(cv2.CAP_PROP_POS_MSEC, (la.get('thumb_t') or la['start']) * slowmo * 1000)
+                ok, frame = cap.read()
+                cap.release()
+                if ok:
+                    cv2.imwrite(jpg_out, frame)
+        except Exception as e:
+            self.log(f"Не удалось сохранить превью {num:04d}.jpg: {e}", logging.WARNING)
+        la['saved'] = True
+        self.need_update_attempts = True
+        self.log(f"Попытка {_live_num_str(num)} сохранена: {output_file}")
+        return True
 
     # === Режим 'Попытки (атриб.)': сплиттер попыток + автоатрибуция ===
 
@@ -744,11 +1047,16 @@ class FreestyleParserApp:
 
     def _roi_bbox_percentages(self):
         """BBox ROI в процентах (L, T, R, B) из прямоугольника или полигона."""
-        if len(self.roi) == 4:
+        if self._is_flat_rectangle(self.roi):
             return tuple(self.roi)
         xs = [p[0] for p in self.roi]
         ys = [p[1] for p in self.roi]
         return (min(xs), min(ys), max(xs), max(ys))
+
+    @staticmethod
+    def _is_flat_rectangle(roi):
+        """Прямоугольник - 4 скаляра; полигон из 4 точек тоже даёт len==4."""
+        return len(roi) == 4 and all(isinstance(v, (int, float)) for v in roi)
 
     def _next_attempt_number(self):
         """Следующий свободный номер попытки в папке дня."""
@@ -1334,9 +1642,9 @@ class FreestyleParserApp:
             selected = [c for c in self.candidates
                         if c['status'] == 'pending' and c.get('selected')]
         n = len(selected)
-        text = "✂️ Нарезать выбранное"
+        # компактный текст: панель попыток узкая, длинная подпись обрезается
+        text = "✂️ Нарезать"
         if n > 0:
-            text += f" ({n})"
             try:
                 start_pad = self.processing_params['attempt_start_padding']
                 end_pad = self.processing_params['attempt_end_padding']
@@ -1345,10 +1653,10 @@ class FreestyleParserApp:
                 total = sum(self._estimate_output_bytes(
                     c['file'], c['end'] - c['start'] + start_pad + end_pad + margin)
                     for c in selected)
-                if total > 0:
-                    text += f" ≈{self._fmt_size(total)}"
+                text = f"✂️ Нарезать ({n}) ≈{self._fmt_size(total)}" if total > 0 \
+                    else f"✂️ Нарезать ({n})"
             except Exception:
-                pass
+                text = f"✂️ Нарезать ({n})"
             self.button_cut_selected.config(state=tk.NORMAL, text=text)
         else:
             self.button_cut_selected.config(state=tk.DISABLED, text=text)
@@ -1401,7 +1709,7 @@ class FreestyleParserApp:
                     remaining = total - i
                     self.log(f"Нарезка остановлена: обработано {i} из {total}, "
                              f"осталось {remaining} кандидатов. Повторный запуск "
-                             f"«Нарезать выбранное» продолжит с того же места.")
+                             f"«Нарезать» продолжит с того же места.")
                     break
                 left = total - i
                 if any(f == cand['file'] and max(s, cand['start']) < min(e, cand['end'])
@@ -1965,6 +2273,17 @@ class FreestyleParserApp:
         self.button_stop = tk.Button(control_inner, text="Остановить", state=tk.DISABLED, command=self.stop_processing)
         self.button_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
+        # Режим «Просмотр без сохранения»: скан в фоне, попытки живут в памяти,
+        # просмотр в плеере, сохранение - по кнопкам (или A/S) в плеере
+        self.button_live = tk.Button(control_inner, text="👁 Просмотр", command=self.start_live_preview)
+        self.button_live.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self._attach_tooltip(self.button_live,
+                             "Сканировать попытки без сохранения на диск.\n"
+                             "Просмотр в плеере, сохранение - кнопками в плеере\n"
+                             "или клавишами A (предыдущая) / S (текущая).\n"
+                             "«Определять атлетов» вкл -> точный сплиттер (медленно),\n"
+                             "выкл -> грубый быстрый скан (шаг scan_interval).")
+
         # === ПРАВЫЙ БЛОК ===
         self.right_frame = tk.PanedWindow(self.top_frame, orient=tk.HORIZONTAL)
         self.top_frame.add(self.right_frame)
@@ -2019,7 +2338,7 @@ class FreestyleParserApp:
         # Кнопка нарезки выбранных кандидатов (ручной режим).
         # Ярко выделена, чтобы читалась как кнопка, а не надпись.
         self.button_cut_selected = tk.Button(
-            self.actions_frame, text="✂️ Нарезать выбранное",
+            self.actions_frame, text="✂️ Нарезать",
             command=self.cut_selected_candidates, state=tk.DISABLED,
             relief=tk.RAISED, bd=2, bg="#dff0d8", activebackground="#c8e6c9",
             font=('Arial', 10, 'bold'), padx=8, pady=2)
@@ -2377,7 +2696,10 @@ class FreestyleParserApp:
             # Создаем превью
             thumbnail_path = os.path.join(self.output_folder, f"{os.path.splitext(attempt)[0]}.jpg")
             if not os.path.exists(thumbnail_path):
-                self.generate_thumbnail(attempt, thumbnail_path, self.roi)
+                try:
+                    self.generate_thumbnail(attempt, thumbnail_path, self.roi)
+                except Exception as e:
+                    self.log(f"Ошибка превью {attempt}: {e}")
 
             if os.path.exists(thumbnail_path):
                 try:
@@ -2470,7 +2792,7 @@ class FreestyleParserApp:
             sep_frame.grid(row=row + 1, column=0, columnspan=max_cols, pady=(12, 2))
             tk.Label(sep_frame,
                      text=f"—— Кандидаты ({len(pending)}): снимите галочки с ненужных, "
-                          f"затем «Нарезать выбранное» ——",
+                          f"затем «Нарезать» ——",
                      fg="#555555").pack(side=tk.LEFT)
             # Очистка ненарезанных кандидатов (для пересканирования с нуля)
             clear_btn = tk.Button(sep_frame, text="🧹", width=3, bd=1,
@@ -2535,6 +2857,149 @@ class FreestyleParserApp:
                 if ccol >= max_cols:
                     ccol = 0
                     crow += 1
+
+        # --- Live-попытки (просмотр без сохранения) ---
+        with self._live_lock:
+            live = sorted(self.live_attempts, key=lambda a: a['num'])
+        self.live_vars = {}
+        if live:
+            base_row = (crow + 1) if 'crow' in locals() else (row + 1)
+            sep_frame = tk.Frame(self.attempts_scrollable_frame)
+            sep_frame.grid(row=base_row, column=0, columnspan=max_cols, pady=(12, 2))
+            n_saved = sum(1 for a in live if a['saved'])
+            tk.Label(sep_frame,
+                     text=f"—— Просмотр без сохранения ({len(live)}, "
+                          f"сохранено {n_saved}) ——",
+                     fg="#555555").pack(side=tk.LEFT)
+            save_sel_btn = tk.Button(sep_frame, text="💾 Сохранить выбранные",
+                                     command=self.save_selected_live)
+            save_sel_btn.pack(side=tk.LEFT, padx=8)
+            self._attach_tooltip(save_sel_btn,
+                                 "Сохранить отмеченные попытки на диск\n"
+                                 "(номер = номер в подписи, дырки в нумерации - норма)")
+            clear_live_btn = tk.Button(sep_frame, text="🧹", width=3, bd=1,
+                                       command=self.clear_live_attempts)
+            clear_live_btn.pack(side=tk.LEFT, padx=4)
+            self._attach_tooltip(clear_live_btn,
+                                 "Очистить весь список live-попыток\n"
+                                 "(на диск ничего не сохранялось, но превью удалятся)")
+            lrow, lcol = base_row + 1, 0
+            for i, la in enumerate(live):
+                frame = tk.Frame(self.attempts_scrollable_frame)
+                frame.grid(row=lrow, column=lcol, padx=5, pady=5)
+
+                img_label = None
+                if la['thumb'] and os.path.exists(la['thumb']):
+                    try:
+                        image = Image.open(la['thumb'])
+                        image = image.resize((200, 150), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(image)
+                        img_label = tk.Label(frame, image=photo)
+                        img_label.image = photo
+                        img_label.pack()
+                    except Exception as e:
+                        self.log(f"Ошибка превью live-попытки: {e}")
+
+                name_frame = tk.Frame(frame)
+                name_frame.pack()
+                if not la['saved']:
+                    # по умолчанию попытка НЕ помечена на сохранение;
+                    # галочку ставит S/A в плеере (queued) или пользователь
+                    var = tk.BooleanVar(value=bool(la.get('queued')))
+                    self.live_vars[la['num']] = var
+                    tk.Checkbutton(name_frame, variable=var,
+                                   command=lambda n=la['num']: self._on_live_check_toggle(n)
+                                   ).pack(side=tk.LEFT, padx=(0, 4))
+                status = f"✓ {_live_num_str(la['num'])}.mp4" if la['saved'] \
+                    else ("⏳ к сохранению" if la.get('queued') else "— не сохранена")
+                name_label = tk.Label(
+                    name_frame,
+                    text=f"{_live_num_str(la['num'])} · клип {la['start']:.0f}–{la['end']:.0f}с {status}",
+                    fg='#2e7d32' if la['saved'] else None)
+                name_label.pack(side=tk.LEFT)
+                for w in (img_label, name_label):
+                    if w is not None:
+                        w.bind('<Double-Button-1>',
+                               lambda e, n=la['num']: self._open_live_by_num(n))
+                lcol += 1
+                if lcol >= max_cols:
+                    lcol = 0
+                    lrow += 1
+
+    def save_selected_live(self):
+        """Сохранение отмеченных live-попыток (воркер: remux блокирует)"""
+        todo = [la for la in list(self.live_attempts)
+                if not la['saved'] and la['num'] in getattr(self, 'live_vars', {})
+                and self.live_vars[la['num']].get()]
+        if not todo:
+            self.log("Нет отмеченных несохранённых live-попыток")
+            return
+        self.log(f"Сохраняю {len(todo)} live-попыток: "
+                 + ", ".join(_live_num_str(a['num']) for a in todo))
+
+        def worker():
+            ok = 0
+            for la in todo:
+                if self.save_live_attempt(la):
+                    ok += 1
+            self.log(f"Сохранено {ok} из {len(todo)} live-попыток")
+            self.need_update_attempts = True
+            self.root.after(0, self.update_attempt_thumbnails)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_live_check_toggle(self, num):
+        """Синхронизация queued-флага с чекбоксом (клик по галочке в панели)."""
+        var = self.live_vars.get(num)
+        for la in self.live_attempts:
+            if la['num'] == num and not la['saved']:
+                la['queued'] = bool(var and var.get())
+                break
+        self.need_update_attempts = True
+
+    def _flush_live_saves_if_needed(self):
+        """Пакетное сохранение отмеченных live-попыток (вызывается при
+        закрытии плеера); если нечего сохранять - молча выходим."""
+        todo = [la for la in list(self.live_attempts)
+                if not la['saved'] and la['num'] in getattr(self, 'live_vars', {})
+                and self.live_vars[la['num']].get()]
+        if todo:
+            self.save_selected_live()
+
+    def clear_live_attempts(self):
+        """Полная очистка live-списка: плитки, превью live_*.jpg, плеер"""
+        with self._live_lock:
+            n = len(self.live_attempts)
+            thumbs = [a['thumb'] for a in self.live_attempts]
+        if not n:
+            return
+        if not messagebox.askyesno(
+                "Очистить live-попытки",
+                f"Удалить список из {n} попыток?\n"
+                f"Сохранённые на диск клипы останутся,\n"
+                f"несохранённые - будут потеряны."):
+            return
+        with self._live_lock:
+            self.live_attempts = []
+        for t in thumbs:
+            try:
+                if t and os.path.exists(t):
+                    os.remove(t)
+            except OSError as e:
+                self.log(f"Не удалось удалить превью {t}: {e}", logging.WARNING)
+        pop = getattr(self, '_preview_popup', None)
+        if pop is not None and getattr(pop, '_live', False) and pop.top.winfo_exists():
+            pop.close()
+        self._live_player_opened = False
+        self.need_update_attempts = True
+        self.log(f"Live-список очищен ({n} попыток)")
+
+    def _open_live_by_num(self, num):
+        """Двойной клик по live-плитке: открыть плеер на этой попытке"""
+        with self._live_lock:
+            idx = next((i for i, la in enumerate(self.live_attempts)
+                        if la['num'] == num), None)
+        if idx is not None:
+            self.open_live_attempt(idx)
 
     def on_attempt_checkbox_change(self, attempt, var):
         """Обработчик изменения состояния чекбокса попытки"""
@@ -2866,11 +3331,15 @@ class FreestyleParserApp:
             return
         factor = self._preview_slowmo_factor()
         start_real = max(0.0, float(cand.get('start', 0)) - 1.0)
+        # пауза в конце попытки (+запас на выбег), как в live-просмотре
+        interval = (start_real,
+                    float(cand.get('end', 0))
+                    + float(self.processing_params.get('attempt_end_padding', 0.5)))
         stem = os.path.splitext(os.path.basename(cand['file']))[0]
         VideoPreviewPopup(self, src,
                           start_real * factor if factor > 1 else start_real,
                           f"{stem} {cand['start']:.0f}–{cand['end']:.0f}s",
-                          factor=factor)
+                          factor=factor, interval=interval)
 
     def show_candidate_preview(self, cand):
         """Превью кандидата в сохранённом (полном) размере - попапом.
@@ -3079,8 +3548,9 @@ class FreestyleParserApp:
             initialdir=initial_dir)
         if not files:
             return
-        self.selected_files = list(files)
-        self._render_file_list()
+        # порядок диалога непредсказуем (порядок кликов) - сортируем натурально,
+        # иначе скан может начаться не с первого файла
+        self._set_selected_files(files)
         self.save_processing_config()
         self.update_folder_status()
 
@@ -3123,84 +3593,89 @@ class FreestyleParserApp:
         for key, var in self.param_vars.items():
             var.set(str(self.processing_params[key]))
 
-    def generate_thumbnail(self, video_path, output_path, roi=None):
-        """Создает превью для видео с учетом ROI"""
+    def extract_frame(self, video_path, output_path, seek_s=3.0,
+                      scale_w=None, scale_h=None, keyframe_only=True):
+        """Единая точка извлечения кадра видео в JPEG (ffmpeg).
+
+        - seek_s перед '-i': ffmpeg встаёт на ближайший кей-фрейм, поэтому
+          кадр берётся "прямо из кей-фрейма" без полного декодирования.
+        - Полный кадр по умолчанию (масштабирование делает UI); scale_w -
+          исключение для canvas ROI-редактора; scale_h - жёсткий размер
+          canvas_width:CANVAS_HEIGHT (проценты ROI завязаны на него).
+        - keyframe_only: '-skip_frame nokey' - декодируются только кей-фреймы,
+          самый быстрый путь; при сбое вызывающий код может повторить без него.
+        """
+        cmd = [get_ffmpeg_path(), '-ss', str(max(0.0, float(seek_s))),
+               '-i', self.get_absolute_path(video_path),
+               '-vframes', '1', '-q:v', '2']
+        if keyframe_only:
+            cmd += ['-skip_frame', 'nokey']
+        if scale_w and scale_h:
+            cmd += ['-vf', f'scale={int(scale_w)}:{int(scale_h)}']
+        elif scale_w:
+            cmd += ['-vf', f'scale={int(scale_w)}:-1']
+        cmd += ['-y', output_path]
         try:
-            if roi:
-                # Сначала получаем полный кадр из видео
-                temp_path = output_path + ".temp.jpg"
-                cmd = [
-                    get_ffmpeg_path(), '-ss', '3.0',  # Берем кадр на 3 секунде
-                    '-i', self.get_absolute_path(video_path),
-                    '-vframes', '1',
-                    '-q:v', '2',  # Максимальное качество JPEG
-                    '-y', temp_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
-
-                # Получаем размеры оригинального кадра
-                img = Image.open(temp_path)
-                orig_width, orig_height = img.size
-
-                # Проверяем формат ROI
-                if len(roi) == 4:  # Прямоугольник (две точки: x1,y1,x2,y2)
-                    x1, y1, x2, y2 = roi
-                    crop_x = int(x1 * orig_width / 100)
-                    crop_y = int(y1 * orig_height / 100)
-                    crop_w = int((x2 - x1) * orig_width / 100)
-                    crop_h = int((y2 - y1) * orig_height / 100)
-                    if crop_h == 0 or crop_w == 0:
-                        self.log(f"Ошибка вырезания скриншота roi={roi}; wxh ={orig_width}x{orig_height}")
-                    # Вырезаем ROI из оригинального кадра
-                    cmd = [
-                        get_ffmpeg_path(),
-                        '-i', temp_path,
-                        '-vf', f'crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={THUMB_X}:-1',  # Сначала crop, потом scale
-                        '-q:v', '2',
-                        '-y', output_path
-                    ]
-                    subprocess.run(cmd, check=True, capture_output=True)
-                    
-                elif len(roi) > 4:  # Многоугольник (новый формат)
-                    # Для многоугольника используем Python для обработки
-                    import cv2
-                    import numpy as np
-                    
-                    # Загружаем изображение
-                    frame = cv2.imread(temp_path)
-                    
-                    # Для превью показываем полный кадр без маски
-                    # Маска применяется только при обработке для детекции
-                    # Здесь мы просто используем полный кадр для красивого превью
-
-                    # Полный кадр - единообразно с превью при обработке
-                    cv2.imwrite(output_path, frame)
-
-                # Удаляем временный файл
-                if os.path.exists(temp_path):
-                    try:
-                        # Даем небольшую задержку для освобождения файла
-                        time.sleep(0.1)
-                        os.remove(temp_path)
-                    except PermissionError:
-                        self.log(f"Не удалось удалить временный файл {temp_path} - файл занят")
-                    except Exception as e:
-                        self.log(f"Ошибка при удалении временного файла: {e}")
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        except subprocess.CalledProcessError:
+            if float(seek_s) > 0:
+                # seek за пределы видео / нет кей-фреймов - берём первый кадр
+                fallback = [c for c in cmd]
+                fi = fallback.index('-ss')
+                fallback[fi + 1] = '0'
+                if '-skip_frame' in fallback:
+                    ki = fallback.index('-skip_frame')
+                    del fallback[ki:ki + 2]
+                subprocess.run(fallback, check=True, capture_output=True,
+                               timeout=120)
             else:
-                cmd = [
-                    get_ffmpeg_path(), '-ss', '2.5',
-                    '-i', self.get_absolute_path(video_path),
-                    '-vframes', '1',
-                    '-vf', f'scale={THUMB_X}:-1',
-                    '-q:v', '2',
-                    '-y', output_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
+                raise
+
+    def generate_thumbnail(self, video_path, output_path, roi=None):
+        """Превью попытки: полный кадр (без уменьшения, UI сам масштабирует
+        при показе) из ближайшего кей-фрейма. Для прямоугольного ROI кадр
+        обрезается по ROI в полном разрешении."""
+        temp_path = None
+        try:
+            if self._is_flat_rectangle(roi):  # Прямоугольник (x1, y1, x2, y2 в %)
+                temp_path = output_path + ".temp.jpg"
+                self.extract_frame(video_path, temp_path, seek_s=3.0)
+                import cv2
+                frame = cv2.imread(temp_path)
+                if frame is None:
+                    raise RuntimeError(f"ffmpeg не дал кадр для {video_path}")
+                H, W = frame.shape[:2]
+                x1, y1, x2, y2 = roi
+                crop_x = int(x1 * W / 100)
+                crop_y = int(y1 * H / 100)
+                crop_w = int((x2 - x1) * W / 100)
+                crop_h = int((y2 - y1) * H / 100)
+                if crop_w <= 0 or crop_h <= 0:
+                    self.log(f"Ошибка вырезания скриншота roi={roi}; "
+                             f"wxh={W}x{H} - сохраняю полный кадр")
+                else:
+                    frame = frame[crop_y:crop_y + crop_h,
+                                  crop_x:crop_x + crop_w]
+                if cv2.imwrite(output_path, frame) is False:
+                    raise RuntimeError(f"cv2.imwrite не записал {output_path}")
+            else:
+                # Многоугольник / без ROI: полный кадр без маски (маска
+                # применяется только при обработке для детекции)
+                self.extract_frame(video_path, output_path, seek_s=3.0)
 
             return True
         except subprocess.CalledProcessError as e:
             self.log(f"Ошибка создания скриншота: {e}")
             return False
+        except Exception as e:
+            self.log(f"Ошибка создания скриншота {video_path}: {e}")
+            return False
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    self.log(f"Не удалось удалить временный файл {temp_path}: {e}")
 
     def smart_thumbnail(self, video_path, output_path):
         """Превью попытки: кадр, где каякер ближе к центру кадра и крупнее.
@@ -3286,11 +3761,14 @@ class FreestyleParserApp:
         if self.processing:
             messagebox.showinfo("Информация", "Идёт обработка - дождитесь завершения.")
             return
-        if not any(files for files in self.athlete_mapping.values()):
+        if not any(files for files in self.athlete_mapping.values()) \
+                and not self._base_banks():
             messagebox.showinfo(
                 "Информация",
-                "Сначала привяжите несколько попыток к атлетам (кнопка ✓ или селектор):\n"
-                "банки строятся из подтверждённых привязок.")
+                "Нет банков для детекции. Либо привяжите несколько попыток "
+                "к атлетам (кнопка ✓ или селектор - банк построится из "
+                "подтверждённых привязок), либо подгрузите базовый банк "
+                "(~/.FreestyleParser/banks/).")
             return
         self.processing = True
         self.button_process.config(state=tk.DISABLED)
@@ -3911,14 +4389,22 @@ class FreestyleParserApp:
                                     self.roi = tuple(roi_data['rectangle']) # Преобразуем обратно в tuple
                                     self.roi_mode = "rectangle"
                                 elif 'polygon' in roi_data:
-                                    # Убеждаемся, что каждая точка является list
-                                    polygon_points = []
-                                    for point in roi_data['polygon']:
-                                        if isinstance(point, tuple):
-                                            polygon_points.append(list(point))
-                                        else:
-                                            polygon_points.append(point)
-                                    self.roi = polygon_points # Многоугольник в формате list
+                                    raw_points = roi_data['polygon']
+                                    if all(isinstance(p, (list, tuple)) and len(p) == 2 for p in raw_points):
+                                        # Убеждаемся, что каждая точка является list, а не tuple
+                                        self.roi = [list(p) for p in raw_points]
+                                    elif len(raw_points) % 2 == 0 \
+                                            and all(isinstance(v, (int, float)) for v in raw_points):
+                                        # Восстановление "плоского" полигона [x1,y1,x2,y2,...]:
+                                        # такой файл нельзя прочитать (падение на старте),
+                                        # склеиваем скаляры обратно в пары точек
+                                        self.roi = [[raw_points[i], raw_points[i + 1]]
+                                                    for i in range(0, len(raw_points), 2)]
+                                        self.log("ROI в processing.yaml был сохранён в плоском формате - восстановлен")
+                                    else:
+                                        self.log("Некорректный ROI в processing.yaml - проигнорирован",
+                                                 logging.WARNING)
+                                        self.roi = None
                                     self.roi_mode = "polygon"
                             # Поддержка старого формата для обратной совместимости
                             elif isinstance(roi_data, list):
@@ -3929,8 +4415,9 @@ class FreestyleParserApp:
                                     self.roi = roi_data
                                     self.roi_mode = "polygon"
                     
-                    # Загружаем режим ROI
-                    if 'roi_mode' in config['processing-config']:
+                    # Загружаем режим ROI только если roi не задан выше -
+                    # иначе может возникнуть рассинхрон (плоский roi + polygon)
+                    if 'roi_mode' in config['processing-config'] and self.roi is None:
                         self.roi_mode = config['processing-config']['roi_mode']
 
                     # Загружаем параметры обработки
@@ -3957,9 +4444,9 @@ class FreestyleParserApp:
                                 self.athletes_var.set(strategy in ('attempts', 'athletes'))
 
                     # Восстанавливаем выбранные файлы этого дня
+                    # (с сортировкой - в yaml мог остаться непредсказуемый порядок)
                     files = config['processing-config'].get('selected_files') or []
-                    self.selected_files = [f for f in files if isinstance(f, str)]
-                    self._render_file_list()
+                    self._set_selected_files(files)
 
     def save_processing_config(self):
         """Сохраняет конфигурацию обработки в файл"""
@@ -4071,25 +4558,16 @@ class FreestyleParserApp:
             # Берем кадр из середины видео
             seek_time = duration / 2
 
-            # Создаем canvas.jpg
-
-            cmd = [
-                get_ffmpeg_path(),
-                '-ss', str(seek_time),
-                '-i', video_path,
-                '-vframes', '1',
-                        '-vf', f'scale={self.canvas_width}:{CANVAS_HEIGHT}',
-                '-y',
-                canvas_path
-            ]
-
-            # Отображаем canvas.jpg
+            # Создаем canvas.jpg (кадр из середины видео, уменьшенный
+            # до ширины ROI-редактора - через общий экстрактор кадров)
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                # subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                # Показываем кадр на канвасе и сохранённый ROI
+                self.extract_frame(video_path, canvas_path,
+                                   seek_s=seek_time,
+                                   scale_w=self.canvas_width,
+                                   scale_h=CANVAS_HEIGHT,
+                                   keyframe_only=False)
+                # Показываем кадр на канве и сохранённый ROI
                 self.show_canvas_with_roi(canvas_path)
-                # return canvas_path
             except subprocess.CalledProcessError as e:
                 print(f"Ошибка создания canvas.jpg (1): {e}")
                 return None
@@ -4262,10 +4740,17 @@ class VideoPreviewPopup:
     MAX_WIDTH = 960
 
     def __init__(self, app, video_path, start_file_sec, title, factor=1,
-                 attempt=None):
+                 attempt=None, live=False, live_index=0, interval=None):
         self.app = app
         self._path = video_path
         self.attempt = attempt
+        # Режим live (просмотр без сохранения): навигация по self.app.live_attempts,
+        # кнопки сохранения (или клавиши A/S), границы попытки = интервал просмотра.
+        # interval=(t0,t1) реальных секунд - для одиночного просмотра (кандидат)
+        self._live = live
+        self._live_idx = live_index
+        self._interval = interval   # (t0, t1) реальных секунд границы просмотра
+        self._inside = True     # находимся ли внутри интервала (для границы)
         # ключ атрибуции: клип-строка или номер AttemptInfo (NNNN.mp4)
         self.athlete_key = attempt if isinstance(attempt, str) \
             else (f"{attempt.number:04d}.mp4" if attempt is not None else None)
@@ -4323,7 +4808,25 @@ class VideoPreviewPopup:
             if self.athlete_key else None
         cb = tk.Checkbutton(ctrl, text="Продолжать просмотр",
                             variable=self.auto_next_var)
-        if self._next_key:
+        if self._live:
+            # в live-режиме переход - по списку найденных попыток, всегда доступен
+            cb.pack(side=tk.LEFT, padx=4)
+            # --- кнопки сохранения + индикация текущей/предыдущей ---
+            self._save_busy = False
+            self.save_prev_btn = tk.Label(ctrl, text='💾 Пред. —', font=('Arial', 9),
+                                          cursor='hand2', padx=6, pady=2,
+                                          bg='#c8e6c9')
+            self.save_prev_btn.bind('<Button-1>', lambda e: self._save_live('prev'))
+            self.save_prev_btn.pack(side=tk.LEFT, padx=(14, 4))
+            self.save_cur_btn = tk.Label(ctrl, text='💾 Текущая —', font=('Arial', 9),
+                                         cursor='hand2', padx=6, pady=2,
+                                         bg='#c8e6c9')
+            self.save_cur_btn.bind('<Button-1>', lambda e: self._save_live('cur'))
+            self.save_cur_btn.pack(side=tk.LEFT, padx=4)
+            self._live_status_var = tk.StringVar()
+            tk.Label(ctrl, textvariable=self._live_status_var,
+                     fg='#1565c0', font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=8)
+        elif self._next_key:
             cb.pack(side=tk.LEFT, padx=4)
         else:
             cb.pack(side=tk.LEFT, padx=4)
@@ -4353,6 +4856,9 @@ class VideoPreviewPopup:
         self.top.bind('<Shift-Down>', lambda e: self.change_speed(0.5))
         self.top.bind('<Shift-Right>', lambda e: self._goto(1))
         self.top.bind('<Shift-Left>', lambda e: self._goto(-1))
+        if self._live:
+            # сохранение с клавиатуры: S (ы) - текущая, A (ф) - предыдущая
+            self.top.bind('<Key>', self._hotkey_save)
         self.label.bind('<ButtonPress-1>', self._on_video_press)
         self.label.bind('<B1-Motion>', self._on_video_motion)
         self.label.bind('<ButtonRelease-1>', self._on_video_release)
@@ -4368,6 +4874,10 @@ class VideoPreviewPopup:
         if old is not None and old is not self and old.top.winfo_exists():
             old.close()
         app._preview_popup = self
+        if self._live:
+            # live-режим: позиционируемся на выбранную попытку (интервал,
+            # заголовок, кнопки) вместо клиппового seek от start_file_sec
+            self._load_live_entry(self._live_idx)
         # позиция: по центру горизонтали у верхнего края; между попытками
         # сохраняем геометрию окна (для 'Продолжать' и Shift+стрелок)
         self.top.update_idletasks()
@@ -4398,10 +4908,48 @@ class VideoPreviewPopup:
             self._on_end()
             return
         self._show(frame)
+        # live-режим: граница попытки - пауза или переход к следующей.
+        # За пределами интервала (перематывали стрелками) играем свободно,
+        # повторный вход не ловим, чтобы не зациклиться на границе
+        if self._interval is not None and self._inside \
+                and self._real_time() >= self._interval[1]:
+            self._inside = False
+            self._on_boundary()
+            return
         self._after_id = self.top.after(max(1, int(self.frame_delay)), self._tick)
 
+    def _on_boundary(self):
+        """Достигли конца интервала просмотра (если интервал задан):
+        Повтор - с начала интервала; в live-режиме 'Продолжать' -
+        следующая попытка; иначе пауза."""
+        if self.loop_var.get():
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, self._interval[0] * self.factor * 1000)
+            self._inside = True
+            self._tick()
+            return
+        if self._live and self.auto_next_var.get() \
+                and self._live_idx + 1 < len(self.app.live_attempts):
+            self._goto(1)
+            return
+        self.playing = False
+        self._update_status()
+
     def _goto(self, delta):
-        """Shift+стрелки: следующая/предыдущая попытка в том же окне"""
+        """Shift+стрелки: следующая/предыдущая попытка в том же окне.
+        live-режим - по списку найденных попыток, иначе по сохранённым клипам."""
+        if self._live:
+            idx = self._live_idx + delta
+            if not (0 <= idx < len(self.app.live_attempts)):
+                return
+            self._load_live_entry(idx)
+            if self.top.winfo_exists():
+                if self.playing:
+                    self._tick()
+                else:
+                    ok, frame = self.cap.read()
+                    if ok:
+                        self._show(frame)
+            return
         keys = sorted(self.app.attempt_checkboxes.keys())
         if self.athlete_key not in keys:
             return
@@ -4448,11 +4996,22 @@ class VideoPreviewPopup:
             self.toggle_play()
 
     def _on_end(self):
-        """Конец клипа: Повтор - с начала; Продолжать - следующая попытка
-        в том же окне (без пересоздания плеера)."""
+        """Конец клипа/файла: Повтор - с начала; Продолжать - следующая попытка
+        в том же окне (без пересоздания плеера). В live-режиме - по списку
+        найденных попыток."""
         if self.loop_var.get():
-            self.cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+            start = self._interval[0] if self._interval is not None else 0.0
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, start * self.factor * 1000)
+            self._inside = True
             self._tick()
+            return
+        if self._live:
+            if self.auto_next_var.get() \
+                    and self._live_idx + 1 < len(self.app.live_attempts):
+                self._goto(1)
+                return
+            self.playing = False
+            self._update_status()
             return
         if self.auto_next_var.get() and self._next_key:
             nxt = self._next_key
@@ -4601,9 +5160,96 @@ class VideoPreviewPopup:
         cur = self.cap.get(cv2.CAP_PROP_POS_MSEC)
         self.cap.set(cv2.CAP_PROP_POS_MSEC,
                      max(0.0, cur + delta_real_sec * self.factor * 1000))
+        # если перемотали внутрь интервала попытки - снова ловим её границу
+        if self._interval is not None:
+            self._inside = self._real_time() < self._interval[1]
         ok, frame = self.cap.read()
         if ok:
             self._show(frame)
+
+    # --- live-режим: загрузка попытки, сохранение, индикация ---
+
+    def _load_live_entry(self, idx):
+        """Загрузка live-попытки: интервал просмотра (с запасами),
+        seek на его начало, заголовок, кнопки сохранения."""
+        if not (0 <= idx < len(self.app.live_attempts)):
+            return
+        la = self.app.live_attempts[idx]
+        self._live_idx = idx
+        sp = float(self.app.processing_params.get('attempt_start_padding', 2))
+        ep = float(self.app.processing_params.get('attempt_end_padding', 0.5))
+        t0 = max(0.0, la['start'] - sp)
+        t1 = la['end'] + ep
+        self._interval = (t0, t1)
+        src = la['file']
+        if not os.path.exists(src):
+            self.app.log(f"Исходник не найден: {src}", logging.ERROR)
+            self.playing = False
+            self._update_status()
+            return
+        self._load_video(src, t0 * self.factor,
+                         f"Попытка {_live_num_str(la['num'])} · клип "
+                         f"{la['start']:.0f}–{la['end']:.0f}с — просмотр без сохранения")
+        self._inside = True
+        self._refresh_live_ui()
+
+    def _refresh_live_ui(self):
+        """Кнопки сохранения + метка 'Текущая: NNNN · Пред.: NNNN'"""
+        if not getattr(self, 'save_cur_btn', None) or not self.top.winfo_exists():
+            return
+        live = self.app.live_attempts
+        idx = self._live_idx
+        cur = live[idx] if 0 <= idx < len(live) else None
+        prev = live[idx - 1] if 1 <= idx <= len(live) else None
+
+        def _set(btn, la, word):
+            if la is None:
+                btn.config(text=f"💾 {word} —", bg='#eeeeee', fg='#999999')
+            elif la.get('saved'):
+                btn.config(text=f"✓ {_live_num_str(la['num'])} сохранена",
+                           bg='#eeeeee', fg='#2e7d32')
+            elif la.get('queued'):
+                btn.config(text=f"⏳ {_live_num_str(la['num'])} запланирована",
+                           bg='#ffe082', fg='black')
+            else:
+                btn.config(text=f"💾 {word} {_live_num_str(la['num'])}",
+                           bg='#c8e6c9', fg='black')
+        _set(self.save_prev_btn, prev, "Пред.")
+        _set(self.save_cur_btn, cur, "Текущая")
+        cur_s = _live_num_str(cur['num']) if cur else '—'
+        prev_s = _live_num_str(prev['num']) if prev else '—'
+        self._live_status_var.set(f"Текущая: {cur_s} · Пред.: {prev_s}")
+
+    def _save_live(self, which):
+        """Клик/хоткей сохранения: 'cur' - текущая попытка, 'prev' - предыдущая.
+        Remux из UI-потока зависал плеер, поэтому здесь только помечаем попытку
+        (чекбокс в панели включается); запись на диск - пакетом после закрытия
+        плеера (_flush_live_saves_if_needed) или кнопкой «Сохранить выбранные»."""
+        live = self.app.live_attempts
+        idx = self._live_idx if which == 'cur' else self._live_idx - 1
+        if not (0 <= idx < len(live)):
+            return
+        la = live[idx]
+        if la.get('saved'):
+            return
+        la['queued'] = True
+        lv = self.app.live_vars
+        if la['num'] in lv:
+            lv[la['num']].set(True)
+        else:
+            lv[la['num']] = tk.BooleanVar(value=True)
+        self.app.need_update_attempts = True
+        self._refresh_live_ui()
+        self.app.log(f"Попытка {_live_num_str(la['num'])} отмечена к сохранению - "
+                     f"запишется на диск после закрытия плеера")
+
+    def _hotkey_save(self, event):
+        """S/Ы - сохранить текущую, A/Ф - предыдущую (учёт RU-раскладки)"""
+        ch = (event.char or '').lower()
+        if ch in ('s', 'ы'):
+            self._save_live('cur')
+        elif ch in ('a', 'ф'):
+            self._save_live('prev')
 
     def open_external(self):
         t_real = self._real_time()
@@ -4630,6 +5276,13 @@ class VideoPreviewPopup:
             pass
         if self.top.winfo_exists():
             self.top.destroy()
+        # live-режим: сохраняем пакетом всё отмеченное в плеере (S/A ставят
+        # только чекбокс - remux в UI-потоке зависал)
+        if getattr(self, '_live', False):
+            try:
+                self.app.root.after(0, self.app._flush_live_saves_if_needed)
+            except RuntimeError:
+                pass
 
 
 class GuiLogHandler(logging.Handler):

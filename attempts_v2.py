@@ -220,6 +220,28 @@ def _probe_keyframe_grid(path, fps_container, total_frames, probe_seconds=8.0):
         return None
 
 
+_MODEL = None      # кеш YOLO-seg: загрузка модели на каждый файл занимает секунды
+_EMBEDDER = None   # кеш Embedder (torchreid OSNet x2)
+_EMBEDDER_DEVICE = None
+
+
+def _get_model():
+    """YOLO-seg с ленивым кешем (модель stateless, безопасно переиспользовать)."""
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = YOLO('models/yolo11s-seg.pt')
+    return _MODEL
+
+
+def _get_embedder(device):
+    """Embedder с кешем по устройству."""
+    global _EMBEDDER, _EMBEDDER_DEVICE
+    if _EMBEDDER is None or _EMBEDDER_DEVICE != device:
+        _EMBEDDER = Embedder(device)
+        _EMBEDDER_DEVICE = device
+    return _EMBEDDER
+
+
 def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
                   trace=False, progress_cb=None, should_continue=None,
                   stats_out=None, slowmo_factor=1, attempt_found_cb=None,
@@ -247,8 +269,8 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
         roi = ROI_PERCENTAGES
 
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    model = YOLO('models/yolo11s-seg.pt')
-    embedder = None if no_embed else Embedder(device)
+    model = _get_model()
+    embedder = None if no_embed else _get_embedder(device)
     if min_pause is None:
         min_pause = MIN_PAUSE_DURATION
     min_dur = MIN_ATTEMPT_DURATION if min_attempt_duration is None \
@@ -711,9 +733,9 @@ def profile_from_clip(clip_path, model=None, embedder=None, scale=0.4,
     Для кросс-папочной детекции без пересканирования исходников.
     Возвращает {'vest': 1664d, 'boat': 18d} или None, если атлета нет."""
     if model is None:
-        model = YOLO('models/yolo11s-seg.pt')
+        model = _get_model()
     if embedder is None:
-        embedder = Embedder(default_device())
+        embedder = _get_embedder(default_device())
     cap = cv2.VideoCapture(clip_path)
     if not cap.isOpened():
         return None

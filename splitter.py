@@ -68,10 +68,17 @@ def _iou(box1, box2):
     return inter / (a1 + a2 - inter)
 
 
+_YOLO_MODEL = None
+
+
 def load_yolo_model():
-    """Загружает модель YOLO (вынесено наружу, чтобы переиспользовать между вызовами)"""
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
-    return YOLO(model_path)
+    """Загружает модель YOLO с кешем: загрузка занимает секунды,
+    переиспользуем между файлами/потоками (модель stateless)."""
+    global _YOLO_MODEL
+    if _YOLO_MODEL is None:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
+        _YOLO_MODEL = YOLO(model_path)
+    return _YOLO_MODEL
 
 
 def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
@@ -246,7 +253,9 @@ class _Detector:
         # Установка области интереса
         if self.roi:
             frame_height, frame_width = frame.shape[:2]
-            if len(self.roi) == 4:  # Прямоугольник
+            # Прямоугольник - 4 скаляра; полигон из 4 точек тоже даёт len==4,
+            # поэтому различаем по типу элементов
+            if len(self.roi) == 4 and all(isinstance(v, (int, float)) for v in self.roi):
                 left, top, right, bottom = self.roi
                 x1_px = int(frame_width * left / 100)
                 y1_px = int(frame_height * top / 100)
@@ -254,7 +263,8 @@ class _Detector:
                 y2_px = int(frame_height * bottom / 100)
                 frame = frame[y1_px:y2_px, x1_px:x2_px]
                 original_frame = original_frame[y1_px:y2_px, x1_px:x2_px]
-            elif len(self.roi) > 4:  # Многоугольник
+            elif all(isinstance(p, (list, tuple)) and len(p) == 2 for p in self.roi):
+                # Многоугольник
                 polygon_points = [(int(frame_width * x / 100), int(frame_height * y / 100)) for x, y in self.roi]
                 mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
                 polygon_array = np.array(polygon_points, dtype=np.int32)

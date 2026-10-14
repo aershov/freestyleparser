@@ -2965,6 +2965,24 @@ class FreestyleParserApp:
         if todo:
             self.save_selected_live()
 
+    def _reset_live_state(self):
+        """Тихий сброс live-состояния при смене папки дня (без подтверждений):
+        список попыток, чекбоксы, live-плеер. Кандидаты другого дня в панель
+        новой папки попадать не должны; сохранённые клипы старой папки не трогаем."""
+        with self._live_lock:
+            had = bool(self.live_attempts)
+            self.live_attempts = []
+        if not had:
+            return
+        self._live_player_opened = False
+        self._live_next_num = 1
+        self.live_vars = {}
+        pop = getattr(self, '_preview_popup', None)
+        if pop is not None and getattr(pop, '_live', False) and pop.top.winfo_exists():
+            pop._closing = True
+            pop.close()
+        self.log("Live-список очищен при смене рабочей папки")
+
     def clear_live_attempts(self):
         """Полная очистка live-списка: плитки, превью live_*.jpg, плеер"""
         with self._live_lock:
@@ -4694,6 +4712,7 @@ class FreestyleParserApp:
 
 
     def on_output_folder_changed(self):
+        self._reset_live_state()
         self.processing_config_file = os.path.join(self.output_folder, "processing.yaml")
         self.candidates_file = os.path.join(self.output_folder, "candidates.yaml")
         # Создаем выходную папку, если её нет

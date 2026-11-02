@@ -5131,7 +5131,11 @@ class VideoPreviewPopup:
                               else f"{size / 1024 ** 2:.0f} МБ")
         except OSError:
             self._size_str = ""
-        self.cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_file_sec) * 1000)
+        start_ms = max(0.0, start_file_sec) * 1000
+        if fps and n_frames:
+            # seek за концом файла даёт пустой экран - клэмпим в границы
+            start_ms = min(start_ms, max(0.0, n_frames / fps * 1000 - 500))
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, start_ms)
         self._carry = 0.0
         if title:
             self.top.title(title)

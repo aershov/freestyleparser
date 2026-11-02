@@ -125,9 +125,16 @@ def detect_slowmo_factor(video_path):
     коэффициент замедления (1 - обычное видео). Для файлов, где слоумо
     зашито только в таймстампах контейнера (Panasonic GH4 VFR), метаданные
     неотличимы от обычного 24 к/с - тогда вернётся 1 и нужен ручной чекбокс.
+
+    Interlaced-источники (1080/50i: 50 полей = 25 кадров) дают такой же
+    профиль r/avg = 2, но это НЕ слоумо - для них всегда вернём 1
+    (настоящее VFR-слоумо пишется в progressive).
     """
-    info = _ffprobe_stream_info(video_path, 'r_frame_rate,avg_frame_rate')
+    entries = 'r_frame_rate,avg_frame_rate,field_order'
+    info = _ffprobe_stream_info(video_path, entries)
     if not info:
+        return 1
+    if str(info.get('field_order') or '').lower() in ('tt', 'bb', 'tb', 'bt'):
         return 1
     r_rate = _parse_rate(info.get('r_frame_rate'))
     avg_rate = _parse_rate(info.get('avg_frame_rate'))

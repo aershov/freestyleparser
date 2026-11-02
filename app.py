@@ -19,7 +19,7 @@ from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model, 
 import sys
 import traceback
 
-APP_VERSION = "1.0.0.1"
+APP_VERSION = "1.3.1"
 
 THUMB_X = 180  # (не используется: превью хранятся полным кадром, UI масштабирует)
 THUMB_Y = 120
@@ -1901,14 +1901,14 @@ class FreestyleParserApp:
         mapping_file = os.path.join(self.output_folder, "mapping.yaml")
         if os.path.exists(mapping_file):
             try:
-                with open(mapping_file, 'r') as f:
+                with open(mapping_file, 'r', encoding='utf-8') as f:
                     mapping = yaml.safe_load(f)
                     if mapping is None:  # Если файл пустой или содержит только комментарии
                         self.athlete_mapping = {}
                     else:
                         # Преобразуем относительные пути в абсолютные
                         self.athlete_mapping = {
-                            name: list(set(attempts))  # Convert back to a list if needed
+                            self._repair_mojibake(name): list(set(attempts))  # Convert back to a list if needed
                             for name, attempts in mapping.items()
                         }
             except Exception as e:
@@ -1917,6 +1917,21 @@ class FreestyleParserApp:
         else:
             self.athlete_mapping = {}
         self._prune_athlete_mapping()
+
+    @staticmethod
+    def _repair_mojibake(name):
+        """Чинит имена, испорченные чтением UTF-8 как cp1251 (Windows-сборки
+        до v1.3.1 писали mapping.yaml в utf-8, а читали без encoding - кириллица
+        превращалась в 'Ã�Â¿Ã�Â¾Ã�...'). Если обратное преобразование однозначно
+        удается - возвращаем чиненое имя, иначе как есть."""
+        if not isinstance(name, str) or all(ord(c) < 128 for c in name):
+            return name
+        for enc in ('cp1251', 'cp1252'):
+            try:
+                return name.encode(enc).decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+        return name
 
     def _prune_athlete_mapping(self):
         """Убирает из маппинга привязки к несуществующим файлам.

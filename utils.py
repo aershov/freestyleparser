@@ -8,11 +8,23 @@ import shutil
 import tempfile
 import cv2
 import numpy as np
-from scipy.spatial import KDTree
-from sklearn.cluster import KMeans
 from collections import defaultdict
-import matplotlib.colors as mcolors
 import re
+
+# Дефолты выверены на съёмке 2026-11-01 (Открытие сезона): ловят короткие
+# трюки и не дробят серию входов при рыхлой детекции. Живут здесь (без
+# тяжёлых импортов torch/ultralytics), splitter.py переэкспортирует.
+DEFAULT_PROCESSING_PARAMS = {
+    'min_attempt_duration': 2.0,   # Минимальная длительность попытки в секундах
+    'min_pause_duration': 2.0,     # Минимальная пауза между попытками в секундах
+    'attempt_start_padding': 1.5,  # Запас времени (в секундах) к началу попытки
+    'attempt_end_padding': 1.5,    # Запас времени (в секундах) от конца попытки
+    'min_detection_strength': 0.3, # Минимальная сила сигнала (0-1) для начала/продолжения попытки
+    'scan_interval': 1.0,          # Шаг сканирования (ручной режим), сек реального времени
+    'scan_threshold': 0.25,        # Порог YOLO при сканировании (ниже порога обычного анализа)
+    'reid_embed_rate': 3.0,        # OSNet-эмбеддинги внутри попытки, шт/сек реала (5 = каждый сэмпл)
+    'precise_left_margin': 3.5,    # Насколько влево от кандидата искать точное начало, сек
+}
 
 CAMERA_PATHS = [
     {
@@ -327,6 +339,7 @@ def get_dominant_colors(frame, k=5, threshold=10):
     hsv_flat = hsv.reshape((h * w, 3))
 
     # --- Кластеризация ---
+    from sklearn.cluster import KMeans  # ленивый: sklearn тянется 3-4с
     kmeans = KMeans(n_clusters=k, random_state=42)
     labels = kmeans.fit_predict(hsv_flat)
     cluster_centers = kmeans.cluster_centers_.astype(int)
@@ -592,6 +605,8 @@ def rgb_to_name(rgb):
     return color_name
 
 def closest_color_name(requested_color):
+    from scipy.spatial import KDTree        # ленивые импорты тяжёлых пакетов
+    import matplotlib.colors as mcolors
     css4_colors = mcolors.CSS4_COLORS
     names = list(css4_colors.keys())
     rgb_values = [mcolors.hex2color(css4_colors[name]) for name in names]

@@ -48,7 +48,11 @@ def build_app():
     if system == 'Windows':
         if os.path.exists('icon.ico'):
             pyinstaller_args.append('--icon=icon.ico')
-        pyinstaller_args.append('--onefile')
+        # onedir, а не onefile: onefile распаковывает весь бандл (torch+cv2,
+        # ~1.5 ГБ) в %TEMP% при КАЖДОМ запуске - старт 30-60с, плюс Defender
+        # сканирует распакованные файлы. onedir стартует мгновенно;
+        # в релиз папка идёт zip'ом
+        pyinstaller_args.append('--onedir')
     elif system == 'Linux':
         # Портативный бинарник: один файл без установки зависимостей.
         # Иконку окна Tk берёт из icon.ico во время работы (--icon для ELF нет),

@@ -15,11 +15,12 @@ from utils import *
 import time
 
 from Components import AthleteWidget
-from splitter import process_video, DEFAULT_PROCESSING_PARAMS, load_yolo_model, AttemptInfo
+# splitter тянет torch+ultralytics (~1-3с) - импортируем лениво в местах
+# использования, чтобы окно появлялось быстрее
 import sys
 import traceback
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 THUMB_X = 180  # (не используется: превью хранятся полным кадром, UI масштабирует)
 THUMB_Y = 120
@@ -730,6 +731,7 @@ class FreestyleParserApp:
         """Обрабатывает видео в отдельном потоке (авто-режим: нарезать всё)"""
         t0 = time.time()
         try:
+            from splitter import process_video
             next_attempt_number = get_next_attempt_number(self.output_folder)
             process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
                           next_attempt_number, params=self.processing_params,
@@ -760,6 +762,7 @@ class FreestyleParserApp:
         self.scan_running = True
         t0 = time.time()
         try:
+            from splitter import process_video
             existing = list(self.candidates)
             if existing:
                 self.log(f"Пересканирование: {len(existing)} существующих кандидатов сохраняются, "
@@ -838,6 +841,7 @@ class FreestyleParserApp:
         Найденные интервалы регистрируются как live-попытки."""
         t0 = time.time()
         try:
+            from splitter import process_video
             factor = self._active_slowmo_factor
 
             def on_found(attempt):
@@ -1351,6 +1355,7 @@ class FreestyleParserApp:
                 src.release()
                 if not ok:
                     best_frame = np.zeros((360, 640, 3), np.uint8)
+                from splitter import AttemptInfo
                 info = AttemptInfo(r['source'], preroll,
                                    r['end'] + end_pad, number,
                                    best_frame, None, None, None)
@@ -1710,6 +1715,7 @@ class FreestyleParserApp:
         в узком окне вокруг него и вырезка найденных попыток."""
         t0 = time.time()
         try:
+            from splitter import load_yolo_model
             slowmo = self._active_slowmo_factor
             model = load_yolo_model()
             start_pad = self.processing_params['attempt_start_padding']
@@ -1754,6 +1760,7 @@ class FreestyleParserApp:
                     return self.on_attempt_file_created(attempt)
 
                 try:
+                    from splitter import process_video
                     process_video([cand['file']], self.roi, fine_callback, next_num,
                                   params=self.processing_params,
                                   should_continue=lambda: self.processing,
@@ -1870,11 +1877,20 @@ class FreestyleParserApp:
         # Форматтер для логов
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-        # Хендлер для файла
+        # Хендлер для файла: лог текущей папки дня + стабильный app.log
+        # (при смене папки дня лог из папки первой сессии терялся бы)
         log_file = os.path.join(self.output_folder, "processing.log")
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
+        try:
+            os.makedirs(self._app_folder, exist_ok=True)
+            stable_handler = logging.FileHandler(
+                os.path.join(self._app_folder, "app.log"))
+            stable_handler.setFormatter(formatter)
+            self.logger.addHandler(stable_handler)
+        except OSError:
+            pass
 
         # Хендлер для GUI
         self.gui_handler = GuiLogHandler(self)
@@ -3754,6 +3770,7 @@ class FreestyleParserApp:
         Прогоняет YOLO по сэмплам клипа (~2/с, до 120 сэмплов)."""
         try:
             if self._thumb_model is None:
+                from splitter import load_yolo_model
                 self._thumb_model = load_yolo_model()
             model = self._thumb_model
             cap = open_capture(self.get_absolute_path(video_path))
@@ -3852,6 +3869,7 @@ class FreestyleParserApp:
         на 2-3 лучших кропах)."""
         import attempts_v2
         if self._thumb_model is None:
+            from splitter import load_yolo_model
             self._thumb_model = load_yolo_model()
         if self._embedder is None:
             self._embedder = attempts_v2.Embedder(attempts_v2.default_device())

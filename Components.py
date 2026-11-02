@@ -2,7 +2,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
 import os
-from splitter import process_video
 import yaml
 
 

@@ -38,19 +38,22 @@ jobs:
       - name: Build EXE
         run: python build.py
 
+      - name: Zip dist (onedir)
+        run: Compress-Archive -Path dist/FreestyleParser -DestinationPath dist/FreestyleParser-windows-x64.zip -Force
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FreestyleParser-windows-x64
-          path: dist/FreestyleParser.exe
+          path: dist/FreestyleParser-windows-x64.zip
           if-no-files-found: error
 
-      # exe в релиз прикрепляем только при пуше тега (v1.0.0 и т.п.)
+      # zip в релиз прикрепляем только при пуше тега (v1.0.0 и т.п.)
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/FreestyleParser.exe
+          files: dist/FreestyleParser-windows-x64.zip
 
   build-linux:
     # 22.04, а не latest (24.04): бинарь собранный на glibc 2.39 не запустится

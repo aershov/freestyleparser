@@ -129,12 +129,43 @@ def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
 def open_capture(video_file):
     """Открывает видео. На Windows бэкенд FFMPEG часто не читает файлы камер
     (например, GoPro: чтение обрывается на первых кадрах с "packet read max
-    attempts exceeded"), поэтому сначала пробуем Media Foundation."""
+    attempts exceeded"), поэтому сначала пробуем Media Foundation.
+    Если путь с не-ASCII (кириллица в имени пользователя) и открыть не
+    удалось - копируем во временную папку с ASCII-именем."""
+    cap = None
     if sys.platform == 'win32':
         cap = cv2.VideoCapture(video_file, cv2.CAP_MSMF)
         if cap.isOpened():
             return cap
-    return cv2.VideoCapture(video_file)
+        cap.release()
+    cap = cv2.VideoCapture(video_file)
+    if cap.isOpened():
+        return cap
+    if sys.platform == 'win32':
+        try:
+            video_file.encode('ascii')
+            return cap  # путь ASCII - проблема не в нём
+        except UnicodeEncodeError:
+            pass
+        try:
+            import hashlib
+            import shutil as _sh
+            import tempfile as _tf
+            tmp_dir = os.path.join(_tf.gettempdir(), 'FreestyleParserCaps')
+            os.makedirs(tmp_dir, exist_ok=True)
+            digest = hashlib.md5(video_file.encode('utf-8')).hexdigest()[:12]
+            tmp_path = os.path.join(tmp_dir, digest + os.path.splitext(video_file)[1])
+            if not os.path.exists(tmp_path) or \
+                    os.path.getsize(tmp_path) != os.path.getsize(video_file):
+                _sh.copy2(video_file, tmp_path)
+            fallback = cv2.VideoCapture(tmp_path, cv2.CAP_MSMF)
+            if fallback.isOpened():
+                return fallback
+            fallback.release()
+            return cv2.VideoCapture(tmp_path)
+        except Exception:
+            pass
+    return cap
 
 
 def _seek_sample_iter(cap, fps_real, total_frames, sample_rate, range_start, range_end):

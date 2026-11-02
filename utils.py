@@ -4,6 +4,8 @@ import os
 import sys
 import json
 import subprocess
+import shutil
+import tempfile
 import cv2
 import numpy as np
 from scipy.spatial import KDTree
@@ -125,15 +127,120 @@ def detect_slowmo_factor(video_path):
     коэффициент замедления (1 - обычное видео). Для файлов, где слоумо
     зашито только в таймстампах контейнера (Panasonic GH4 VFR), метаданные
     неотличимы от обычного 24 к/с - тогда вернётся 1 и нужен ручной чекбокс.
+
+    Interlaced-источники (1080/50i: 50 полей = 25 кадров) дают такой же
+    профиль r/avg = 2, но это НЕ слоумо - для них всегда вернём 1
+    (настоящее VFR-слоумо пишется в progressive).
     """
-    info = _ffprobe_stream_info(video_path, 'r_frame_rate,avg_frame_rate')
+    entries = 'r_frame_rate,avg_frame_rate,field_order'
+    info = _ffprobe_stream_info(video_path, entries)
     if not info:
+        return 1
+    if str(info.get('field_order') or '').lower() in ('tt', 'bb', 'tb', 'bt'):
         return 1
     r_rate = _parse_rate(info.get('r_frame_rate'))
     avg_rate = _parse_rate(info.get('avg_frame_rate'))
     if avg_rate > 1 and r_rate / avg_rate >= 1.5:
         return max(1, int(round(r_rate / avg_rate)))
     return 1
+
+
+def imwrite_unicode(path, img, params=None):
+    """cv2.imwrite, работающий с не-ASCII путями на Windows (кириллица в
+    имени пользователя ломает fopen внутри OpenCV - imwrite молча не пишет).
+    Кодируем кадр в память и пишем файлом Python, который использует
+    юникодные API. Возвращает True при успехе."""
+    try:
+        ext = os.path.splitext(path)[1] or '.jpg'
+        ok, buf = cv2.imencode(ext, img, params or [])
+        if not ok:
+            return False
+        with open(path, 'wb') as f:
+            f.write(buf.tobytes())
+        return True
+    except Exception:
+        return False
+
+
+def open_capture(video_path, backend=None):
+    """cv2.VideoCapture с обходом проблемы Windows: если путь содержит
+    не-ASCII (кириллица в имени пользователя) и открыть не удалось -
+    копируем исходник во временную папку с ASCII-именем и открываем оттуда."""
+    cap = cv2.VideoCapture(video_path, backend) if backend is not None \
+        else cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    if platform.system() != 'Windows':
+        return cap
+    try:
+        video_path.encode('ascii')
+        return cap  # путь ASCII - проблема не в нём
+    except UnicodeEncodeError:
+        pass
+    try:
+        import hashlib
+        tmp_dir = os.path.join(tempfile.gettempdir(), 'FreestyleParserCaps')
+        os.makedirs(tmp_dir, exist_ok=True)
+        digest = hashlib.md5(video_path.encode('utf-8')).hexdigest()[:12]
+        tmp_path = os.path.join(tmp_dir, digest + os.path.splitext(video_path)[1])
+        if not os.path.exists(tmp_path) or \
+                os.path.getsize(tmp_path) != os.path.getsize(video_path):
+            shutil.copy2(video_path, tmp_path)
+        return cv2.VideoCapture(tmp_path, backend) if backend is not None \
+            else cv2.VideoCapture(tmp_path)
+    except Exception:
+        return cap
+
+
+def open_capture_seekable(video_path):
+    """VideoCapture, в котором работает произвольный seek. Некоторые контейнеры
+    (AVCHD .mts) OpenCV-FFMPEG не умеет искать по кадрам/времени (read у 98%
+    длительности возвращает False) - плеер для последних попыток показывал
+    пустой экран. Пробуем дефолтный бэкенд, при неудаче пробного seek -
+    перебираем платформенные (на macOS AVFOUNDATION ищет точно)."""
+    cap = open_capture(video_path)
+    if cap.isOpened() and _seek_probe_ok(cap):
+        return cap
+    try:
+        cap.release()
+    except Exception:
+        pass
+    backends = []
+    if platform.system() == 'Darwin':
+        backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_FFMPEG]
+    elif platform.system() == 'Windows':
+        backends = [cv2.CAP_MSMF, cv2.CAP_FFMPEG, cv2.CAP_DSHOW]
+    else:
+        backends = [cv2.CAP_FFMPEG, cv2.CAP_GSTREAMER]
+    for be in backends:
+        try:
+            cap = cv2.VideoCapture(video_path, be)
+        except Exception:
+            continue
+        if cap.isOpened() and _seek_probe_ok(cap):
+            return cap
+        try:
+            cap.release()
+        except Exception:
+            pass
+    return open_capture(video_path)
+
+
+def _seek_probe_ok(cap):
+    """Пробный seek на ~90% длительности: read должен вернуть кадр."""
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if not fps or not n or n <= 10:
+            return True  # нечего проверять - короткий файл/нет данных
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * 0.9))
+        ok, _f = cap.read()
+        pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return bool(ok) and pos > (n * 0.9 / fps) * 0.5
+    except Exception:
+        return True
 
 
 def has_audio_stream(video_path):

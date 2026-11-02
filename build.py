@@ -21,14 +21,18 @@ def build_app():
         download_ffmpeg()
     
     # Базовые параметры PyInstaller
+    # Разделитель src:dest в --add-data на Windows - ';' (':' там часть диска C:)
+    data_sep = ';' if system == 'Windows' else ':'
     pyinstaller_args = [
         '--name=FreestyleParser',
         '--windowed',
         '--clean',
-        '--add-data=requirements.txt:.',
-        '--add-data=bin:bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
-        '--add-data=models/yolo11s-seg.pt:./models',  # модель YOLO внутри exe
-        '--add-data=icon.ico:.',  # иконка окна приложения
+        f'--add-data=requirements.txt{data_sep}.',
+        f'--add-data=bin{data_sep}bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
+        f'--add-data=models/yolo11s-seg.pt{data_sep}./models',  # модель YOLO внутри exe
+        f'--add-data=models/osnet_x1_0_combineall.pth{data_sep}./models',  # OSNet-веса
+        f'--add-data=models/osnet_ain_x1_0_msmt17.pth{data_sep}./models',  # для 'Определять атлетов'
+        f'--add-data=icon.ico{data_sep}.',  # иконка окна приложения
         '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--collect-all=scipy',  # у scipy ленивые импорты (array_api_compat и т.п.) - иначе ModuleNotFoundError в exe
         '--collect-all=supervision',  # ByteTrack в attempts_v2; пакет импортируется только из воркеров - PyInstaller его не видит сам

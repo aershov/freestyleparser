@@ -5422,7 +5422,32 @@ class GuiLogHandler(logging.Handler):
         self.app.log_text.see(tk.END)
         self.app.log_text.configure(state='disabled')
 
+def _acquire_single_instance_lock():
+    """Защита от второго экземпляра: медленный старт (распаковка exe,
+    загрузка моделей) провоцирует повторный клик по иконке - открывалось
+    два окна. Держим localhost-сокет на фиксированном порту; если занят -
+    приложение уже запущено."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', 54321))
+        sock.listen(1)
+        return sock
+    except OSError:
+        return None
+
+
 if __name__ == "__main__":
+    lock_sock = _acquire_single_instance_lock()
+    if lock_sock is None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Freestyle Parser",
+            "Программа уже запущена.\n"
+            "Если окна не видно - подождите пару секунд при первом запуске "
+            "или проверьте панель задач.")
+        sys.exit(0)
     try:
         root = tk.Tk()
         app = FreestyleParserApp(root)

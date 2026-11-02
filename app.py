@@ -608,6 +608,11 @@ class FreestyleParserApp:
         """Вырезка интервала из исходника в output_file (ffmpeg stream copy;
         для слоумо - сжатие таймстампов, см. on_attempt_file_created).
         Возвращает True при успехе."""
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg:
+            self.log("ffmpeg не найден: ни в PATH, ни в папке bin рядом с программой",
+                     logging.ERROR)
+            return False
         if slowmo > 1:
             # Слоумо: кадры в контейнере идут с интервалом 1/24с, а поток H.264
             # содержит 96 уникальных кадров в секунду. Сжимаем таймстампы в
@@ -618,7 +623,7 @@ class FreestyleParserApp:
             self.log(f"Слоумо 1/{slowmo}: remux {start_real:.2f}s.."
                      f"{start_real + duration_real:.2f}s (реальных), stream copy "
                      f"(itsscale={1 / slowmo}, timescale={ts})")
-            cmd = [get_ffmpeg_path(),
+            cmd = [ffmpeg,
                    "-itsscale", f"{1 / slowmo}",
                    "-i", source_video,
                    "-ss", f"{start_real:.3f}",
@@ -631,13 +636,14 @@ class FreestyleParserApp:
             if self._video_has_audio(source_video):
                 cmd += ["-map", "0:a:0?"]
         else:
-            cmd = [get_ffmpeg_path(), "-ss", str(start_real), "-i", source_video,
+            cmd = [ffmpeg, "-ss", str(start_real), "-i", source_video,
                    "-t", str(duration_real), "-c", "copy", "-y", output_file]
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=300
-            )
+            kwargs = {'capture_output': True, 'text': True, 'errors': 'replace',
+                      'timeout': 300}
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(cmd, **kwargs)
             if result.returncode != 0:
                 self.log(f"Ошибка ffmpeg для {label}: {result.stderr[-500:]}", logging.ERROR)
                 return False
@@ -665,7 +671,7 @@ class FreestyleParserApp:
 
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
-        cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
+        imwrite_unicode(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
         # cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
         # person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
         # colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
@@ -863,7 +869,7 @@ class FreestyleParserApp:
             self.live_attempts.append(la)
         frame = getattr(attempt, 'best_frame', None)
         if frame is None:
-            src = cv2.VideoCapture(attempt.source_video)
+            src = open_capture(attempt.source_video)
             src.set(cv2.CAP_PROP_POS_MSEC, float(attempt.start) * factor * 1000)
             ok, frame = src.read()
             src.release()
@@ -871,7 +877,7 @@ class FreestyleParserApp:
                 frame = np.zeros((360, 640, 3), np.uint8)
         if frame is not None:
             try:
-                cv2.imwrite(thumb_path, frame)
+                imwrite_unicode(thumb_path, frame)
             except Exception as e:
                 self.log(f"Не удалось записать превью {thumb_path}: {e}", logging.WARNING)
                 la['thumb'] = None
@@ -942,7 +948,7 @@ class FreestyleParserApp:
         start_pad = float(self.processing_params.get('attempt_start_padding', 2))
         thumb_t = r.get('thumb_t') or r['start']
         # thumb: кадр, где атлет ближе всего к центру ROI (для плитки панели)
-        src = cv2.VideoCapture(src_path)
+        src = open_capture(src_path)
         src.set(cv2.CAP_PROP_POS_MSEC, thumb_t * factor * 1000)
         ok, best_frame = src.read()
         src.release()
@@ -961,7 +967,7 @@ class FreestyleParserApp:
                 'saved': False,
             }
             self.live_attempts.append(la)
-        cv2.imwrite(la['thumb'], best_frame)
+        imwrite_unicode(la['thumb'], best_frame)
         self.need_update_attempts = True
         self.log(f"  Попытка {_live_num_str(num)}: {r['start']:.1f}-{r['end']:.1f}с "
                  f"(не сохранена, смотрим в плеере)")
@@ -1026,12 +1032,12 @@ class FreestyleParserApp:
             if la['thumb'] and os.path.exists(la['thumb']):
                 shutil.copyfile(la['thumb'], jpg_out)
             else:
-                cap = cv2.VideoCapture(src)
+                cap = open_capture(src)
                 cap.set(cv2.CAP_PROP_POS_MSEC, (la.get('thumb_t') or la['start']) * slowmo * 1000)
                 ok, frame = cap.read()
                 cap.release()
                 if ok:
-                    cv2.imwrite(jpg_out, frame)
+                    imwrite_unicode(jpg_out, frame)
         except Exception as e:
             self.log(f"Не удалось сохранить превью {num:04d}.jpg: {e}", logging.WARNING)
         la['saved'] = True
@@ -1325,7 +1331,7 @@ class FreestyleParserApp:
                 # thumbnail: кадр, где атлет ближе всего к центру ROI
                 # (attempts_v2 считает thumb_t по дистанции bbox-центра)
                 thumb_t = r.get('thumb_t') or r['start']
-                src = cv2.VideoCapture(r['source'])
+                src = open_capture(r['source'])
                 src.set(cv2.CAP_PROP_POS_MSEC, thumb_t * self._active_slowmo_factor * 1000)
                 ok, best_frame = src.read()
                 src.release()
@@ -1612,7 +1618,7 @@ class FreestyleParserApp:
             idx = len(self.candidates) + 1
             thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
             try:
-                cv2.imwrite(thumb_path, attempt.best_frame)
+                imwrite_unicode(thumb_path, attempt.best_frame)
             except Exception:
                 thumb_path = None
             self.candidates.append({
@@ -3674,7 +3680,7 @@ class FreestyleParserApp:
                 else:
                     frame = frame[crop_y:crop_y + crop_h,
                                   crop_x:crop_x + crop_w]
-                if cv2.imwrite(output_path, frame) is False:
+                if imwrite_unicode(output_path, frame) is False:
                     raise RuntimeError(f"cv2.imwrite не записал {output_path}")
             else:
                 # Многоугольник / без ROI: полный кадр без маски (маска
@@ -3702,7 +3708,7 @@ class FreestyleParserApp:
             if self._thumb_model is None:
                 self._thumb_model = load_yolo_model()
             model = self._thumb_model
-            cap = cv2.VideoCapture(self.get_absolute_path(video_path))
+            cap = open_capture(self.get_absolute_path(video_path))
             if not cap.isOpened():
                 return False
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -3737,7 +3743,7 @@ class FreestyleParserApp:
                 return self.generate_thumbnail(os.path.basename(video_path),
                                                output_path, self.roi)
             # полный кадр FHD - как при обработке (UI сам масштабирует для показа)
-            cv2.imwrite(output_path, best[1])
+            imwrite_unicode(output_path, best[1])
             return True
         except Exception as e:
             self.log(f"Ошибка умного превью {video_path}: {e}", logging.ERROR)
@@ -4781,7 +4787,7 @@ class VideoPreviewPopup:
         self.speed = 1.0
         self._carry = 0.0  # дробный остаток продвигаемых кадров
         self._after_id = None  # id отложенного тика (для отмены)
-        self.cap = cv2.VideoCapture(video_path)
+        self.cap = open_capture(video_path)
         if not self.cap.isOpened():
             messagebox.showinfo("Превью", "Не удалось открыть видео")
             return
@@ -5115,7 +5121,7 @@ class VideoPreviewPopup:
             self.cap.release()
         except Exception:
             pass
-        self.cap = cv2.VideoCapture(video_path)
+        self.cap = open_capture(video_path)
         if not self.cap.isOpened():
             self.close()
             return

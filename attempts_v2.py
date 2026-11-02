@@ -24,6 +24,7 @@ import numpy as np
 import supervision as sv
 import torch
 from ultralytics import YOLO
+from utils import imwrite_unicode, open_capture
 
 ROI_PERCENTAGES = (0, 23, 95, 90)
 YOLO_CONFIDENCE_THRESHOLD = 0.4
@@ -277,7 +278,7 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
         else float(min_attempt_duration)
     merge_gap = min_pause  # пауза >= min_pause = новая попытка; меньше = оверсплит
 
-    cap = cv2.VideoCapture(input_path)
+    cap = open_capture(input_path)
     assert cap.isOpened()
     fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
     fps = fps_container * slowmo_factor if slowmo_factor > 1 else fps_container  # реальный fps
@@ -696,7 +697,7 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
             mos = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
             cv2.putText(mos, f'attempt{i}_{a["start"]:.0f}-{a["end"]:.0f}s', (5, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-            cv2.imwrite(os.path.join(mosaics_dir, f'attempt{i:02d}.jpg'), mos)
+            imwrite_unicode(os.path.join(mosaics_dir, f'attempt{i:02d}.jpg'), mos)
 
     with open(os.path.join(output, 'attempts.json'), 'w') as f:
         json.dump([{'start': r['start'], 'end': r['end']} for r in result], f, indent=1)
@@ -736,7 +737,7 @@ def profile_from_clip(clip_path, model=None, embedder=None, scale=0.4,
         model = _get_model()
     if embedder is None:
         embedder = _get_embedder(default_device())
-    cap = cv2.VideoCapture(clip_path)
+    cap = open_capture(clip_path)
     if not cap.isOpened():
         return None
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

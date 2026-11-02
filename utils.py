@@ -4,6 +4,8 @@ import os
 import sys
 import json
 import subprocess
+import shutil
+import tempfile
 import cv2
 import numpy as np
 from scipy.spatial import KDTree
@@ -141,6 +143,54 @@ def detect_slowmo_factor(video_path):
     if avg_rate > 1 and r_rate / avg_rate >= 1.5:
         return max(1, int(round(r_rate / avg_rate)))
     return 1
+
+
+def imwrite_unicode(path, img, params=None):
+    """cv2.imwrite, работающий с не-ASCII путями на Windows (кириллица в
+    имени пользователя ломает fopen внутри OpenCV - imwrite молча не пишет).
+    Кодируем кадр в память и пишем файлом Python, который использует
+    юникодные API. Возвращает True при успехе."""
+    try:
+        ext = os.path.splitext(path)[1] or '.jpg'
+        ok, buf = cv2.imencode(ext, img, params or [])
+        if not ok:
+            return False
+        with open(path, 'wb') as f:
+            f.write(buf.tobytes())
+        return True
+    except Exception:
+        return False
+
+
+def open_capture(video_path, backend=None):
+    """cv2.VideoCapture с обходом проблемы Windows: если путь содержит
+    не-ASCII (кириллица в имени пользователя) и открыть не удалось -
+    копируем исходник во временную папку с ASCII-именем и открываем оттуда."""
+    cap = cv2.VideoCapture(video_path, backend) if backend is not None \
+        else cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    if platform.system() != 'Windows':
+        return cap
+    try:
+        video_path.encode('ascii')
+        return cap  # путь ASCII - проблема не в нём
+    except UnicodeEncodeError:
+        pass
+    try:
+        import hashlib
+        tmp_dir = os.path.join(tempfile.gettempdir(), 'FreestyleParserCaps')
+        os.makedirs(tmp_dir, exist_ok=True)
+        digest = hashlib.md5(video_path.encode('utf-8')).hexdigest()[:12]
+        tmp_path = os.path.join(tmp_dir, digest + os.path.splitext(video_path)[1])
+        if not os.path.exists(tmp_path) or \
+                os.path.getsize(tmp_path) != os.path.getsize(video_path):
+            shutil.copy2(video_path, tmp_path)
+        return cv2.VideoCapture(tmp_path, backend) if backend is not None \
+            else cv2.VideoCapture(tmp_path)
+    except Exception:
+        return cap
 
 
 def has_audio_stream(video_path):

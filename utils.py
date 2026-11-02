@@ -193,6 +193,56 @@ def open_capture(video_path, backend=None):
         return cap
 
 
+def open_capture_seekable(video_path):
+    """VideoCapture, в котором работает произвольный seek. Некоторые контейнеры
+    (AVCHD .mts) OpenCV-FFMPEG не умеет искать по кадрам/времени (read у 98%
+    длительности возвращает False) - плеер для последних попыток показывал
+    пустой экран. Пробуем дефолтный бэкенд, при неудаче пробного seek -
+    перебираем платформенные (на macOS AVFOUNDATION ищет точно)."""
+    cap = open_capture(video_path)
+    if cap.isOpened() and _seek_probe_ok(cap):
+        return cap
+    try:
+        cap.release()
+    except Exception:
+        pass
+    backends = []
+    if platform.system() == 'Darwin':
+        backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_FFMPEG]
+    elif platform.system() == 'Windows':
+        backends = [cv2.CAP_MSMF, cv2.CAP_FFMPEG, cv2.CAP_DSHOW]
+    else:
+        backends = [cv2.CAP_FFMPEG, cv2.CAP_GSTREAMER]
+    for be in backends:
+        try:
+            cap = cv2.VideoCapture(video_path, be)
+        except Exception:
+            continue
+        if cap.isOpened() and _seek_probe_ok(cap):
+            return cap
+        try:
+            cap.release()
+        except Exception:
+            pass
+    return open_capture(video_path)
+
+
+def _seek_probe_ok(cap):
+    """Пробный seek на ~90% длительности: read должен вернуть кадр."""
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if not fps or not n or n <= 10:
+            return True  # нечего проверять - короткий файл/нет данных
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * 0.9))
+        ok, _f = cap.read()
+        pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return bool(ok) and pos > (n * 0.9 / fps) * 0.5
+    except Exception:
+        return True
+
+
 def has_audio_stream(video_path):
     """Проверяет наличие аудио-дорожки в видео через ffprobe"""
     ffprobe = get_ffprobe_path()

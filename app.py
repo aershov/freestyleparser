@@ -4820,7 +4820,7 @@ class VideoPreviewPopup:
         self.speed = 1.0
         self._carry = 0.0  # дробный остаток продвигаемых кадров
         self._after_id = None  # id отложенного тика (для отмены)
-        self.cap = open_capture(video_path)
+        self.cap = open_capture_seekable(video_path)
         if not self.cap.isOpened():
             messagebox.showinfo("Превью", "Не удалось открыть видео")
             return
@@ -4903,7 +4903,7 @@ class VideoPreviewPopup:
             self.del_btn.bind('<Button-1>', lambda e: self._delete_two_phase())
             self.del_btn.pack(side=tk.RIGHT, padx=6)
 
-        self.cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_file_sec) * 1000)
+        self._seek_readable(max(0.0, start_file_sec) * 1000)
         self.top.bind('<space>', lambda e: self.toggle_play())
         self.top.bind('<Escape>', lambda e: self.close())
         self.top.bind('<Left>', lambda e: self.seek(-2))
@@ -5139,6 +5139,20 @@ class VideoPreviewPopup:
         self.playing = True
         self._tick()
 
+    def _seek_readable(self, start_ms):
+        """Seek + проверка, что первый кадр реально декодируется. У конца
+        AVCHD (длинные GOP) позиция по timestamp может не декодироваться -
+        тогда отступаем назад по 0.5с (до 6с). True - кадр прочитан."""
+        step = 500
+        for i in range(13):
+            ms = max(0.0, start_ms - i * step)
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, ms)
+            ok, _frame = self.cap.read()
+            if ok:
+                self.cap.set(cv2.CAP_PROP_POS_MSEC, ms)
+                return True
+        return False
+
     def _load_video(self, video_path, start_file_sec=0.0, title=None):
         """Загрузка нового клипа в то же окно плеера: чекбоксы, скорость,
         геометрия и позиция окна сохраняются."""
@@ -5154,7 +5168,7 @@ class VideoPreviewPopup:
             self.cap.release()
         except Exception:
             pass
-        self.cap = open_capture(video_path)
+        self.cap = open_capture_seekable(video_path)
         if not self.cap.isOpened():
             self.close()
             return
@@ -5174,7 +5188,10 @@ class VideoPreviewPopup:
         if fps and n_frames:
             # seek за концом файла даёт пустой экран - клэмпим в границы
             start_ms = min(start_ms, max(0.0, n_frames / fps * 1000 - 500))
-        self.cap.set(cv2.CAP_PROP_POS_MSEC, start_ms)
+        if not self._seek_readable(start_ms):
+            # даже с отступом кадр не декодируется - останавливаем, чтобы
+            # тик не ушёл в _on_end с пустым экраном
+            self.playing = False
         self._carry = 0.0
         if title:
             self.top.title(title)

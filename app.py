@@ -3456,12 +3456,11 @@ class FreestyleParserApp:
     def show_attempt_file(self, attempt):
         """Открывает папку с файлом попытки и выделяет его"""
         if os.path.exists(attempt):
-            # Для macOS
-            subprocess.run(['open', '-R', attempt])
-            # Для Windows
-            # subprocess.run(['explorer', '/select,', attempt])
-            # Для Linux
-            # subprocess.run(['xdg-open', os.path.dirname(attempt)])
+            if sys.platform == 'win32':
+                # explorer требует обратные слэши; '/select,' - с запятой
+                subprocess.run(['explorer', '/select,', os.path.normpath(attempt)])
+            else:
+                subprocess.run(['open', '-R', attempt])
 
     def log(self, message, level=logging.INFO):
         """Добавляет сообщение в лог"""

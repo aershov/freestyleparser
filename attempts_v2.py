@@ -98,9 +98,10 @@ class Embedder:
             m.load_state_dict(sd)
             return m.eval().to(device)
 
+        _models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
         self.models = [
-            load('osnet_x1_0', 'models/osnet_x1_0_combineall.pth', 4101),
-            load('osnet_ain_x1_0', 'models/osnet_ain_x1_0_msmt17.pth', 4101),
+            load('osnet_x1_0', os.path.join(_models_dir, 'osnet_x1_0_combineall.pth'), 4101),
+            load('osnet_ain_x1_0', os.path.join(_models_dir, 'osnet_ain_x1_0_msmt17.pth'), 4101),
         ]
         self.device = device
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
@@ -230,7 +231,8 @@ def _get_model():
     """YOLO-seg с ленивым кешем (модель stateless, безопасно переиспользовать)."""
     global _MODEL
     if _MODEL is None:
-        _MODEL = YOLO('models/yolo11s-seg.pt')
+        _MODEL = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'models/yolo11s-seg.pt'))
     return _MODEL
 
 

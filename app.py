@@ -531,6 +531,20 @@ class FreestyleParserApp:
         else:
             self._start_worker(self.process_videos)
 
+    def _on_left_wheel(self, event):
+        delta = getattr(event, 'delta', 0)
+        if abs(delta) >= 120:      # Windows: кратно 120
+            steps = -int(delta / 120)
+        else:                      # macOS: пиксельный дельта
+            steps = -int(delta)
+        if steps:
+            self.left_canvas.yview_scroll(steps, 'units')
+
+    def _bind_left_wheel(self, widget):
+        widget.bind('<MouseWheel>', self._on_left_wheel)
+        for child in widget.winfo_children():
+            self._bind_left_wheel(child)
+
     def _strategy(self):
         """Стратегия из чекбоксов: 'auto'|'manual'|'attempts'|'athletes'.
         Внутренние коды сохранены для совместимости processing.yaml."""
@@ -2113,12 +2127,29 @@ class FreestyleParserApp:
         self.top_frame = tk.PanedWindow(self.main_frame, orient=tk.HORIZONTAL)
         self.main_frame.add(self.top_frame)
 
-        # === ЛЕВЫЙ БЛОК ===
+        # === ЛЕВЫЙ БЛОК (скроллируемый: на небольших экранах не влезает) ===
         self.left_frame = tk.Frame(self.top_frame, width=460)
         self.top_frame.add(self.left_frame, width=460, minsize=425)
 
+        self.left_canvas = tk.Canvas(self.left_frame, highlightthickness=0)
+        left_scroll = ttk.Scrollbar(self.left_frame, orient=tk.VERTICAL,
+                                    command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.left_inner = tk.Frame(self.left_canvas)
+        self._left_win = self.left_canvas.create_window(
+            (0, 0), window=self.left_inner, anchor='nw')
+        self.left_inner.bind(
+            '<Configure>',
+            lambda e: self.left_canvas.configure(
+                scrollregion=self.left_canvas.bbox('all')))
+        self.left_canvas.bind(
+            '<Configure>',
+            lambda e: self.left_canvas.itemconfigure(self._left_win, width=e.width))
+
         # --- Выбор файлов ---
-        self.frame_files = tk.LabelFrame(self.left_frame, text="Файлы")
+        self.frame_files = tk.LabelFrame(self.left_inner, text="Файлы")
         self.frame_files.pack(pady=10, fill=tk.X)
 
         files_inner = tk.Frame(self.frame_files)
@@ -2173,7 +2204,7 @@ class FreestyleParserApp:
         self.folder_status_label.pack(fill=tk.X, padx=5)
 
         # --- ROI Canvas ---
-        self.frame_roi = tk.LabelFrame(self.left_frame, text="Область интереса")
+        self.frame_roi = tk.LabelFrame(self.left_inner, text="Область интереса")
         self.frame_roi.pack(pady=10, fill=tk.X)
 
         # Кнопки для переключения режимов ROI
@@ -2204,7 +2235,7 @@ class FreestyleParserApp:
         self.canvas.bind("<Double-Button-1>", self.finish_polygon)  # Двойной клик завершает многоугольник
 
         # --- Параметры обработки ---
-        self.frame_output = tk.LabelFrame(self.left_frame, text="Настройки обработки")
+        self.frame_output = tk.LabelFrame(self.left_inner, text="Настройки обработки")
         self.frame_output.pack(pady=10, fill=tk.X)
 
         param_defs = [
@@ -2289,6 +2320,9 @@ class FreestyleParserApp:
                              "или клавишами A (предыдущая) / S (текущая).\n"
                              "«Определять атлетов» вкл -> точный сплиттер (медленно),\n"
                              "выкл -> грубый быстрый скан (шаг scan_interval).")
+
+        # колесо мыши над левым блоком = прокрутка панели
+        self._bind_left_wheel(self.left_inner)
 
         # === ПРАВЫЙ БЛОК ===
         self.right_frame = tk.PanedWindow(self.top_frame, orient=tk.HORIZONTAL)

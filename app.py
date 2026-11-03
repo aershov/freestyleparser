@@ -18,6 +18,7 @@ from Components import AthleteWidget
 # splitter тянет torch+ultralytics (~1-3с) - импортируем лениво в местах
 # использования, чтобы окно появлялось быстрее
 import sys
+import pathlib
 import traceback
 
 def _load_app_version():
@@ -2670,7 +2671,12 @@ class FreestyleParserApp:
         if not os.path.exists(path):
             messagebox.showinfo("Справка", f"Файл справки не найден: {path}")
             return
-        webbrowser.open('file://' + path)
+        # file://-URL: Windows-путь с backslash и кириллицей требует
+        # правильного процентного кодирования
+        try:
+            webbrowser.open(pathlib.Path(path).as_uri())
+        except Exception:
+            webbrowser.open('file:///' + path.replace('\\', '/'))
 
     def _toggle_athletes(self):
         """Показать/скрыть правую панель 'Атлеты / Скан' (PanedWindow pane)"""

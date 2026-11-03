@@ -10,3 +10,6 @@ temp/
 *.pyc
 .DS_Store
 version.txt
+
+# локальная память сессий
+.session-notes.md

@@ -95,12 +95,14 @@ class DatePicker(tk.Toplevel):
               'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
     WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
 
-    def __init__(self, parent, initial=None):
+    def __init__(self, parent, initial=None, marked_dates=None):
         super().__init__(parent)
         self.title("Выберите день")
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
+        # дни, за которые есть папки с попытками - выделяются в сетке
+        self.marked = marked_dates or set()
         if initial is not None:
             self.year, self.month = initial.year, initial.month
         else:
@@ -138,9 +140,18 @@ class DatePicker(tk.Toplevel):
                     tk.Label(self.grid_frame, width=4).grid(row=r, column=c)
                     continue
                 d = datetime.date(self.year, self.month, day)
-                text = f"•{day}" if d == today else str(day)
-                tk.Button(self.grid_frame, text=text, width=4,
-                          command=lambda dd=d: self._pick(dd)).grid(row=r, column=c)
+                marked = d in self.marked
+                if d == today:
+                    text = f"•{day}"
+                elif marked:
+                    text = f"{day} •"
+                else:
+                    text = str(day)
+                btn = tk.Button(self.grid_frame, text=text, width=4,
+                                command=lambda dd=d: self._pick(dd))
+                if marked:
+                    btn.config(font=('Arial', 10, 'bold'))
+                btn.grid(row=r, column=c)
 
     def _shift(self, delta):
         m = self.month + delta
@@ -198,6 +209,7 @@ class FreestyleParserApp:
         self.scan_running = False
         self.cut_running = False
         self._candidates_lock = threading.RLock()
+        self._ratings_lock = threading.Lock()
         self.need_update_attempts = False
         self.athlete_mapping = {}  # Инициализируем пустой словарь
         self._thumb_model = None   # кеш YOLO для умных превью
@@ -277,6 +289,7 @@ class FreestyleParserApp:
                 self._render_file_list()
             if self.processing:
                 self.progress_var.set(min(self._progress_percent, 100.0))
+                self._update_progress_info()
         except Exception:
             self.log("Ошибка обновления интерфейса: " + traceback.format_exc(),
                      logging.ERROR)
@@ -401,6 +414,9 @@ class FreestyleParserApp:
         if not hasattr(self, 'listbox_files'):
             return
         self.listbox_files.delete(0, tk.END)
+        if hasattr(self, 'files_hint_label'):
+            self.files_hint_label.pack_forget() if self.selected_files \
+                else self.files_hint_label.pack(fill=tk.X, padx=5)
         folder_ready = os.path.isdir(self.output_folder)
         partial_work = folder_ready and self._folder_has_work()
         processed = self._load_processed()
@@ -498,13 +514,31 @@ class FreestyleParserApp:
 
     def choose_day_folder(self):
         """Выбор папки дня через календарь: ~/Desktop/FreestyleParser/YYYY-MM-DD"""
-        dialog = DatePicker(self.root, datetime.date.today())
+        dialog = DatePicker(self.root, datetime.date.today(),
+                            marked_dates=self._dates_with_attempts())
         self.root.wait_window(dialog)
         d = dialog.result
         if d is None:
             return
         folder = os.path.expanduser(f"~/Desktop/FreestyleParser/{d.isoformat()}")
         self._set_output_folder(folder, f"Рабочая папка дня: {folder}")
+
+    def _dates_with_attempts(self):
+        """Дни (для календаря), за которые есть папки дня:
+        ~/Desktop/FreestyleParser/YYYY-MM-DD. Папка может содержать что
+        угодно (попытки, кандидаты, исходники) - важен сам факт."""
+        base = os.path.expanduser("~/Desktop/FreestyleParser")
+        dates = set()
+        if not os.path.isdir(base):
+            return dates
+        for name in os.listdir(base):
+            if not os.path.isdir(os.path.join(base, name)):
+                continue
+            try:
+                dates.add(datetime.date.fromisoformat(name))
+            except ValueError:
+                continue
+        return dates
 
     def on_filter_change(self, event):
         """Обработчик изменения фильтра"""
@@ -547,20 +581,6 @@ class FreestyleParserApp:
         else:
             self._start_worker(self.process_videos)
 
-    def _on_left_wheel(self, event):
-        delta = getattr(event, 'delta', 0)
-        if abs(delta) >= 120:      # Windows: кратно 120
-            steps = -int(delta / 120)
-        else:                      # macOS: пиксельный дельта
-            steps = -int(delta)
-        if steps:
-            self.left_canvas.yview_scroll(steps, 'units')
-
-    def _bind_left_wheel(self, widget):
-        widget.bind('<MouseWheel>', self._on_left_wheel)
-        for child in widget.winfo_children():
-            self._bind_left_wheel(child)
-
     def _strategy(self):
         """Стратегия из чекбоксов: 'auto'|'manual'|'attempts'|'athletes'.
         Внутренние коды сохранены для совместимости processing.yaml."""
@@ -581,6 +601,9 @@ class FreestyleParserApp:
     def _start_worker(self, target):
         """Запускает поток обработки со страховкой: любая ошибка внутри воркера
         логируется и гарантированно возвращает кнопки в активное состояние."""
+        self._progress_file_t0 = None
+        self._progress_file_name = ''
+
         def run():
             try:
                 target()
@@ -812,6 +835,9 @@ class FreestyleParserApp:
             self.button_process.config(state=tk.NORMAL)
             self.button_live.config(state=tk.NORMAL)
             self.button_stop.config(state=tk.DISABLED)
+            self._progress_file_t0 = None
+            if hasattr(self, 'progress_info_var'):
+                self.progress_info_var.set('')
         self.update_cut_button_state()
 
     # === Режим «Просмотр без сохранения» ===
@@ -1881,8 +1907,44 @@ class FreestyleParserApp:
         процент - сам прогрессбар обновляет periodic_update в главном потоке."""
         if file_count <= 0:
             return
+        now = time.time()
+        # новый файл (или новый запуск) - сбрасываем точку отсчёта ETA
+        if getattr(self, '_progress_file_index', None) != file_index or frame_index <= 1:
+            self._progress_file_index = file_index
+            self._progress_file_t0 = now
+            self._progress_file_pos = f"{file_index + 1}/{file_count}"
+            if 0 <= file_index < len(self.selected_files):
+                self._progress_file_name = os.path.basename(self.selected_files[file_index])
+            else:
+                self._progress_file_name = ''
         file_progress = frame_index / total_frames if total_frames > 0 else 0.0
         self._progress_percent = 100.0 * (file_index + min(file_progress, 1.0)) / file_count
+        self._progress_file_percent = 100.0 * min(file_progress, 1.0)
+
+    @staticmethod
+    def _fmt_eta(seconds):
+        """Человекочитаемая оценка остатка времени"""
+        seconds = max(0, int(seconds))
+        if seconds >= 60:
+            return f"~{seconds // 60} мин {seconds % 60} с"
+        return f"~{seconds} с"
+
+    def _update_progress_info(self):
+        """Строка под прогресс-баром: имя файла + ETA текущего файла"""
+        if not self.processing:
+            self.progress_info_var.set('')
+            return
+        parts = []
+        name = getattr(self, '_progress_file_name', '')
+        pos = getattr(self, '_progress_file_pos', '')
+        if name:
+            parts.append(f"{name} [{pos}]" if pos else name)
+        t0 = getattr(self, '_progress_file_t0', None)
+        fp = getattr(self, '_progress_file_percent', 0.0)
+        if t0 and fp > 2.0:
+            parts.append("осталось " + self._fmt_eta(
+                (time.time() - t0) * (100.0 - fp) / fp))
+        self.progress_info_var.set(' · '.join(parts))
 
     def setup_logger(self):
         """Настройка логгера"""
@@ -2082,13 +2144,14 @@ class FreestyleParserApp:
             self.log(f"Ошибка при сохранении маппинга: {str(e)}")
 
     def save_ratings(self):
-        """Сохраняет рейтинги попыток в файл"""
+        """Сохраняет рейтинги попыток в файл (может зваться из фонового потока)"""
         ratings_file = os.path.join(self.output_folder, "ratings.yaml")
-        try:
-            with open(ratings_file, 'w', encoding='utf-8') as f:
-                yaml.dump(self.attempt_ratings, f, default_flow_style=False, allow_unicode=True)
-        except Exception as e:
-            self.log(f"Ошибка при сохранении рейтингов: {str(e)}")
+        with getattr(self, '_ratings_lock', threading.Lock()):
+            try:
+                with open(ratings_file, 'w', encoding='utf-8') as f:
+                    yaml.dump(self.attempt_ratings, f, default_flow_style=False, allow_unicode=True)
+            except Exception as e:
+                self.log(f"Ошибка при сохранении рейтингов: {str(e)}")
 
     def load_ratings(self):
         """Загружает рейтинги попыток из файла"""
@@ -2212,8 +2275,18 @@ class FreestyleParserApp:
         self.listbox_files.pack(fill=tk.X, padx=5)
         self.listbox_files.bind('<<ListboxSelect>>', self.on_file_select)
 
+        # подсказка, пока файлы не выбраны (скрывается при выборе)
+        self.files_hint_label = tk.Label(
+            files_left,
+            text="Выберите файлы с тренировкой\n(поддерживаются .MTS, .MP4, .AVI)",
+            fg='#888888', justify=tk.LEFT, font=('Arial', 8))
+        self.files_hint_label.pack(fill=tk.X, padx=5)
+
         self.button_select_files = tk.Button(files_left, text="Выбрать файлы", command=self.select_files)
         self.button_select_files.pack(fill=tk.X, padx=5, pady=5)
+        self._attach_tooltip(self.button_select_files,
+                             "Выбрать видеофайлы тренировки (.MTS, .MP4, .AVI).\n"
+                             "Можно выбирать прямо с флешки, без копирования.")
 
         # Правая часть — выходная папка
         files_right = tk.Frame(files_inner)
@@ -2234,6 +2307,8 @@ class FreestyleParserApp:
 
         self.button_open_output = tk.Button(entry_row, text="Открыть", command=self.open_output_folder)
         self.button_open_output.pack(side=tk.LEFT, padx=(5, 0))
+        self._attach_tooltip(self.button_open_output,
+                             "Открыть текущую рабочую папку в проводнике")
 
         output_btn_inner = tk.Frame(files_right)
         output_btn_inner.pack(fill=tk.X, padx=5, pady=5)
@@ -2241,9 +2316,14 @@ class FreestyleParserApp:
         self.button_day_folder = tk.Button(output_btn_inner, text="📅",
                                            command=self.choose_day_folder)
         self.button_day_folder.pack(side=tk.LEFT, padx=2)
+        self._attach_tooltip(self.button_day_folder,
+                             "Выбрать/создать папку дня (дата - часть имени).\n"
+                             "Для каждой тренировки - своя папка.")
 
         self.button_change_output = tk.Button(output_btn_inner, text="Изменить", command=self.change_output_folder)
         self.button_change_output.pack(side=tk.LEFT, padx=2)
+        self._attach_tooltip(self.button_change_output,
+                             "Выбрать произвольную рабочую папку")
 
         # Индикатор состояния рабочей папки
         self.folder_status_label = tk.Label(files_right, text="", anchor=tk.W)
@@ -2257,20 +2337,25 @@ class FreestyleParserApp:
         self.frame_roi_controls = tk.Frame(self.frame_roi)
         self.frame_roi_controls.pack(pady=5)
         
-        self.button_rectangle_mode = tk.Button(self.frame_roi_controls, text="Прямоугольник", 
+        self.button_rectangle_mode = tk.Button(self.frame_roi_controls, text="Прямоугольник",
                                               command=lambda: self.switch_roi_mode("rectangle"))
         self.button_rectangle_mode.pack(side=tk.LEFT, padx=5)
-        
-        self.button_polygon_mode = tk.Button(self.frame_roi_controls, text="Многоугольник", 
+        self._attach_tooltip(self.button_rectangle_mode,
+                             "Режим прямоугольника: растяните область мышью")
+
+        self.button_polygon_mode = tk.Button(self.frame_roi_controls, text="Многоугольник",
                                             command=lambda: self.switch_roi_mode("polygon"))
         self.button_polygon_mode.pack(side=tk.LEFT, padx=5)
-        
-        self.button_clear_roi = tk.Button(self.frame_roi_controls, text="Очистить", 
+        self._attach_tooltip(self.button_polygon_mode,
+                             "Кликайте точки многоугольника, двойной клик - "
+                             "завершить,\nBackspace - убрать последнюю точку")
+        self.button_clear_roi = tk.Button(self.frame_roi_controls, text="Очистить",
                                          command=self.clear_roi)
         self.button_clear_roi.pack(side=tk.LEFT, padx=5)
+        self._attach_tooltip(self.button_clear_roi, "Стереть область интереса")
 
-        self.label_roi = tk.Label(self.frame_roi, text="Кликните по точкам многоугольника. Двойной клик завершает:")
-        self.label_roi.pack()
+        # подпись режима (для полигона не нужна - подсказка в тултипе кнопки)
+        self.label_roi = tk.Label(self.frame_roi, text="")
 
         self.canvas = tk.Canvas(self.frame_roi, height=CANVAS_HEIGHT, bg="black")
         self.canvas.pack(pady=5, fill=tk.X)
@@ -2279,6 +2364,7 @@ class FreestyleParserApp:
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Double-Button-1>", self.finish_polygon)  # Двойной клик завершает многоугольник
+        self.canvas.bind("<BackSpace>", self._roi_undo_point)  # Backspace убирает последнюю точку
 
         # --- Параметры обработки ---
         self.frame_output = tk.LabelFrame(self.left_inner, text="Настройки обработки")
@@ -2296,6 +2382,33 @@ class FreestyleParserApp:
             ('precise_left_margin', 'Поиск начала влево, с'),
         ]
 
+        # описания + значения по умолчанию для тултипов
+        param_hints = {
+            'min_pause_duration':
+                'Минимальная пауза между попытками, сек реального времени.\n'
+                'Меньше - соседние попытки склеиваются, больше - разрываются.',
+            'min_attempt_duration':
+                'Попытки короче отбрасываются, сек.\n'
+                'Больше - отсекаются случайные проходы мимо ROI.',
+            'attempt_start_padding':
+                'Сколько секунд записать до начала попытки\n(запас на вход атлета в кадр).',
+            'attempt_end_padding':
+                'Сколько секунд записать после попытки\n(запас на выбег).',
+            'min_detection_strength':
+                'Минимальная сила сигнала детекции (0-1) для начала/продолжения попытки.\n'
+                'Меньше - ловит тусклые/далёкие появления, больше - строгость.',
+            'scan_interval':
+                'Шаг сканирования видео в ручном режиме и грубом live-скане, сек.\n'
+                'Меньше - точнее границы, дольше скан.',
+            'scan_threshold':
+                'Порог YOLO при сканировании (0-1), ниже обычного анализа.\n'
+                'Меньше - больше кандидатов (в т.ч. ложных).',
+            'reid_embed_rate':
+                'Сколько OSNet-эмбеддингов в секунду брать внутри попытки\nдля атрибуции. Больше - точнее, медленнее.',
+            'precise_left_margin':
+                'Насколько влево от кандидата искать точное начало попытки, сек.',
+        }
+
         self.param_vars = {}
         for i, (key, label_text) in enumerate(param_defs):
             col = i % 2
@@ -2308,6 +2421,10 @@ class FreestyleParserApp:
             entry = tk.Entry(row_frame, textvariable=var, width=6)
             entry.pack(side=tk.LEFT, padx=(0, 15))
             self.param_vars[key] = var
+            hint = param_hints.get(key, '')
+            if hint:
+                self._attach_tooltip(entry, hint + f"\n\nПо умолчанию: "
+                                     f"{DEFAULT_PROCESSING_PARAMS.get(key, '?')}")
 
         # --- Слоумо: чекбокс + коэффициент (в той же сетке параметров) ---
         i = len(param_defs)
@@ -2324,6 +2441,11 @@ class FreestyleParserApp:
             row_frame, textvariable=self.slowmo_combo_var,
             values=('1/4', '1/8'), width=4, state='disabled')
         self.slowmo_combo.pack(side=tk.LEFT, padx=(2, 0))
+        self._attach_tooltip(self.check_slowmo,
+                             "Запись в слоумо (например, 96 к/с). Вырезанные\n"
+                             "файлы будут обычной скорости, попытки и\n"
+                             "параметры считаются в реальных секундах.")
+        self._attach_tooltip(self.slowmo_combo, "Во сколько раз запись замедлена")
 
         # --- Стратегия обработки: 2 чекбокса = 4 комбинации ---
         # [ ] Сразу сохранять  [ ] Определять атлетов
@@ -2335,26 +2457,42 @@ class FreestyleParserApp:
         tk.Label(strategy_frame, text="Стратегия:").pack(side=tk.LEFT, padx=(0, 5))
         self.save_now_var = tk.BooleanVar(value=True)
         self.athletes_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(strategy_frame, text="Сразу сохранять",
-                       variable=self.save_now_var,
-                       command=self.on_strategy_change).pack(side=tk.LEFT)
-        tk.Checkbutton(strategy_frame, text="Определять атлетов",
-                       variable=self.athletes_var,
-                       command=self.on_strategy_change).pack(side=tk.LEFT, padx=(5, 0))
+        cb_save_now = tk.Checkbutton(strategy_frame, text="Сразу сохранять",
+                                     variable=self.save_now_var,
+                                     command=self.on_strategy_change)
+        cb_save_now.pack(side=tk.LEFT)
+        self._attach_tooltip(cb_save_now,
+                             "Вкл: попытки сразу режутся в файлы.\n"
+                             "Выкл: сначала кандидаты, потом «Нарезать».")
+        cb_athletes = tk.Checkbutton(strategy_frame, text="Определять атлетов",
+                                     variable=self.athletes_var,
+                                     command=self.on_strategy_change)
+        cb_athletes.pack(side=tk.LEFT, padx=(5, 0))
+        self._attach_tooltip(cb_athletes,
+                             "Вкл: точный анализ + эмбеддинги + автоатрибуция (медленно).\n"
+                             "Выкл: быстрый скан без атрибуции.")
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.frame_output, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=5)
+        # имя текущего файла + ETA (заполняется при обработке)
+        self.progress_info_var = tk.StringVar()
+        tk.Label(self.frame_output, textvariable=self.progress_info_var,
+                 fg='#555', font=('Arial', 8), anchor=tk.W).pack(fill=tk.X)
 
         control_inner = tk.Frame(self.frame_output)
         control_inner.pack(fill=tk.X)
 
         self.button_process = tk.Button(control_inner, text="Обработать", command=self.start_processing)
         self.button_process.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self._attach_tooltip(self.button_process,
+                             "Найти и нарезать попытки по выбранным файлам\n"
+                             "(стратегия - чекбоксами выше)")
 
         self.button_stop = tk.Button(control_inner, text="Остановить", state=tk.DISABLED, command=self.stop_processing)
         self.button_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self._attach_tooltip(self.button_stop, "Остановить обработку")
 
         # Режим «Просмотр без сохранения»: скан в фоне, попытки живут в памяти,
         # просмотр в плеере, сохранение - по кнопкам (или A/S) в плеере
@@ -2367,8 +2505,6 @@ class FreestyleParserApp:
                              "«Определять атлетов» вкл -> точный сплиттер (медленно),\n"
                              "выкл -> грубый быстрый скан (шаг scan_interval).")
 
-        # колесо мыши над левым блоком = прокрутка панели
-        self._bind_left_wheel(self.left_inner)
 
         # === ПРАВЫЙ БЛОК ===
         self.right_frame = tk.PanedWindow(self.top_frame, orient=tk.HORIZONTAL)
@@ -2392,6 +2528,9 @@ class FreestyleParserApp:
                                        state=tk.DISABLED,
                                        command=self.export_selected_attempts)
         self.export_button.pack(side=tk.LEFT, padx=5)
+        self._attach_tooltip(self.export_button,
+                             "Скопировать выбранные попытки (видео + превью)\n"
+                             "в стороннюю папку")
 
         # Фильтры по меткам
         self.rating_filters_frame = tk.Frame(self.actions_frame)
@@ -2402,24 +2541,33 @@ class FreestyleParserApp:
                                         command=lambda: self.toggle_rating_filter("up"),
                                         font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
         self.filter_up_button.pack(side=tk.LEFT, padx=2)
+        self._attach_tooltip(self.filter_up_button,
+                             "Показывать только попытки с 👍")
 
         # Кнопка фильтра "палец вниз"
-        self.filter_down_button = tk.Button(self.rating_filters_frame, text="👎", 
+        self.filter_down_button = tk.Button(self.rating_filters_frame, text="👎",
                                           command=lambda: self.toggle_rating_filter("down"),
                                           font=('Arial', 11, 'normal'), bd=2, width=3, height=1)
         self.filter_down_button.pack(side=tk.LEFT, padx=2)
+        self._attach_tooltip(self.filter_down_button,
+                             "Показывать только попытки с 👎")
 
         # Кнопка "Выбрать все"
         self.select_all_button = tk.Button(self.actions_frame, text="Выбрать все", command=self.select_all_attempts)
         self.select_all_button.pack(side=tk.RIGHT, padx=5)
+        self._attach_tooltip(self.select_all_button,
+                             "Отметить все видимые (по текущему фильтру) попытки")
 
         # Кнопка "Снять выделение"
         self.deselect_all_button = tk.Button(self.actions_frame, text="Снять выделение", command=self.deselect_all_attempts)
         self.deselect_all_button.pack(side=tk.RIGHT, padx=5)
+        self._attach_tooltip(self.deselect_all_button, "Снять все галочки")
 
         # Кнопка удаления
         self.delete_button = tk.Button(self.actions_frame, text="🗑️ Удалить", command=self.delete_selected_attempts)
         self.delete_button.pack(side=tk.RIGHT, padx=5)
+        self._attach_tooltip(self.delete_button,
+                             "Удалить выбранные попытки\n(видео и превью-файлы)")
 
         # Кнопка нарезки выбранных кандидатов (ручной режим).
         # Ярко выделена, чтобы читалась как кнопка, а не надпись.
@@ -2429,6 +2577,8 @@ class FreestyleParserApp:
             relief=tk.RAISED, bd=2, bg="#dff0d8", activebackground="#c8e6c9",
             font=('Arial', 10, 'bold'), padx=8, pady=2)
         self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
+        self._attach_tooltip(self.button_cut_selected,
+                             "Нарезать отмеченных кандидатов в видеофайлы")
 
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
@@ -2483,29 +2633,40 @@ class FreestyleParserApp:
         self.filter_all_button = tk.Button(self.filter_buttons_frame, text="Все",
                                            command=lambda: self.set_filter("Все"))
         self.filter_all_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.filter_all_button, "Показать все попытки")
 
         self.filter_unknown_button = tk.Button(self.filter_buttons_frame, text="Не разобрано",
                                                command=lambda: self.set_filter("Неизвестно"))
         self.filter_unknown_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.filter_unknown_button,
+                             "Попытки без привязки к атлету")
 
         self.filter_confirm_button = tk.Button(self.filter_buttons_frame, text="На подтверждение",
                                                command=lambda: self.set_filter("На подтверждение"))
         self.filter_confirm_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.filter_confirm_button,
+                             "Попытки с авто-привязкой, требующие подтверждения")
 
         self.confirm_auto_button = tk.Button(self.filter_buttons_frame,
                                              text="Подтвердить все авто",
                                              command=self.confirm_all_auto_assignments)
         self.confirm_auto_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.confirm_auto_button,
+                             "Подтвердить все авто-привязки разом")
 
         self.regenerate_thumbs_button = tk.Button(self.filter_buttons_frame,
                                                   text="Обновить превью",
                                                   command=self.start_thumbnail_regeneration)
         self.regenerate_thumbs_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.regenerate_thumbs_button,
+                             "Пересоздать скриншоты всех попыток")
 
         self.bank_detect_button = tk.Button(self.filter_buttons_frame,
                                             text="Детекция по банкам",
                                             command=self.start_bank_detection)
         self.bank_detect_button.pack(fill=tk.X, pady=2)
+        self._attach_tooltip(self.bank_detect_button,
+                             "Найти атлетов по банкам лиц/жилетов\n(вкладка Скан)")
 
         # Контейнер для списка атлетов: скроллируемый (много атлетов)
         self.athletes_canvas = tk.Canvas(tab_athletes, highlightthickness=0)
@@ -2523,10 +2684,10 @@ class FreestyleParserApp:
         # канваса, иначе канвас (fill=both) забирает всю высоту/ширину
         self.button_add_athlete = tk.Button(tab_athletes, text="+ Новый атлет", command=self.add_athlete)
         self.button_add_athlete.pack(side=tk.BOTTOM, pady=3, padx=2, fill=tk.X)
+        self._attach_tooltip(self.button_add_athlete, "Добавить атлета (имя вписывается вручную)")
         ath_sb.pack(side="right", fill="y")
         self.athletes_canvas.pack(side="left", fill="both", expand=True,
                                   padx=(2, 0), pady=3)
-        self._bind_canvas_wheel(self.athletes_canvas)
 
         # === Вкладка Скан: статус банка + сегменты ===
         tab_segments = self._athlete_tab_frames['scan']
@@ -2547,7 +2708,6 @@ class FreestyleParserApp:
         self.segments_canvas.pack(side="left", fill="both", expand=True,
                                   padx=(2, 0), pady=3)
         seg_sb.pack(side="right", fill="y")
-        self._bind_canvas_wheel(self.segments_canvas)
         self.update_segments_panel()
 
         # Инициализируем список атлетов
@@ -2603,6 +2763,9 @@ class FreestyleParserApp:
                                    bg='#e8e8e8')
         self.ath_toggle.place(relx=1.0, rely=1.0, x=-26, y=-4, anchor='se')
         self.ath_toggle.bind('<Button-1>', lambda e: self._toggle_athletes())
+
+        # колесо мыши: один глобальный обработчик для всех скроллируемых панелей
+        self._setup_wheel_scrolling()
 
     def _make_collapsible(self, frame):
         """Схлопывание панели: узкая шапка-строка с маленькой кнопкой
@@ -2692,15 +2855,106 @@ class FreestyleParserApp:
             self.ath_toggle.config(text='⇥')
             self._ath_pane_visible = True
 
-    def _bind_canvas_wheel(self, canvas):
-        """Колесо мыши скроллит канвас, пока курсор над ним (macOS)"""
-        def wheel(e):
+    def _wheel_target(self, widget):
+        """Скроллируемый канвас, в котором находится виджет (по цепочке
+        родителей), или None"""
+        targets = (self.left_canvas, self.attempts_canvas,
+                   self.athletes_canvas, self.segments_canvas)
+        w = widget
+        while w is not None:
+            if w in targets:
+                return w
+            w = getattr(w, 'master', None)
+        return None
+
+    def _setup_wheel_scrolling(self):
+        """Один глобальный обработчик колеса: скроллит тот канвас, над которым
+        курсор - включая дочерние виджеты панелей (Enter/Leave на канвасе не
+        ловил: переход на ребёнок давал Leave и отключал скролл)."""
+        debug = bool(os.environ.get('FREESTYLE_WHEEL_DEBUG'))
+        dbg_log = os.path.join(self._app_folder, 'wheel_debug.log')
+
+        def dbg(msg):
+            if debug:
+                try:
+                    with open(dbg_log, 'a', encoding='utf-8') as f:
+                        f.write(msg + '\n')
+                except OSError:
+                    pass
+
+        def on_wheel(e):
             try:
-                canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units')
+                cls = e.widget.winfo_class()
+                dbg(f"wheel cls={cls} delta={e.delta!r} w={e.widget} "
+                    f"target={self._wheel_target(e.widget)}")
+                if cls in ('Listbox', 'Text'):
+                    return  # виджет скроллится сам
+                canvas = self._wheel_target(e.widget)
+                if canvas is not None:
+                    canvas.yview_scroll(-1 if getattr(e, 'delta', 0) > 0 else 1,
+                                        'units')
             except tk.TclError:
                 pass
-        canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', wheel))
-        canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
+            except Exception:
+                dbg('wheel handler error: ' + traceback.format_exc())
+
+        pend = {'canvas': None, 'dy': 0, 'after_id': None}
+
+        def on_touchpad_scroll(e):
+            # Tk 9 на macOS: тачпад/тачпад-жесты мыши дают <TouchpadScroll>,
+            # а не <MouseWheel>. Дельта упакована как (dX << 16) | (dY & 0xffff),
+            # dY - малые точные значения (±1..±30); направление инвертировано
+            # (см. tk::PreciseScrollDeltas в Tk 9).
+            # Ивенты идут с частотой тачпада (~120 Гц) - перерисовка канваса
+            # на каждый дёргает; накапливаем и применяем раз в ~16 мс.
+            try:
+                cls = e.widget.winfo_class()
+                if cls in ('Listbox', 'Text', 'Scrollbar', 'TScrollbar'):
+                    return  # скроллятся сами / нативная обработка
+                canvas = self._wheel_target(e.widget)
+                if canvas is None:
+                    return
+                raw = int(getattr(e, 'delta', 0) or 0)
+                low = raw & 0xffff
+                dy = low if low < 0x8000 else low - 0x10000
+                if not dy:
+                    return
+                pend['canvas'] = canvas
+                pend['dy'] += dy
+                if pend['after_id'] is None:
+                    pend['after_id'] = self.root.after(16, _flush_touchpad)
+            except tk.TclError:
+                pass
+            except Exception:
+                dbg('touchpad handler error: ' + traceback.format_exc())
+
+        def _flush_touchpad():
+            pend['after_id'] = None
+            canvas, dy = pend['canvas'], pend['dy']
+            pend['dy'] = 0
+            if canvas is None or not dy:
+                return
+            try:
+                # у canvas yview scroll не умеет pixels - скроллим
+                # через moveto (как tk::ScrollByPixels в Tk 9)
+                frac = canvas.yview()[0]
+                h = canvas.winfo_height() or 1
+                # скорость прокрутки - половина нативной (по отзыву)
+                canvas.yview_moveto(frac - dy / h / 2)
+            except tk.TclError:
+                pass
+
+        def on_wheel_x11(e):
+            try:
+                canvas = self._wheel_target(e.widget)
+                if canvas is not None:
+                    canvas.yview_scroll(-1 if e.num == 4 else 1, 'units')
+            except tk.TclError:
+                pass
+        self.root.bind_all('<MouseWheel>', on_wheel)
+        self.root.bind_all('<TouchpadScroll>', on_touchpad_scroll)
+        self.root.bind_all('<Button-4>', on_wheel_x11)
+        self.root.bind_all('<Button-5>', on_wheel_x11)
 
     def _toggle_logs(self):
         """Показать/скрыть панель логов (скрываем pane PanedWindow)"""
@@ -2744,6 +2998,7 @@ class FreestyleParserApp:
             widget.destroy()
         self._attempt_labels = {}
         self._attempt_attr_frames = {}
+        self._rating_buttons = {}
 
         # Получаем отфильтрованные попытки
         filtered_files = self.get_filtered_attempts()
@@ -2843,6 +3098,7 @@ class FreestyleParserApp:
                     down_button.pack(side=tk.LEFT, padx=1)
 
                     # Обновляем стиль кнопок в зависимости от текущего состояния
+                    self._rating_buttons[attempt] = (up_button, down_button)
                     self.update_rating_button_style(up_button, down_button, self.attempt_ratings[attempt])
 
                     # Добавляем обработчики событий
@@ -3016,6 +3272,16 @@ class FreestyleParserApp:
                 if lcol >= max_cols:
                     lcol = 0
                     lrow += 1
+
+        # подсказка для пустой панели: ни попыток, ни кандидатов, ни live
+        if not attempts and not pending and not live:
+            hint = tk.Label(self.attempts_scrollable_frame,
+                            text="Здесь появятся попытки после обработки\n"
+                                 "Выберите файлы, нарисуйте область интереса "
+                                 "и нажмите «Обработать»",
+                            fg='#888888', justify=tk.CENTER,
+                            font=('Arial', 10))
+            hint.grid(row=0, column=0, columnspan=max_cols, pady=30)
 
     def save_selected_live(self):
         """Сохранение отмеченных live-попыток (воркер: remux блокирует)"""
@@ -3308,18 +3574,20 @@ class FreestyleParserApp:
         self._update_selected_count()
 
     def toggle_attempt_rating(self, attempt, rating_type):
-        """Переключает рейтинг попытки"""
-        if attempt not in self.attempt_ratings:
-            self.attempt_ratings[attempt] = {'up': False, 'down': False}
-        
-        # Переключаем состояние
-        self.attempt_ratings[attempt][rating_type] = not self.attempt_ratings[attempt][rating_type]
-        
-        # Сохраняем рейтинги
-        self.save_ratings()
-        
-        # Обновляем интерфейс
-        self.update_attempt_thumbnails()
+        """Переключает рейтинг попытки (кнопки на плитке)"""
+        self.rate_attempt(attempt, rating_type)
+
+    def rate_attempt(self, attempt, rating_type):
+        """Переключает рейтинг и обновляет кнопки на плитке
+        (без полной перерисовки панели - плеер остаётся на месте).
+        Запись на диск - в фоновом потоке: дисковый I/O в UI-потоке
+        подтормаживал видео в плеере."""
+        st = self.attempt_ratings.setdefault(attempt, {'up': False, 'down': False})
+        st[rating_type] = not st[rating_type]
+        buttons = getattr(self, '_rating_buttons', {}).get(attempt)
+        if buttons:
+            self.update_rating_button_style(buttons[0], buttons[1], st)
+        threading.Thread(target=self.save_ratings, daemon=True).start()
 
     def update_rating_button_style(self, up_button, down_button, rating_state):
         """Обновляет стиль кнопок рейтинга"""
@@ -3426,10 +3694,12 @@ class FreestyleParserApp:
             return
         factor = self._preview_slowmo_factor()
         start_real = max(0.0, float(attempt.start) - 1.0)
+        dur_real = max(0.0, float(attempt.end) - start_real)
         VideoPreviewPopup(self, src,
                           start_real * factor if factor > 1 else start_real,
                           f"Попытка {attempt.number:04d}", factor=factor,
-                          attempt=attempt)
+                          attempt=attempt,
+                          clip_bytes=self._estimate_output_bytes(src, dur_real))
 
     def show_candidate_video(self, cand):
         """Двойной клик по кандидату: видео из оригинала с позиции кандидата
@@ -3448,7 +3718,8 @@ class FreestyleParserApp:
         VideoPreviewPopup(self, src,
                           start_real * factor if factor > 1 else start_real,
                           f"{stem} {cand['start']:.0f}–{cand['end']:.0f}s",
-                          factor=factor, interval=interval)
+                          factor=factor, interval=interval,
+                          clip_bytes=self._estimate_output_bytes(src, interval[1] - interval[0]))
 
     def show_candidate_preview(self, cand):
         """Превью кандидата в сохранённом (полном) размере - попапом.
@@ -3519,6 +3790,7 @@ class FreestyleParserApp:
             self.logger.log(level, message)
 
     def on_click(self, event):
+        self.canvas.focus_set()
         if self.roi_mode == "rectangle":
             self.start_x = event.x
             self.start_y = event.y
@@ -3559,6 +3831,25 @@ class FreestyleParserApp:
             self.roi = (100 * self.start_x/ self.canvas_width, 100 * self.start_y /CANVAS_HEIGHT, 100 * self.end_x / self.canvas_width, 100* self.end_y/ CANVAS_HEIGHT)
             self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline="red", tags="roi_rectangle")
 
+    def _roi_undo_point(self, event=None):
+        """Backspace: убрать последнюю точку рисуемого многоугольника"""
+        if self.roi_mode != "polygon" or not self.drawing_polygon \
+                or not self.roi_points:
+            return "break"
+        self.roi_points.pop()
+        self.canvas.delete("roi_points")
+        self.canvas.delete("roi_polygon")
+        for x, y in self.roi_points:
+            self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                    fill="red", tags="roi_points")
+        for i in range(1, len(self.roi_points)):
+            p1, p2 = self.roi_points[i - 1], self.roi_points[i]
+            self.canvas.create_line(p1[0], p1[1], p2[0], p2[1],
+                                    fill="red", width=2, tags="roi_polygon")
+        if not self.roi_points:
+            self.drawing_polygon = False
+        return "break"
+
     def finish_polygon(self, event):
         """Завершает рисование многоугольника"""
         if self.roi_mode == "polygon" and self.drawing_polygon and len(self.roi_points) >= 3:
@@ -3588,10 +3879,8 @@ class FreestyleParserApp:
         """Переключает режим ROI между прямоугольником и многоугольником"""
         self.roi_mode = mode
         self.clear_roi()
-        if mode == "rectangle":
-            self.label_roi.config(text="Выберите прямоугольную область интереса:")
-        else:
-            self.label_roi.config(text="Кликните по точкам многоугольника. Двойной клик завершает:")
+        self.label_roi.config(text="Выберите прямоугольную область интереса:"
+                              if mode == "rectangle" else "")
 
     def on_file_select(self, event):
         """Обработчик выбора файла в списке"""
@@ -4639,10 +4928,12 @@ class FreestyleParserApp:
         return True
 
     def refresh_canvas_from_folder(self):
-        """Показывает canvas.jpg текущей рабочей папки (или приложения) с сохранённым ROI"""
+        """Показывает canvas.jpg текущей рабочей папки с сохранённым ROI"""
         canvas_path = os.path.join(self.output_folder, "canvas.jpg")
         if not os.path.exists(canvas_path):
-            canvas_path = os.path.join(self._app_folder, "canvas.jpg")
+            # кадра из этой папки ещё нет - не показываем канвас прошлой папки
+            self.canvas.delete("all")
+            return False
         return self.show_canvas_with_roi(canvas_path)
 
     def create_canvas_from_video(self, video_path):
@@ -4811,11 +5102,11 @@ class FreestyleParserApp:
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder, exist_ok=True)
 
-        canvas_path_app = os.path.join(self._app_folder, "canvas.jpg")
-        canvas_path_out = os.path.join(self.output_folder, "canvas.jpg")
-        if os.path.exists(canvas_path_app) and not os.path.exists(canvas_path_out) :
-            shutil.copy(canvas_path_app, canvas_path_out)
-
+        # Новая папка без processing.yaml - чистый лист: ROI из предыдущей
+        # папки дня не переносим (камера/расстановка могли измениться)
+        fresh_folder = not os.path.exists(self.processing_config_file)
+        if fresh_folder:
+            self.roi = None
         self.load_processing_config()
         # Настраиваем логгер
         if not self.logger:
@@ -4851,10 +5142,13 @@ class VideoPreviewPopup:
     MAX_WIDTH = 960
 
     def __init__(self, app, video_path, start_file_sec, title, factor=1,
-                 attempt=None, live=False, live_index=0, interval=None):
+                 attempt=None, live=False, live_index=0, interval=None,
+                 clip_bytes=None):
         self.app = app
         self._path = video_path
         self.attempt = attempt
+        # оценка размера нарезки при просмотре из исходника (None = сам файл)
+        self._clip_bytes = clip_bytes or 0
         # Режим live (просмотр без сохранения): навигация по self.app.live_attempts,
         # кнопки сохранения (или клавиши A/S), границы попытки = интервал просмотра.
         # interval=(t0,t1) реальных секунд - для одиночного просмотра (кандидат)
@@ -4906,8 +5200,11 @@ class VideoPreviewPopup:
         tk.Label(bar, text="Space/клик - пауза   ← → ±2с   ↑ ↓ ±10с   "
                            "⇧↑ x2 (до x16)   ⇧↓ x0.5   Esc - закрыть",
                  fg='#666666').pack(side=tk.RIGHT, padx=6)
-        tk.Button(bar, text="Во внешний плеер",
-                  command=self.open_external).pack(side=tk.RIGHT, padx=6, pady=3)
+        ext_btn = tk.Button(bar, text="⧉", width=2,
+                            command=self.open_external)
+        ext_btn.pack(side=tk.RIGHT, padx=6, pady=3)
+        app._attach_tooltip(ext_btn, "Открыть во внешнем плеере\n"
+                                     "(macOS - QuickTime, Windows/Linux - VLC)")
 
         # Панель управления: повтор, автопереход, выбор атлета
         ctrl = tk.Frame(self.top)
@@ -4943,6 +5240,15 @@ class VideoPreviewPopup:
             cb.pack(side=tk.LEFT, padx=4)
             cb.config(state=tk.DISABLED)
         self._ctrl = ctrl
+        if self.attempt is not None and not self._live:
+            # рейтинг попытки прямо из плеера (как 👍/👎 на плитке)
+            self.rate_up_btn = tk.Button(ctrl, text='👍', width=3, bd=1,
+                                         command=lambda: self._rate('up'))
+            self.rate_up_btn.pack(side=tk.LEFT, padx=(10, 1))
+            self.rate_down_btn = tk.Button(ctrl, text='👎', width=3, bd=1,
+                                           command=lambda: self._rate('down'))
+            self.rate_down_btn.pack(side=tk.LEFT, padx=1)
+            self._refresh_rating_btns()
         if self.attempt is not None:
             self._rebuild_selector()
             # двухфазное удаление: 1-й клик - краснеет, 2-й - удаляет и закрывает
@@ -5074,6 +5380,7 @@ class VideoPreviewPopup:
         self.attempt = self.athlete_key = nxt
         self._load_video(src, 0.0, f"Попытка {nxt}")
         self._rebuild_selector()
+        self._refresh_rating_btns()
         if self.top.winfo_exists():
             if self.playing:
                 self._tick()
@@ -5135,6 +5442,7 @@ class VideoPreviewPopup:
             self.athlete_key = nxt
             self._load_video(src, 0.0, f"Попытка {nxt}")
             self._rebuild_selector()
+            self._refresh_rating_btns()
             if self.top.winfo_exists():
                 self._tick()
             return
@@ -5157,6 +5465,22 @@ class VideoPreviewPopup:
         """Подтверждение авто-привязки из плеера + обновление селектора"""
         self.app.confirm_assignment(key, athlete)
         self._sel_refresh()
+
+    def _rate(self, kind):
+        """Рейтинг 👍/👎 из плеера + синхронизация кнопок плеера"""
+        if not self.athlete_key:
+            return
+        self.app.rate_attempt(self.athlete_key, kind)
+        self._refresh_rating_btns()
+
+    def _refresh_rating_btns(self):
+        """Стиль кнопок рейтинга плеера по текущему состоянию попытки"""
+        if getattr(self, 'rate_up_btn', None) is None or not self.top.winfo_exists():
+            return
+        st = self.app.attempt_ratings.get(self.athlete_key) \
+            or {'up': False, 'down': False}
+        self.app.update_rating_button_style(
+            self.rate_up_btn, self.rate_down_btn, st)
 
     def _pause(self):
         """Пауза при открытии селектора атлета"""
@@ -5206,10 +5530,12 @@ class VideoPreviewPopup:
                 return True
         return False
 
-    def _load_video(self, video_path, start_file_sec=0.0, title=None):
+    def _load_video(self, video_path, start_file_sec=0.0, title=None,
+                    clip_bytes=None):
         """Загрузка нового клипа в то же окно плеера: чекбоксы, скорость,
         геометрия и позиция окна сохраняются."""
         self._path = video_path
+        self._clip_bytes = clip_bytes or 0
         self._disarm_delete()
         if getattr(self, '_after_id', None):
             try:
@@ -5269,6 +5595,9 @@ class VideoPreviewPopup:
         state = "▶" if self.playing else "⏸"
         total = f"/{self.total_real:.1f}с" if self.total_real > 0 else ""
         size = f" · {self._size_str}" if getattr(self, '_size_str', '') else ""
+        if getattr(self, '_clip_bytes', 0) > 0:
+            # просмотр из исходника: показываем и размер самой попытки
+            size += f" · попытка ≈{self.app._fmt_size(self._clip_bytes)}"
         self.status_var.set(f"{state} x{self.speed:g} реал "
                             f"{self._real_time():.1f}{total}{size}")
 
@@ -5321,7 +5650,8 @@ class VideoPreviewPopup:
             return
         self._load_video(src, t0 * self.factor,
                          f"Попытка {_live_num_str(la['num'])} · клип "
-                         f"{la['start']:.0f}–{la['end']:.0f}с — просмотр без сохранения")
+                         f"{la['start']:.0f}–{la['end']:.0f}с — просмотр без сохранения",
+                         clip_bytes=self.app._estimate_output_bytes(src, t1 - t0))
         self._inside = True
         self._refresh_live_ui()
 

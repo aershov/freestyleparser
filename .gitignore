@@ -9,3 +9,4 @@ temp/
 .idea
 *.pyc
 .DS_Store
+version.txt

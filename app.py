@@ -20,7 +20,21 @@ from Components import AthleteWidget
 import sys
 import traceback
 
-APP_VERSION = "1.3.2"
+def _load_app_version():
+    """Версия из version.txt, который build.py пишет из git-тега при сборке
+    (в бандле и рядом с исходниками). Fallback - 'dev'."""
+    try:
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(base, 'version.txt')) as f:
+            v = f.read().strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return 'dev'
+
+
+APP_VERSION = _load_app_version()
 
 THUMB_X = 180  # (не используется: превью хранятся полным кадром, UI масштабирует)
 THUMB_Y = 120

@@ -23,10 +23,27 @@ def build_app():
     # Базовые параметры PyInstaller
     # Разделитель src:dest в --add-data на Windows - ';' (':' там часть диска C:)
     data_sep = ';' if system == 'Windows' else ':'
+
+    # Версия: из тега CI (GITHUB_REF_NAME=v1.3.4) или последнего локального
+    # тега; попадает в version.txt внутри бандла, app.py показывает её в
+    # заголовке - вручную править нигде не нужно
+    version = os.environ.get('GITHUB_REF_NAME', '').lstrip('v') \
+        if os.environ.get('GITHUB_REF_TYPE') == 'tag' else ''
+    if not version:
+        try:
+            version = subprocess.check_output(
+                ['git', 'describe', '--tags', '--abbrev=0'],
+                stderr=subprocess.DEVNULL).decode().strip().lstrip('v')
+        except Exception:
+            version = 'dev'
+    with open('version.txt', 'w') as f:
+        f.write(version)
+
     pyinstaller_args = [
         '--name=FreestyleParser',
         '--windowed',
         '--clean',
+        f'--add-data=version.txt{data_sep}.',
         f'--add-data=requirements.txt{data_sep}.',
         f'--add-data=bin{data_sep}bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
         f'--add-data=models/yolo11s-seg.pt{data_sep}./models',  # модель YOLO внутри exe

@@ -19,9 +19,9 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; не требуем админа, если ставим только в Program Files - всё равно нужен;
 ; privileged для автозапуска не нужен
-OutputDir=dist
+OutputDir=..\dist
 OutputBaseFilename=FreestyleParser-setup-{#AppVersion}
-SetupIconFile=icon.ico
+SetupIconFile=..\icon.ico
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -38,7 +38,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
 
 [Files]
 ; содержимое onedir-сборки PyInstaller (dist/FreestyleParser/*)
-Source: "dist\FreestyleParser\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\FreestyleParser\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

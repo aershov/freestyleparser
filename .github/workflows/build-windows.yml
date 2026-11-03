@@ -41,6 +41,14 @@ jobs:
       - name: Zip dist (onedir)
         run: Compress-Archive -Path dist/FreestyleParser -DestinationPath dist/FreestyleParser-windows-x64.zip -Force
 
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0' }
+          & $iscc installer/freestyleparser.iss /DAppVersion=$tag
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -53,7 +61,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/FreestyleParser-windows-x64.zip
+          files: |
+            dist/FreestyleParser-windows-x64.zip
+            dist/FreestyleParser-setup-*.exe
 
   build-linux:
     # 22.04, а не latest (24.04): бинарь собранный на glibc 2.39 не запустится

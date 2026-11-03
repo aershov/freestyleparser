@@ -64,6 +64,7 @@ jobs:
           files: |
             dist/FreestyleParser-windows-x64.zip
             dist/FreestyleParser-setup-*.exe
+            tools/win-diagnostic.ps1
 
   build-linux:
     # 22.04, а не latest (24.04): бинарь собранный на glibc 2.39 не запустится

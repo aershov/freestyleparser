@@ -2462,6 +2462,9 @@ class FreestyleParserApp:
     def setup_ui(self):
         # === Основной контейнер с вертикальной ориентацией ===
         self.main_frame = tk.PanedWindow(self.root, orient=tk.VERTICAL)
+        # заметный шов: иначе на Windows границу панелей не видно и
+        # не за что ухватиться мышью (ресайз кажется сломанным)
+        self.main_frame.configure(sashwidth=6, sashrelief=tk.RAISED)
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # === Плавающий выбор языка в правом верхнем углу (в титлбар ОС
@@ -3012,7 +3015,7 @@ class FreestyleParserApp:
                 self.root.clipboard_append(txt)
 
         # Создаем текстовое поле для логов с прокруткой
-        self.log_text = tk.Text(self.frame_logs, height=10, wrap=tk.WORD)
+        self.log_text = tk.Text(self.frame_logs, height=6, wrap=tk.WORD)
         self.log_scrollbar = ttk.Scrollbar(self.frame_logs, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=self.log_scrollbar.set)
 
@@ -3313,10 +3316,21 @@ class FreestyleParserApp:
             self._logs_visible = False
         else:
             # Tk 9 не перераспределяет pane по reqsize - пересоздаём pane
-            # с явной высотой
+            # с явной высотой ~1/7 окна (1/8..1/6 экрана приложения);
+            # высоту переподтверждаем несколько раз - Tk 9 её теряет
+            h = max(140, int(self.root.winfo_height() / 7))
             self.main_frame.forget(self.frame_logs_wrap)
-            self.main_frame.add(self.frame_logs_wrap, height=180, minsize=100,
+            self.main_frame.add(self.frame_logs_wrap, height=h, minsize=100,
                                 stretch='never')
+
+            def _assert_height():
+                try:
+                    self.main_frame.paneconfigure(self.frame_logs_wrap,
+                                                  height=h)
+                except tk.TclError:
+                    pass
+            self.root.after(30, _assert_height)
+            self.root.after(200, _assert_height)
             self.logs_btn.config(text=i18n.tr('▾ Логи'))
             self._logs_visible = True
         self.logs_btn.lift()

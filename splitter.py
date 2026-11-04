@@ -1,4 +1,5 @@
 import cv2
+import i18n
 import numpy as np
 import os
 import sys
@@ -85,16 +86,18 @@ def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
     end1 = min(end_time + end_padding, real_duration)
 
     if end1 <= start1:
-        safe_print(f"  [SKIP] Попытка #{attempt_number}: start ({start1:.2f}s) >= end ({end1:.2f}s)")
+        safe_print(i18n.tr("  [SKIP] Попытка #{n}: start ({start:.2f}s) >= end ({end:.2f}s)",
+                           n=attempt_number, start=start1, end=end1))
         return None, attempt_number
 
     duration = end1 - start1
     if duration < min_duration:
-        safe_print(f"  [SKIP] Попытка #{attempt_number}: duration {duration:.2f}s < {min_duration}s")
+        safe_print(i18n.tr("  [SKIP] Попытка #{n}: duration {dur:.2f}s < {min}s",
+                           n=attempt_number, dur=duration, min=min_duration))
         return None, attempt_number
 
     if person_bbox is None:
-        safe_print(f"  [SKIP] Попытка #{attempt_number}: нет данных о позиции человека")
+        safe_print(i18n.tr("  [SKIP] Попытка #{n}: нет данных о позиции человека", n=attempt_number))
         return None, attempt_number
 
     x1, y1, x2, y2 = map(int, person_bbox)
@@ -165,7 +168,8 @@ def _seek_sample_iter(cap, fps_real, total_frames, sample_rate, range_start, ran
     быстрее полного декодирования: каждый seek декодирует не больше кадров,
     чем GOP. sample_rate - сэмплов в секунду реального времени."""
     step = max(1, int(round(fps_real / sample_rate)))
-    safe_print(f"  Скан точечным seek: шаг {step} кадров, ~{sample_rate:.1f}/с реальных")
+    safe_print(i18n.tr("  Скан точечным seek: шаг {step} кадров, ~{rate:.1f}/с реальных",
+                       step=step, rate=sample_rate))
     start_f = int(range_start * fps_real) if range_start and range_start > 0 else 0
     end_f = total_frames if range_end is None else min(total_frames, int(range_end * fps_real))
     pos = start_f
@@ -181,14 +185,17 @@ def _grab_sample_iter(cap, fps_container, fps_real, total_frames, frame_skip,
                       range_start, range_end):
     """Генератор сэмплов из полного декодирования (как раньше).
     Декодируется каждый frame_skip-й кадр; сэмплы в реальных секундах."""
-    safe_print(f"  FPS: {fps_container:.1f}, реальный fps: {fps_real:.1f}, "
-               f"frame_skip: {frame_skip}, анализ: {fps_real / frame_skip:.1f}/с")
+    safe_print(i18n.tr("  FPS: {container:.1f}, реальный fps: {real:.1f}, "
+                       "frame_skip: {skip}, анализ: {rate:.1f}/с",
+                       container=fps_container, real=fps_real, skip=frame_skip,
+                       rate=fps_real / frame_skip))
     start_frame = 0
     if range_start and range_start > 0:
         start_frame = int(range_start * fps_real)
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            safe_print(f"  Старт с кадра {start_frame} (диапазон от {range_start:.1f}s)")
+            safe_print(i18n.tr("  Старт с кадра {frame} (диапазон от {start:.1f}s)",
+                               frame=start_frame, start=range_start))
     frame_index = start_frame
     while True:
         if not cap.grab():
@@ -393,7 +400,8 @@ class _Detector:
                     if detection_start_time - (self.end_time or 0) >= self.min_pause:
                         self.in_attempt = True
                         self.start_time = detection_start_time
-                        safe_print(f"  [START] Попытка #{self.attempt_number} на {self.start_time:.2f}s")
+                        safe_print(i18n.tr("  [START] Попытка #{n} на {t:.2f}s",
+                                           n=self.attempt_number, t=self.start_time))
         else:
             self.detection_window.append(0)
             self.frames_out_of_attempt += 1
@@ -429,7 +437,9 @@ class _Detector:
         """Финализирует незакрытую попытку на конце файла/диапазона."""
         if self.in_attempt and self.start_time is not None:
             end_time = self.real_duration if self.range_end is None else min(self.real_duration, self.range_end)
-            safe_print(f"  [{os.path.basename(self.video_file)}] Финализация попытки #{self.attempt_number} на конце ({end_time:.1f}s)")
+            safe_print(i18n.tr("  [{file}] Финализация попытки #{n} на конце ({t:.1f}s)",
+                               file=os.path.basename(self.video_file),
+                               n=self.attempt_number, t=end_time))
             return self._finalize(self.start_time, end_time)
         return None
 
@@ -468,7 +478,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         safe_print(f"Processing {video_file}...")
         cap = open_capture(video_file)
         if not cap.isOpened():
-            safe_print(f"  Не удалось открыть файл: {video_file}")
+            safe_print(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
             continue
 
         fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -476,8 +486,9 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         fps_real = fps_container * slowmo_factor if slowmo_factor > 1 else fps_container
         real_duration = total_frames / fps_real if fps_real > 0 else 0.0
         if slowmo_factor > 1:
-            safe_print(f"  Слоумо-видео (замедление 1/{slowmo_factor}): "
-                       f"fps контейнера {fps_container:.1f} -> реальный fps {fps_real:.1f}")
+            safe_print(i18n.tr("  Слоумо-видео (замедление 1/{factor}): "
+                               "fps контейнера {container:.1f} -> реальный fps {real:.1f}",
+                               factor=slowmo_factor, container=fps_container, real=fps_real))
 
         if scan_mode:
             # Скан: редкие сэмплы точечным seek - не декодируем весь файл
@@ -504,7 +515,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         sample_index = 0
         for real_sec, frame, pos, pos_total in sample_iter:
             if should_continue is not None and not should_continue():
-                safe_print("  Остановка обработки по запросу пользователя")
+                safe_print(i18n.tr("  Остановка обработки по запросу пользователя"))
                 cap.release()
                 return
             sample_index += 1

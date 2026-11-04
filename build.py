@@ -51,6 +51,7 @@ def build_app():
         f'--add-data=models/osnet_x1_0_combineall.pth{data_sep}./models',  # OSNet-веса
         f'--add-data=models/osnet_ain_x1_0_msmt17.pth{data_sep}./models',  # для 'Определять атлетов'
         f'--add-data=icon.ico{data_sep}.',  # иконка окна приложения
+        f'--add-data=locales{data_sep}locales',  # переводы UI (ru/en)
         '--collect-all=ultralytics',  # конфиги и данные пакета, без них импорт падает
         '--collect-all=scipy',  # у scipy ленивые импорты (array_api_compat и т.п.) - иначе ModuleNotFoundError в exe
         '--collect-all=supervision',  # ByteTrack в attempts_v2; пакет импортируется только из воркеров - PyInstaller его не видит сам

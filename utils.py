@@ -7,6 +7,7 @@ import subprocess
 import shutil
 import tempfile
 import cv2
+import i18n
 import numpy as np
 from collections import defaultdict
 import re
@@ -396,41 +397,41 @@ def hsv_to_name0(h, s, v):
 
     # Ахроматический цвет (серый)
     if s < 20:
-        return "серый"
+        return i18n.tr("серый")
 
     # Яркость очень низкая → чёрный
     if v < 30:
-        return "черный"
+        return i18n.tr("черный")
 
     # Яркость высокая, но нет насыщенности → белый
     if s < 30 and v > 180:
-        return "белый"
+        return i18n.tr("белый")
 
     # === Цвета по Hue (H) ===
     if h < 5 or h > 170:
-        return "красный"
+        return i18n.tr("красный")
     elif h < 15:
-        return "оранжевый"
+        return i18n.tr("оранжевый")
     elif h < 35:
-        return "желтый"
+        return i18n.tr("желтый")
     elif h < 85:
         # Зеленый диапазон: 35–85
         if v > 150:
-            return "светло-зеленый"
+            return i18n.tr("светло-зеленый")
         else:
-            return "темно-зеленый"
+            return i18n.tr("темно-зеленый")
     elif h < 130:
         # Синий диапазон: 85–130
         if s > 100:
-            return "синий"
+            return i18n.tr("синий")
         else:
             if  v < 50:
-                return "черный"
-            return "голубой"
+                return i18n.tr("черный")
+            return i18n.tr("голубой")
     elif h < 150:
-        return "фиолетовый"
+        return i18n.tr("фиолетовый")
     else:
-        return "розовый"
+        return i18n.tr("розовый")
 
 def extract_athlete_difference(frame_bg, frame_with, bbox=None):
     """
@@ -529,60 +530,60 @@ def hsv_to_name(h, s, v):
     # --- Ахроматические цвета ---
     if s < 30:
         if v > 230:
-            return "белый"
+            return i18n.tr("белый")
         elif v < 30:
-            return "черный"
+            return i18n.tr("черный")
         else:
-            return "серый"
+            return i18n.tr("серый")
 
     # --- Яркость низкая → темные цвета ---
     if v < 80:
         if h < 15 or h > 165:
-            return "темно-красный"
+            return i18n.tr("темно-красный")
         elif h < 35:
-            return "темно-оранжевый"
+            return i18n.tr("темно-оранжевый")
         elif h < 85:
-            return "темно-зеленый"
+            return i18n.tr("темно-зеленый")
         elif h < 130:
-            return "темно-синий"
+            return i18n.tr("темно-синий")
         elif h < 150:
-            return "фиолетовый"
+            return i18n.tr("фиолетовый")
         else:
-            return "розовый"
+            return i18n.tr("розовый")
 
     # --- Средняя яркость ---
     elif v < 200:
         if h < 5 or h > 170:
-            return "красный"
+            return i18n.tr("красный")
         elif h < 25:
-            return "оранжевый"
+            return i18n.tr("оранжевый")
         elif h < 35:
-            return "желтый"
+            return i18n.tr("желтый")
         elif h < 85:
-            return "зеленый"
+            return i18n.tr("зеленый")
         elif h < 130:
-            return "синий"
+            return i18n.tr("синий")
         elif h < 150:
-            return "фиолетовый"
+            return i18n.tr("фиолетовый")
         else:
-            return "розовый"
+            return i18n.tr("розовый")
 
     # --- Высокая яркость → светлые тона ---
     else:
         if h < 5 or h > 170:
-            return "розово-красный"
+            return i18n.tr("розово-красный")
         elif h < 25:
-            return "оранжевый"
+            return i18n.tr("оранжевый")
         elif h < 35:
-            return "желтый"
+            return i18n.tr("желтый")
         elif h < 85:
-            return "светло-зеленый"
+            return i18n.tr("светло-зеленый")
         elif h < 130:
-            return "светло-синий"
+            return i18n.tr("светло-синий")
         elif h < 150:
-            return "светло-фиолетовый"
+            return i18n.tr("светло-фиолетовый")
         else:
-            return "светло-розовый"
+            return i18n.tr("светло-розовый")
 
 
 def hsv_to_name1(h,s,v):

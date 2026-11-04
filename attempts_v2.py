@@ -15,6 +15,7 @@
 - dino:   усреднённый DINOv2-эмбеддинг маскированного кропа
 """
 import argparse
+import i18n
 import json
 import os
 from collections import defaultdict, deque
@@ -352,7 +353,8 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
         nonlocal last_closed_end
         last_closed_end = max(last_closed_end or 0.0, a.end)
         if a.end - a.start < min_dur:
-            msg = f'  [drop] {a.start:.1f}-{a.end:.1f}s: короче {min_dur}с'
+            msg = i18n.tr('  [drop] {start:.1f}-{end:.1f}s: короче {dur}с',
+                          start=a.start, end=a.end, dur=min_dur)
             print(msg)
             if log_cb is not None:
                 log_cb(msg)
@@ -550,10 +552,13 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
                     break  # решение о склейке - в конце файла
                 a = pending.pop(0)
                 b1, b2 = dominant_bin(a), dominant_bin(pending[0])
-                msg = (f'  [no merge] {a.start:.1f}-{a.end:.1f}s и '
-                       f'{pending[0].start:.1f}-{pending[0].end:.1f}s: '
-                       f'лодка {b1 * 10 if b1 is not None else "-"}°/'
-                       f'{b2 * 10 if b2 is not None else "-"}°, gap={pending[0].start - a.end:.1f}с')
+                msg = i18n.tr('  [no merge] {s1:.1f}-{e1:.1f}s и {s2:.1f}-{e2:.1f}s: '
+                              'лодка {b1}°/{b2}°, gap={gap:.1f}с',
+                              s1=a.start, e1=a.end,
+                              s2=pending[0].start, e2=pending[0].end,
+                              b1=b1 * 10 if b1 is not None else '-',
+                              b2=b2 * 10 if b2 is not None else '-',
+                              gap=pending[0].start - a.end)
                 print(msg)
                 if log_cb is not None:
                     log_cb(msg)
@@ -660,7 +665,8 @@ def process_video(input_path, output, roi=None, scale=0.4, no_embed=False,
     # финальная склейка соседних и сброс остатка
     while len(pending) >= 2 and mergeable(pending[0], pending[1]):
         a, b = pending.pop(0), pending.pop(0)
-        msg = f'  [merge] {a.start:.1f}-{a.end:.1f}s + {b.start:.1f}-{b.end:.1f}s: одна попытка'
+        msg = i18n.tr('  [merge] {a1:.1f}-{a2:.1f}s + {b1:.1f}-{b2:.1f}s: одна попытка',
+                      a1=a.start, a2=a.end, b1=b.start, b2=b.end)
         print(msg)
         if log_cb is not None:
             log_cb(msg)

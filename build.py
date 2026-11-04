@@ -57,6 +57,7 @@ def build_app():
         '--collect-all=scipy',  # у scipy ленивые импорты (array_api_compat и т.п.) - иначе ModuleNotFoundError в exe
         '--collect-all=supervision',  # ByteTrack в attempts_v2; пакет импортируется только из воркеров - PyInstaller его не видит сам
         '--collect-all=lap',  # C-расширение, нужное supervision.ByteTrack
+        '--collect-all=torchreid',  # OSNet-реид в Embedder; импортируется лениво из воркеров
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',
         '--hidden-import=numpy',

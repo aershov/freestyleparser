@@ -45,6 +45,7 @@ six==1.17.0
 supervision==0.25.1
 sympy==1.14.0
 torch==2.7.0
+torchreid==0.2.5
 torchvision==0.22.0
 tqdm==4.67.1
 typing_extensions==4.13.2

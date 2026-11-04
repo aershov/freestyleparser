@@ -127,25 +127,25 @@ jobs:
           files: dist/FreestyleParser-linux-x64
 
   build-macos:
-    # Apple Silicon (arm64): macos-14+ раннеры - arm64.
-    # Приложение ad-hoc подписано (build.py) - без нотаризации Gatekeeper
-    # ругается при первом запуске, обход описан в README
+    # Homebrew-питон с Tcl/Tk 9: инсталляторы python.org (actions/setup-python)
+    # бандлят Tk 8.6, а код рассчитан на Tk 9 (<TouchpadScroll> и т.п.);
+    # локальная dev-сборка - тоже brew python 3.13 + Tk 9.0
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
+      # python3.13 -> brew -> tcl-tk 9; venv кладём в PATH, дальше
+      # все шаги вызывают python/pip уже из него
+      - name: Setup Python (Homebrew, Tcl/Tk 9)
+        run: |
+          brew install python@3.13
+          python3.13 -m venv env
+          echo "$PWD/env/bin" >> "$GITHUB_PATH"
+          python --version
+          python -c "import tkinter; assert tkinter.TkVersion >= 9.0, tkinter.TkVersion; print('Tk OK:', tkinter.TkVersion)"
+
       - name: Check locales
         run: python tools/check_locales.py
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # Как в Linux-джобе: Tkinter именно этого питона попадёт в бандл
-      - name: Smoke-test Tkinter
-        run: >-
-          python -c "import tkinter; root = tkinter.Tk();
-          print('Tk OK:', root.tk.call('tk', 'windowingsystem')); root.destroy()"
 
       - name: Install dependencies
         run: |

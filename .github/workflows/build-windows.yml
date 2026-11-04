@@ -134,15 +134,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # python3.13 -> brew -> tcl-tk 9; venv кладём в PATH, дальше
-      # все шаги вызывают python/pip уже из него
+      # python3.13 -> brew -> tcl-tk 9; пин к кегу brew: голый python3.13
+      # на раннере может оказаться CLT-питоном без tkinter (стало причиной
+      # v1.3.14: бандл без tkinter, приложение падало на старте)
       - name: Setup Python (Homebrew, Tcl/Tk 9)
         run: |
           brew install python@3.13
-          python3.13 -m venv env
+          PY="$(brew --prefix python@3.13)/bin/python3.13"
+          "$PY" -m venv env
           echo "$PWD/env/bin" >> "$GITHUB_PATH"
-          python --version
-          python -c "import tkinter; assert tkinter.TkVersion >= 9.0, tkinter.TkVersion; print('Tk OK:', tkinter.TkVersion)"
+          # проверяем именно venv-питон, из которого пойдёт PyInstaller;
+          # GITHUB_PATH на текущий шаг ещё не действует - python тут другой
+          env/bin/python -c "import sys, tkinter; print(sys.executable); assert tkinter.TkVersion >= 9.0, tkinter.TkVersion; print('Tk OK:', tkinter.TkVersion)"
 
       - name: Check locales
         run: python tools/check_locales.py
@@ -158,6 +161,10 @@ jobs:
 
       - name: Build .app
         run: python build.py
+
+      # v1.3.14: tkinter не попал в бандл, приложение падало на старте
+      - name: Verify tkinter in bundle
+        run: find dist/FreestyleParser.app -name "_tkinter*" | grep . || exit 1
 
       - name: Build DMG
         run: |

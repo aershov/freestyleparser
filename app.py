@@ -259,7 +259,6 @@ class FreestyleParserApp:
         # Создаем интерфейс
         self.setup_ui()
         self._setup_window_icon()
-        self._restore_selected_files()
         if os.path.exists(self.output_folder):
             self.on_output_folder_changed()
         else:
@@ -433,6 +432,7 @@ class FreestyleParserApp:
             files = []
         self._set_selected_files(files)
         if not self.selected_files:
+            self.current_video_for_roi = None
             return
         existing = [f for f in self.selected_files if os.path.exists(f)]
         if existing:
@@ -5097,6 +5097,9 @@ class FreestyleParserApp:
             menu.tk_popup(event.x_root, event.y_root)
 
     def display_image(self, cv_image):
+        # очистка обязательна: иначе новое изображение ляжет поверх старого
+        # вместе с ROI-фигурами прошлой папки (переключение дней)
+        self.canvas.delete("all")
         bgr_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(bgr_image)
         self.photo = ImageTk.PhotoImage(image)
@@ -5534,11 +5537,14 @@ class FreestyleParserApp:
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder, exist_ok=True)
 
-        # Новая папка без processing.yaml - чистый лист: ROI из предыдущей
-        # папки дня не переносим (камера/расстановка могли измениться)
+        # Новая папка без processing.yaml - чистый лист: ROI и выбор файлов
+        # из предыдущей папки дня не переносим (камера/расстановка могли
+        # измениться, исходники относятся к другому дню)
         fresh_folder = not os.path.exists(self.processing_config_file)
         if fresh_folder:
             self.roi = None
+            self._set_selected_files([])
+            self.current_video_for_roi = None
         self.load_processing_config()
         # Настраиваем логгер
         if not self.logger:

@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
+import i18n
 import os
 import yaml
 
@@ -158,12 +159,12 @@ class AthleteWidget(tk.Frame):
     def show_context_menu(self, event):
         """Показывает контекстное меню"""
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Удалить", command=self.delete_athlete)
+        menu.add_command(label=i18n.tr("Удалить"), command=self.delete_athlete)
         menu.post(event.x_root, event.y_root)
     
     def delete_athlete(self):
         """Удаляет атлета"""
-        if messagebox.askyesno("Подтверждение", f"Удалить атлета {self.name}?"):
+        if messagebox.askyesno(i18n.tr("Подтверждение"), i18n.tr("Удалить атлета {name}?", name=self.name)):
             # Удаляем из маппинга
             if self.name in self.master_app.athlete_mapping:
                 del self.master_app.athlete_mapping[self.name]
@@ -183,7 +184,7 @@ class AthleteWidget(tk.Frame):
         attempts = self.master_app.athlete_mapping.get(self.name, [])
         self.tooltip = tk.Label(
             self,
-            text=f"Попыток: {len(attempts)}",
+            text=i18n.tr("Попыток: {count}", count=len(attempts)),
             bg='#ffffe0',
             relief=tk.SOLID,
             borderwidth=1

@@ -40,6 +40,13 @@ FreestyleParser — это инструмент для автоматическ�
   chmod +x FreestyleParser-linux-x64
   ./FreestyleParser-linux-x64
   ```
+- **macOS** (Apple Silicon, M1 и новее): `FreestyleParser-macos-arm64.dmg` — открыть dmg и перетащить `FreestyleParser.app` в Applications.
+
+  Приложение ad-hoc подписано, поэтому Gatekeeper при первом запуске заблокирует его. Обход:
+  ```bash
+  xattr -cr /Applications/FreestyleParser.app
+  ```
+  (или ПКМ по приложению → «Открыть» → подтвердить в диалоге).
 
 ## Установка
 1. Создайте виртуальное окружение:

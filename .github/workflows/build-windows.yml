@@ -137,9 +137,11 @@ jobs:
       # python3.13 -> brew -> tcl-tk 9; пин к кегу brew: голый python3.13
       # на раннере может оказаться CLT-питоном без tkinter (стало причиной
       # v1.3.14: бандл без tkinter, приложение падало на старте)
+      # python-tk@3.13 тянет tcl-tk 9; сам python@3.13 tkinter НЕ содержит -
+      # без python-tk в бандле не окажется _tkinter (v1.3.14) и ассерт упадёт
       - name: Setup Python (Homebrew, Tcl/Tk 9)
         run: |
-          brew install python@3.13
+          brew install python@3.13 python-tk@3.13
           PY="$(brew --prefix python@3.13)/bin/python3.13"
           "$PY" -m venv env
           echo "$PWD/env/bin" >> "$GITHUB_PATH"

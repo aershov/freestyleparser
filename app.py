@@ -3010,10 +3010,6 @@ class FreestyleParserApp:
             if txt:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(txt)
-        log_menu.add_command(label=i18n.tr("Копировать"),
-                             command=_log_copy_selection)
-        log_menu.add_command(label=i18n.tr("Копировать всё"),
-                             command=_log_copy_all)
 
         # Создаем текстовое поле для логов с прокруткой
         self.log_text = tk.Text(self.frame_logs, height=10, wrap=tk.WORD)

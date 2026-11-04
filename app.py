@@ -269,6 +269,9 @@ class FreestyleParserApp:
                   f"выберите день (📅) или папку (Изменить)")
         # Запускаем периодическое обновление
         self.root.after(1000, self.periodic_update)
+        # после отрисовки окна: пересчитать колонки сетки попыток
+        # по реальной ширине (до маппинга winfo_width() == 1)
+        self.root.after_idle(self._maybe_relayout_attempts)
 
     def _setup_window_icon(self):
         """Иконка окна: icon.ico рядом с app.py (в exe - из распакованного бандла)"""
@@ -284,6 +287,16 @@ class FreestyleParserApp:
         """Периодическое обновление интерфейса (таймер живёт даже при
         ошибке отрисовки - иначе панель попыток замирает до перезапуска)"""
         try:
+            # детект выхода из сна: тик раз в секунду, большой скачок
+            # времени означает, что машина спала (обработка прервана)
+            now = time.time()
+            last = getattr(self, '_last_tick_t', None)
+            self._last_tick_t = now
+            if last is not None and now - last > 30:
+                self.log(i18n.tr("Компьютер выходил из спящего режима. "
+                                 "Если обработка остановилась - запустите её "
+                                 "снова: уже обработанные файлы пропускаются, "
+                                 "доделается только остаток."), logging.WARNING)
             if self.need_update_attempts:
                 self.update_attempt_thumbnails()
                 self.need_update_attempts = False
@@ -501,15 +514,71 @@ class FreestyleParserApp:
                  "файлов: {n}", strategy=strategy, state=state, mins=mins,
                  secs=secs, n=len(files)))
 
+    def _is_processed(self, video_path, strategy):
+        """Файл уже полностью обработан этой стратегией (отметка в
+        processed.yaml ставится только после успешного прогона файла)."""
+        mark = self._load_processed().get(os.path.basename(video_path))
+        return bool(mark and mark.get('strategy') == strategy)
+
+    # === Журнал нарезанных попыток (папка дня, attempts_index.yaml) ===
+
+    def _attempts_index_file(self):
+        return os.path.join(self.output_folder, 'attempts_index.yaml')
+
+    def _load_attempts_index(self):
+        """[{number, source, start, end}] - что уже нарезано в этой папке."""
+        f = self._attempts_index_file()
+        if os.path.exists(f):
+            try:
+                with open(f, encoding='utf-8') as fh:
+                    data = yaml.safe_load(fh) or {}
+                return data.get('attempts') or []
+            except Exception:
+                pass
+        return []
+
+    def _attempt_already_cut(self, source_video, start):
+        """Попытка из этого исходника около времени start уже нарезана
+        (защита от дублей при докатке прерванного файла: недоконченный
+        файл пересканируется целиком, а его попытки уже на диске).
+        Допуск 2с: границы детекции между прогонами слегка гуляют,
+        а соседние попытки разделены минимум min_pause."""
+        src = os.path.basename(source_video)
+        for a in self._load_attempts_index():
+            if a.get('source') == src and \
+                    abs(float(a.get('start', 0)) - start) < 2.0:
+                return True
+        return False
+
+    def _record_attempt(self, attempt):
+        """Пишет попытку в attempts_index.yaml (атомарно: tmp + replace),
+        сразу после успешной вырезки."""
+        entries = self._load_attempts_index()
+        entries.append({'number': attempt.number,
+                        'source': os.path.basename(attempt.source_video),
+                        'start': float(attempt.start),
+                        'end': float(attempt.end)})
+        try:
+            tmp = self._attempts_index_file() + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                yaml.dump({'attempts': entries}, fh, allow_unicode=True)
+            os.replace(tmp, self._attempts_index_file())
+        except Exception as e:
+            self.log(i18n.tr("Не удалось записать журнал попыток: {err}", err=e),
+                     logging.WARNING)
+
     def _mark_processed(self, video_path, strategy):
-        """Отмечает исходник обработанным (после успешного прогона файла)."""
+        """Отмечает исходник обработанным (после успешного прогона файла).
+        Атомарная запись: обрыв питания не оставит битый yaml."""
         data = self._load_processed()
         data[os.path.basename(video_path)] = {
             'strategy': strategy,
             'when': datetime.datetime.now().isoformat(timespec='seconds')}
         try:
-            with open(self._processed_file(), 'w', encoding='utf-8') as fh:
+            tmp = self._processed_file() + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
                 yaml.dump(data, fh, allow_unicode=True)
+            os.replace(tmp, self._processed_file())
         except Exception as e:
             self.log(i18n.tr("Не удалось записать отметку обработки: {err}", err=e), logging.WARNING)
         self.need_update_files = True
@@ -760,6 +829,12 @@ class FreestyleParserApp:
 
     def on_attempt_file_created(self, attempt):
         ## TODO analyze best_frame
+        if self._attempt_already_cut(attempt.source_video, attempt.start):
+            # докатка прерванного прогона: эта попытка уже нарезана
+            self.log(i18n.tr("Попытка {attempt} ({src} ~{start:.0f}с) уже нарезана - пропускаю",
+                             attempt=attempt.number, src=os.path.basename(attempt.source_video),
+                             start=attempt.start))
+            return self.processing
         imwrite_unicode(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
         # cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
         # person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
@@ -778,6 +853,7 @@ class FreestyleParserApp:
                                 output_file, slowmo,
                                 i18n.tr("попытка {attempt:04d}", attempt=attempt.number)):
             return self.processing
+        self._record_attempt(attempt)
 
         self.need_update_attempts = True
         self.log(i18n.tr("Видео попытки готово: {file}", file=output_file))
@@ -803,19 +879,31 @@ class FreestyleParserApp:
 
 
     def process_videos(self):
-        """Обрабатывает видео в отдельном потоке (авто-режим: нарезать всё)"""
+        """Обрабатывает видео в отдельном потоке (авто-режим: нарезать всё).
+        Повторный запуск после прерывания (сон, кнопка Стоп) продолжает:
+        файлы с отметкой processed.yaml пропускаются."""
         t0 = time.time()
         try:
             from splitter import process_video
+            files = [f for f in self.selected_files
+                     if not self._is_processed(f, 'auto')]
+            skipped = len(self.selected_files) - len(files)
+            if skipped:
+                self.log(i18n.tr("{n} файл(ов) уже обработаны - пропускаю, "
+                                 "доделывается остаток", n=skipped))
+            if not files:
+                self.log(i18n.tr("Все выбранные файлы уже обработаны - "
+                                 "нечего делать (отметки в processed.yaml)"))
+                return
             next_attempt_number = get_next_attempt_number(self.output_folder)
-            process_video(self.selected_files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
+            process_video(files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
                           next_attempt_number, params=self.processing_params,
                           progress_callback=self.on_processing_progress,
                           should_continue=lambda: self.processing,
                           slowmo_factor=self._active_slowmo_factor)
-            self.log(i18n.tr("Файлы {files} успешно обработаны.", files=self.selected_files))
+            self.log(i18n.tr("Файлы {files} успешно обработаны.", files=files))
             if self.processing:
-                for f in self.selected_files:
+                for f in files:
                     self._mark_processed(f, 'auto')
             self._log_processing_summary(i18n.tr("Нарезка всех попыток (авто)"),
                                          self.selected_files, t0, self.processing)
@@ -1440,6 +1528,11 @@ class FreestyleParserApp:
             def on_attempt_found(r):
                 """Прогрессивная нарезка: попытка режется сразу после закрытия."""
                 nonlocal number
+                # докатка прерванного прогона: не расходуем номер на дубль
+                if self._attempt_already_cut(r['source'], r['start']):
+                    self.log(i18n.tr("Попытка ({src} ~{start:.0f}с) уже нарезана - пропускаю",
+                                     src=os.path.basename(r['source']), start=r['start']))
+                    return
                 # preroll = start_pad (2с до входа) — даёт каякеру появиться во 2й секунде
                 preroll = max(0.0, r['start'] - start_pad)
                 # thumbnail: кадр, где атлет ближе всего к центру ROI
@@ -1481,6 +1574,12 @@ class FreestyleParserApp:
                 if not self.processing:
                     break
                 base = os.path.splitext(os.path.basename(video_path))[0]
+                if self._is_processed(video_path, 'attempts'):
+                    # продолжение прерванного прогона: файл уже нарезан
+                    self.log(i18n.tr("[{i}/{n}] {file}: уже обработан - пропускаю",
+                                     i=file_index + 1, n=len(self.selected_files),
+                                     file=os.path.basename(video_path)))
+                    continue
                 self.log(i18n.tr("[{i}/{n}] "
                                  "Поиск попыток: {file} ...", i=file_index + 1,
                                  n=len(self.selected_files),
@@ -1661,6 +1760,12 @@ class FreestyleParserApp:
             for file_index, video_path in enumerate(self.selected_files):
                 if not self.processing:
                     break
+                if self._is_processed(video_path, 'athletes'):
+                    # продолжение прерванного прогона: сегменты файла уже есть
+                    self.log(i18n.tr("[{i}/{n}] {file}: уже обработан - пропускаю",
+                                     i=file_index + 1, n=len(self.selected_files),
+                                     file=os.path.basename(video_path)))
+                    continue
                 base = os.path.splitext(os.path.basename(video_path))[0]
                 self.log(i18n.tr("[{i}/{n}] "
                                  "Скан атлетов: {file} ...", i=file_index + 1,
@@ -1755,6 +1860,7 @@ class FreestyleParserApp:
                 'start': float(attempt.start),
                 'end': float(attempt.end),
                 'thumbnail': thumb_path,
+                'num': idx,
                 'selected': True,
                 'status': 'pending',
             })
@@ -1767,6 +1873,23 @@ class FreestyleParserApp:
 
     def _candidate_key(self, cand):
         return (cand['file'], round(cand['start'], 2))
+
+    def _candidate_num(self, cand):
+        """Номер кандидата для показа (#003): из cand['num'], для старых
+        записей candidates.yaml - из имени превью cand_NNN.jpg."""
+        num = int(cand.get('num') or 0)
+        if not num:
+            m = re.search(r'cand_(\d+)',
+                          os.path.basename(cand.get('thumbnail') or ''))
+            num = int(m.group(1)) if m else 0
+        return num
+
+    def _candidate_title(self, cand):
+        """Заголовок окна плеера кандидата: исходник, номер, диапазон, длительность"""
+        stem = os.path.splitext(os.path.basename(cand['file']))[0]
+        dur = max(0.0, float(cand['end']) - float(cand['start']))
+        return (f"{stem} · #{self._candidate_num(cand):03d} · "
+                f"{cand['start']:.0f}–{cand['end']:.0f}s · {dur:.0f}с")
 
     def on_candidate_checkbox_change(self, cand, var):
         cand['selected'] = var.get()
@@ -1950,6 +2073,7 @@ class FreestyleParserApp:
                 {'file': c['file'], 'start': c['start'], 'end': c['end'],
                  'thumbnail': self.get_relative_path(c['thumbnail'])
                  if c.get('thumbnail') else None,
+                 'num': c.get('num'),
                  'selected': bool(c.get('selected')),
                  'status': c['status']}
                 for c in self.candidates]}
@@ -1979,6 +2103,7 @@ class FreestyleParserApp:
                         'start': float(c.get('start', 0)),
                         'end': float(c.get('end', 0)),
                         'thumbnail': thumb,
+                        'num': int(c.get('num') or 0),
                         'selected': bool(c.get('selected')),
                         'status': c.get('status', 'pending'),
                     })
@@ -2043,6 +2168,7 @@ class FreestyleParserApp:
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
+        self._day_log_handler = file_handler
         try:
             os.makedirs(self._app_folder, exist_ok=True)
             stable_handler = logging.FileHandler(
@@ -2056,6 +2182,29 @@ class FreestyleParserApp:
         self.gui_handler = GuiLogHandler(self)
         self.gui_handler.setFormatter(formatter)
         self.logger.addHandler(self.gui_handler)
+
+    def _redirect_day_log(self):
+        """Перенаправляет день-хендлер логгера в текущую папку дня:
+        setup_logger вызывается один раз, без этого логи всех дней
+        падали в processing.log папки первой сессии."""
+        if not self.logger:
+            return
+        try:
+            new_path = os.path.abspath(
+                os.path.join(self.output_folder, "processing.log"))
+            h = getattr(self, '_day_log_handler', None)
+            if h is not None and getattr(h, 'baseFilename', None) == new_path:
+                return
+            if h is not None:
+                self.logger.removeHandler(h)
+                h.close()
+            fh = logging.FileHandler(new_path)
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(fh)
+            self._day_log_handler = fh
+        except OSError:
+            pass
 
     def get_relative_path(self, path):
         """Преобразует абсолютный путь в относительный относительно output_folder"""
@@ -2691,8 +2840,15 @@ class FreestyleParserApp:
             lambda e: self.attempts_canvas.configure(scrollregion=self.attempts_canvas.bbox("all"))
         )
 
-        self.attempts_canvas.create_window((0, 0), window=self.attempts_scrollable_frame, anchor="nw")
+        self._attempts_win = self.attempts_canvas.create_window(
+            (0, 0), window=self.attempts_scrollable_frame, anchor="nw")
         self.attempts_canvas.configure(yscrollcommand=self.attempts_scrollbar.set)
+        # динамическое число колонок: пересчёт по ширине канваса
+        # (ресайз окна, таскание sash, скрытие/показ атлетов - всё
+        # приходит сюда как <Configure>)
+        self._attempts_cols_current = 4
+        self._attempts_relayout_job = None
+        self.attempts_canvas.bind("<Configure>", self._on_attempts_canvas_configure)
 
         # Размещаем canvas и scrollbar
         self.attempts_canvas.pack(side="left", fill="both", expand=True)
@@ -2832,6 +2988,33 @@ class FreestyleParserApp:
         self._logs_visible = False
         self.main_frame.paneconfigure(self.frame_logs_wrap, hide=True)
 
+        # Копирование из панели логов: на Windows Ctrl+C в readonly Text
+        # работает нестабильно - даём явные способы (кнопка + правый клик)
+        copy_bar = tk.Frame(self.frame_logs)
+        copy_bar.pack(side="top", fill="x")
+        def _log_copy_all():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.log_text.get('1.0', 'end-1c'))
+            self.log(i18n.tr("Логи скопированы в буфер обмена"))
+        copy_btn = tk.Button(copy_bar, text=i18n.tr("📋 Копировать всё"),
+                             command=_log_copy_all)
+        copy_btn.pack(side="right", padx=4, pady=2)
+        self._attach_tooltip(copy_btn,
+                             i18n.tr("Скопировать весь лог в буфер обмена\n"
+                                     "(правый клик по тексту - копировать выделенное)"))
+        def _log_copy_selection():
+            try:
+                txt = self.log_text.get('sel.first', 'sel.last')
+            except tk.TclError:
+                return
+            if txt:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(txt)
+        log_menu.add_command(label=i18n.tr("Копировать"),
+                             command=_log_copy_selection)
+        log_menu.add_command(label=i18n.tr("Копировать всё"),
+                             command=_log_copy_all)
+
         # Создаем текстовое поле для логов с прокруткой
         self.log_text = tk.Text(self.frame_logs, height=10, wrap=tk.WORD)
         self.log_scrollbar = ttk.Scrollbar(self.frame_logs, orient="vertical", command=self.log_text.yview)
@@ -2843,18 +3026,34 @@ class FreestyleParserApp:
 
         # Делаем текстовое поле только для чтения
         self.log_text.configure(state='disabled')
+        log_menu = tk.Menu(self.log_text, tearoff=0)
+        log_menu.add_command(label=i18n.tr("Копировать"),
+                             command=_log_copy_selection)
+        log_menu.add_command(label=i18n.tr("Копировать всё"),
+                             command=_log_copy_all)
+        self.log_text.bind('<Button-3>',
+                           lambda e: log_menu.tk_popup(e.x_root, e.y_root))
+        self.log_text.bind('<Control-a>',
+                           lambda e: (self.log_text.tag_add('sel', '1.0', 'end-1c'), 'break')[1])
 
         # Схлопываемые панели левого блока (кнопка '-/+' в шапке)
         for f in (self.frame_files, self.frame_roi, self.frame_output):
             self._make_collapsible(f)
 
-        # Справка по настройкам обработки: '?' слева от кнопки схлопывания
-        self.help_btn = tk.Label(self.frame_output, text='?', cursor='hand2',
-                                 font=('Arial', 10, 'bold'), padx=5, pady=0,
-                                 bd=1, relief='solid', fg='#0b57d0',
-                                 bg='#f0f0f0')
-        self.help_btn.place(relx=1.0, x=-36, y=2, anchor='ne')
-        self.help_btn.bind('<Button-1>', lambda e: self._open_help())
+        # Справка '?' в шапке каждого блока - открывает справку
+        # на соответствующем разделе docs/help.html
+        self._add_help_badge(self.frame_files, 'files',
+                             i18n.tr("Справка: Файлы"))
+        self._add_help_badge(self.frame_roi, 'roi',
+                             i18n.tr("Справка: Область интереса"))
+        self._add_help_badge(self.frame_output, 'params',
+                             i18n.tr("Справка: Настройки обработки"))
+        self._add_help_badge(self.frame_attempts, 'player',
+                             i18n.tr("Справка: попытки и плеер"))
+        self._add_help_badge(self.frame_athletes, 'athletes',
+                             i18n.tr("Справка: Атлеты и Скан"))
+        self._add_help_badge(self.frame_logs, 'logs',
+                             i18n.tr("Справка: Логи"))
 
         # Панель 'Атлеты / Скан': скрываемая целиком (кнопка-язычок внизу
         # справа; при скрытии панель попыток расширяется)
@@ -2929,22 +3128,71 @@ class FreestyleParserApp:
         frame._collapse_toggle = toggle
         return toggle
 
-    def _open_help(self):
-        """Открывает HTML-справку в браузере (docs/help.html; в PyInstaller -
-        из распакованного бандла)"""
+    def _open_help(self, anchor=None):
+        """Открывает HTML-справку в браузере на языке интерфейса
+        (docs/help.html - ru, docs/help.en.html - en; в PyInstaller - из
+        распакованного бандла). anchor - id раздела (#files, #params, ...).
+        macOS отдаёт браузеру file://-URL без query/fragment, поэтому для
+        якоря копируем справку во временный файл, вшивая в неё автоскролл
+        к разделу; без якоря открываем оригинал как есть."""
         import webbrowser
         base = getattr(sys, '_MEIPASS', None) or os.path.dirname(
             os.path.abspath(__file__))
-        path = os.path.join(base, 'docs', 'help.html')
-        if not os.path.exists(path):
-            messagebox.showinfo(i18n.tr("Справка"), i18n.tr("Файл справки не найден: {path}", path=path))
+        # справка на языке интерфейса: help.<lang>.html, fallback - ru
+        lang = i18n.get_language()
+        help_path = os.path.join(base, 'docs', f'help.{lang}.html')
+        if not os.path.exists(help_path):
+            help_path = os.path.join(base, 'docs', 'help.html')
+        if not os.path.exists(help_path):
+            messagebox.showinfo(i18n.tr("Справка"),
+                                i18n.tr("Файл справки не найден: {path}", path=help_path))
             return
+        open_path = help_path
+        if anchor:
+            try:
+                import tempfile
+                with open(help_path, encoding='utf-8') as f:
+                    html = f.read()
+                inject = (
+                    '<script>window.addEventListener("load",function(){'
+                    'var e=document.getElementById("' + anchor + '");'
+                    'if(e){e.scrollIntoView();}});</script>')
+                html = html.replace('</body>', inject + '</body>')
+                fd, tmp = tempfile.mkstemp(suffix='.html', prefix='fshelp_')
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                open_path = tmp
+            except Exception:
+                open_path = help_path   # не смогли - открываем без якоря
         # file://-URL: Windows-путь с backslash и кириллицей требует
         # правильного процентного кодирования
+        uri = pathlib.Path(open_path).as_uri()
+        if sys.platform == 'darwin':
+            # webbrowser/open() на macOS не активирует браузер надёжно;
+            # 'open location' - штатный URL-путь; Popen не ждёт -
+            # фокус остаётся в браузере, а не возвращается в приложение
+            try:
+                subprocess.Popen(['osascript', '-e', f'open location "{uri}"'])
+                return
+            except Exception:
+                pass
         try:
-            webbrowser.open(pathlib.Path(path).as_uri())
+            webbrowser.open(uri)
         except Exception:
-            webbrowser.open('file:///' + path.replace('\\', '/'))
+            webbrowser.open('file:///' + open_path.replace('\\', '/'))
+
+    def _add_help_badge(self, frame, anchor, tooltip=None):
+        """Кнопка '?' в шапке блока: открывает справку на разделе anchor
+        (позиция - слева от кнопки схлопывания '-/+', как у 'Настроек')"""
+        badge = tk.Label(frame, text='?', cursor='hand2',
+                         font=('Arial', 10, 'bold'), padx=5, pady=0,
+                         bd=1, relief='solid', fg='#0b57d0',
+                         bg='#f0f0f0')
+        badge.place(relx=1.0, x=-36, y=2, anchor='ne')
+        badge.bind('<Button-1>', lambda e: self._open_help(anchor))
+        if tooltip:
+            self._attach_tooltip(badge, tooltip)
+        return badge
 
     def _toggle_athletes(self):
         """Показать/скрыть правую панель 'Атлеты / Скан' (PanedWindow pane)"""
@@ -3094,6 +3342,48 @@ class FreestyleParserApp:
 
         self.log(i18n.tr("Установлен фильтр: {filter}", filter=filter_name))
 
+    # --- Динамическая сетка попыток ---
+
+    TILE_W, TILE_H = 200, 150   # размер превью-плитки
+    COL_PAD = 5                 # padx плитки в grid
+    OVERLAY_FRAC = 0.15         # допустимый оверлей крайней плитки за край
+
+    def _attempts_cols(self):
+        """Число колонок сетки по доступной ширине канваса.
+        Целые колонки, плюс одна «наполовину влезающая», если её оверлей
+        за правый край не превышает OVERLAY_FRAC ширины плитки: небольшой
+        срез крайней попытки лучше пустого места, а масштабирование
+        превьюшек под ширину колонки заметно дороже по CPU."""
+        avail = max(0, self.attempts_canvas.winfo_width() - 20)  # минус скроллбар/запас
+        per = self.TILE_W + 2 * self.COL_PAD
+        cols = avail // per
+        if (cols + 1) * per - avail <= self.OVERLAY_FRAC * self.TILE_W:
+            cols += 1
+        return max(1, cols)
+
+    def _on_attempts_canvas_configure(self, event):
+        # внутренний фрейм - на всю ширину канваса, чтобы сепараторы
+        # и сетка не прижимались влево при широком окне
+        self.attempts_canvas.itemconfigure(self._attempts_win, width=event.width)
+        if self._attempts_relayout_job is not None:
+            self.root.after_cancel(self._attempts_relayout_job)
+        self._attempts_relayout_job = self.root.after(
+            150, self._maybe_relayout_attempts)
+
+    def _maybe_relayout_attempts(self):
+        """Перерисовать сетку, только если изменилось число колонок."""
+        self._attempts_relayout_job = None
+        if not self.root.winfo_exists():
+            return
+        if self.attempts_canvas.winfo_width() <= 1:
+            # окно ещё не отрисовано: стартовое значение (4) не трогаем,
+            # реальную ширину даст первый <Configure> при маппинге
+            return
+        cols = self._attempts_cols()
+        if cols != self._attempts_cols_current:
+            self._attempts_cols_current = cols
+            self.update_attempt_thumbnails()
+
     def update_attempt_thumbnails(self):
         """Обновляет превью попыток"""
         # сохраняем позицию скролла, чтобы перерисовка её не сбрасывала
@@ -3124,7 +3414,7 @@ class FreestyleParserApp:
         # Создаем сетку для превью
         row = 0
         col = 0
-        max_cols = 4  # Фиксированное количество колонок
+        max_cols = self._attempts_cols_current
 
         # вероятности атрибуции - один расчёт на всё обновление сетки
         sims_cache = {}
@@ -3157,7 +3447,7 @@ class FreestyleParserApp:
                     # Загружаем изображение
                     image = Image.open(thumbnail_path)
                     # Изменяем размер
-                    image = image.resize((200, 150), Image.Resampling.LANCZOS)
+                    image = image.resize((self.TILE_W, self.TILE_H), Image.Resampling.LANCZOS)
                     photo = ImageTk.PhotoImage(image)
 
                     # Создаем метку с изображением
@@ -3262,7 +3552,7 @@ class FreestyleParserApp:
                 if thumb and os.path.exists(thumb):
                     try:
                         image = Image.open(thumb)
-                        image = image.resize((200, 150), Image.Resampling.LANCZOS)
+                        image = image.resize((self.TILE_W, self.TILE_H), Image.Resampling.LANCZOS)
                         photo = ImageTk.PhotoImage(image)
                         img_label = tk.Label(frame, image=photo)
                         img_label.image = photo
@@ -3278,8 +3568,10 @@ class FreestyleParserApp:
                                           command=lambda c=cand, v=var: self.on_candidate_checkbox_change(c, v))
                 checkbox.pack(side=tk.LEFT, padx=(0, 5))
 
-                # Компактная подпись: имя без расширения, диапазон, оценка объёма выхлопа
+                # Компактная подпись: номер кандидата + длительность;
+                # исходник и диапазон секунд - в тултипе
                 stem = os.path.splitext(os.path.basename(cand['file']))[0]
+                num = self._candidate_num(cand)
                 est = self._estimate_output_bytes(
                     cand['file'],
                     cand['end'] - cand['start'] + self.processing_params['attempt_start_padding']
@@ -3290,10 +3582,15 @@ class FreestyleParserApp:
                     not os.path.exists(self.get_absolute_path(cand['file']))
                 if src_missing:
                     size_txt += i18n.tr("  (нет исходника)")
+                dur = max(0.0, float(cand['end']) - float(cand['start']))
                 name_label = tk.Label(name_frame,
-                                      text=f"{stem} {cand['start']:.0f}–{cand['end']:.0f}s{size_txt}",
+                                      text=i18n.tr("#{num} · {dur:.0f}с",
+                                                   num=num, dur=dur) + size_txt,
                                       fg='#d32f2f' if src_missing else None)
                 name_label.pack(side=tk.LEFT)
+                cand_tip = i18n.tr("{file} · {start:.0f}–{end:.0f}с",
+                                   file=stem, start=cand['start'], end=cand['end'])
+                self._attach_tooltip(name_label, cand_tip)
 
                 # Двойной клик - видео кандидата из оригинала; правый клик - фотопревью
                 for w in (img_label, name_label):
@@ -3302,6 +3599,8 @@ class FreestyleParserApp:
                                lambda e, c=cand: self.show_candidate_video(c))
                         w.bind('<Button-3>',
                                lambda e, c=cand: self.show_candidate_preview(c))
+                if img_label is not None:
+                    self._attach_tooltip(img_label, cand_tip)
 
                 self.candidate_vars[self._candidate_key(cand)] = var
 
@@ -3344,7 +3643,7 @@ class FreestyleParserApp:
                 if la['thumb'] and os.path.exists(la['thumb']):
                     try:
                         image = Image.open(la['thumb'])
-                        image = image.resize((200, 150), Image.Resampling.LANCZOS)
+                        image = image.resize((self.TILE_W, self.TILE_H), Image.Resampling.LANCZOS)
                         photo = ImageTk.PhotoImage(image)
                         img_label = tk.Label(frame, image=photo)
                         img_label.image = photo
@@ -3805,10 +4104,12 @@ class FreestyleParserApp:
         factor = self._preview_slowmo_factor()
         start_real = max(0.0, float(attempt.start) - 1.0)
         dur_real = max(0.0, float(attempt.end) - start_real)
+        end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
         VideoPreviewPopup(self, src,
                           start_real * factor if factor > 1 else start_real,
                           i18n.tr("Попытка {attempt:04d}", attempt=attempt.number), factor=factor,
                           attempt=attempt,
+                          interval=(start_real, float(attempt.end) + end_pad),
                           clip_bytes=self._estimate_output_bytes(src, dur_real))
 
     def show_candidate_video(self, cand):
@@ -3824,12 +4125,13 @@ class FreestyleParserApp:
         interval = (start_real,
                     float(cand.get('end', 0))
                     + float(self.processing_params.get('attempt_end_padding', 0.5)))
-        stem = os.path.splitext(os.path.basename(cand['file']))[0]
+        title = self._candidate_title(cand)
         VideoPreviewPopup(self, src,
                           start_real * factor if factor > 1 else start_real,
-                          f"{stem} {cand['start']:.0f}–{cand['end']:.0f}s",
+                          title,
                           factor=factor, interval=interval,
-                          clip_bytes=self._estimate_output_bytes(src, interval[1] - interval[0]))
+                          clip_bytes=self._estimate_output_bytes(src, interval[1] - interval[0]),
+                          cand=cand)
 
     def show_candidate_preview(self, cand):
         """Превью кандидата в сохранённом (полном) размере - попапом.
@@ -5226,6 +5528,9 @@ class FreestyleParserApp:
         # Настраиваем логгер
         if not self.logger:
             self.setup_logger()
+        # лог дня (processing.log) - в текущую папку дня
+        if os.path.isdir(self.output_folder):
+            self._redirect_day_log()
 
         # Загружаем кандидатов ручного режима
         self.load_candidates()
@@ -5258,7 +5563,7 @@ class VideoPreviewPopup:
 
     def __init__(self, app, video_path, start_file_sec, title, factor=1,
                  attempt=None, live=False, live_index=0, interval=None,
-                 clip_bytes=None):
+                 clip_bytes=None, cand=None):
         self.app = app
         self._path = video_path
         self.attempt = attempt
@@ -5269,6 +5574,10 @@ class VideoPreviewPopup:
         # interval=(t0,t1) реальных секунд - для одиночного просмотра (кандидат)
         self._live = live
         self._live_idx = live_index
+        # кандидат (просмотр из исходника): переход «Продолжать»/Shift+стрелки
+        # по списку ожидающих кандидатов
+        self._cand = cand
+        self._cand_key = self.app._candidate_key(cand) if cand is not None else None
         self._interval = interval   # (t0, t1) реальных секунд границы просмотра
         self._inside = True     # находимся ли внутри интервала (для границы)
         # ключ атрибуции: клип-строка или номер AttemptInfo (NNNN.mp4)
@@ -5313,7 +5622,8 @@ class VideoPreviewPopup:
         self.status_var = tk.StringVar()
         tk.Label(bar, textvariable=self.status_var, anchor='w').pack(side=tk.LEFT, padx=6)
         tk.Label(bar, text=i18n.tr("Space/клик - пауза   ← → ±2с   ↑ ↓ ±10с   "
-                                   "⇧↑ x2 (до x16)   ⇧↓ x0.5   Esc - закрыть"),
+                                   "⇧↑ x2 (до x16)   ⇧↓ x0.5   "
+                                   "⇧→ след. попытка   ⇧← пред.   Esc - закрыть"),
                  fg='#666666').pack(side=tk.RIGHT, padx=6)
         ext_btn = tk.Button(bar, text="⧉", width=2,
                             command=self.open_external)
@@ -5349,7 +5659,7 @@ class VideoPreviewPopup:
             self._live_status_var = tk.StringVar()
             tk.Label(ctrl, textvariable=self._live_status_var,
                      fg='#1565c0', font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=8)
-        elif self._next_key:
+        elif self._next_key or self._cand_key is not None:
             cb.pack(side=tk.LEFT, padx=4)
         else:
             cb.pack(side=tk.LEFT, padx=4)
@@ -5452,8 +5762,9 @@ class VideoPreviewPopup:
 
     def _on_boundary(self):
         """Достигли конца интервала просмотра (если интервал задан):
-        Повтор - с начала интервала; в live-режиме 'Продолжать' -
-        следующая попытка; иначе пауза."""
+        Повтор - с начала интервала; 'Продолжать' - следующая попытка
+        (в live-режиме по списку найденных, у кандидатов - по списку
+        ожидающих кандидатов, у клипов - по нарезанным клипам); иначе пауза."""
         if self.loop_var.get():
             self.cap.set(cv2.CAP_PROP_POS_MSEC, self._interval[0] * self.factor * 1000)
             self._inside = True
@@ -5463,39 +5774,52 @@ class VideoPreviewPopup:
                 and self._live_idx + 1 < len(self.app.live_attempts):
             self._goto(1)
             return
+        if not self._live and self.auto_next_var.get() and self._goto(1):
+            return
         self.playing = False
         self._update_status()
 
     def _goto(self, delta):
         """Shift+стрелки: следующая/предыдущая попытка в том же окне.
-        live-режим - по списку найденных попыток, иначе по сохранённым клипам."""
+        live-режим - по списку найденных попыток, у кандидатов - по ожидающим
+        кандидатам, иначе по сохранённым клипам. True - переход состоялся."""
         if self._live:
             idx = self._live_idx + delta
             if not (0 <= idx < len(self.app.live_attempts)):
-                return
+                return False
             self._load_live_entry(idx)
-            if self.top.winfo_exists():
-                if self.playing:
-                    self._tick()
-                else:
-                    ok, frame = self.cap.read()
-                    if ok:
-                        self._show(frame)
-            return
+            self._show_after_load()
+            return True
+        if self._cand_key is not None:
+            cands = [c for c in self.app.candidates if c['status'] == 'pending']
+            keys = [self.app._candidate_key(c) for c in cands]
+            if self._cand_key not in keys:
+                return False
+            i = keys.index(self._cand_key) + delta
+            if not (0 <= i < len(keys)):
+                return False
+            self._load_candidate(cands[i])
+            self._show_after_load()
+            return True
         keys = sorted(self.app.attempt_checkboxes.keys())
         if self.athlete_key not in keys:
-            return
+            return False
         i = keys.index(self.athlete_key) + delta
         if not (0 <= i < len(keys)):
-            return
+            return False
         nxt = keys[i]
         src = self.app.get_absolute_path(nxt)
         if not os.path.exists(src):
-            return
+            return False
         self.attempt = self.athlete_key = nxt
         self._load_video(src, 0.0, i18n.tr("Попытка {attempt}", attempt=nxt))
         self._rebuild_selector()
         self._refresh_rating_btns()
+        self._show_after_load()
+        return True
+
+    def _show_after_load(self):
+        """Кадр после перехода к другой попытке в том же окне"""
         if self.top.winfo_exists():
             if self.playing:
                 self._tick()
@@ -5503,6 +5827,24 @@ class VideoPreviewPopup:
                 ok, frame = self.cap.read()
                 if ok:
                     self._show(frame)
+
+    def _load_candidate(self, cand):
+        """Загрузка кандидата в то же окно: интервал границы попытки,
+        seek на начало, заголовок, оценка размера нарезки."""
+        src = self.app.get_absolute_path(cand.get('file', ''))
+        start_real = max(0.0, float(cand.get('start', 0)) - 1.0)
+        # пауза в конце попытки (+запас на выбег), как при первом открытии
+        interval = (start_real,
+                    float(cand.get('end', 0))
+                    + float(self.app.processing_params.get('attempt_end_padding', 0.5)))
+        self._interval = interval
+        self._inside = True
+        self._cand = cand
+        self._cand_key = self.app._candidate_key(cand)
+        self._load_video(src,
+                         start_real * self.factor if self.factor > 1 else start_real,
+                         self.app._candidate_title(cand),
+                         clip_bytes=self.app._estimate_output_bytes(src, interval[1] - interval[0]))
 
     def _on_video_press(self, e):
         """Начало клика/перетаскивания за видео"""
@@ -5542,6 +5884,12 @@ class VideoPreviewPopup:
             if self.auto_next_var.get() \
                     and self._live_idx + 1 < len(self.app.live_attempts):
                 self._goto(1)
+                return
+            self.playing = False
+            self._update_status()
+            return
+        if self._cand_key is not None:
+            if self.auto_next_var.get() and self._goto(1):
                 return
             self.playing = False
             self._update_status()

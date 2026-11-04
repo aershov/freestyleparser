@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FreestyleParser — Help</title>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; max-width: 900px;
+         margin: 0 auto; padding: 20px 30px; color: #222; line-height: 1.5; }
+  h1 { color: #0b3d6b; border-bottom: 3px solid #0b57d0; padding-bottom: 6px; }
+  h2 { color: #0b57d0; margin-top: 28px; border-bottom: 1px solid #cde; padding-bottom: 3px; }
+  h3 { color: #333; margin-top: 18px; }
+  table { border-collapse: collapse; margin: 10px 0; }
+  th, td { border: 1px solid #bbb; padding: 5px 10px; text-align: left; vertical-align: top; }
+  th { background: #eef4fb; }
+  code, kbd { background: #f2f2f2; border: 1px solid #ddd; border-radius: 3px;
+              padding: 1px 5px; font-size: 0.92em; }
+  kbd { background: #333; color: #fff; border-color: #333; }
+  .tip { background: #eef8ee; border-left: 4px solid #3a3; padding: 8px 12px; margin: 10px 0; }
+  .warn { background: #fdf2e9; border-left: 4px solid #d80; padding: 8px 12px; margin: 10px 0; }
+  .toc a { text-decoration: none; }
+</style>
+</head>
+<body>
+
+<h1>FreestyleParser — Help
+<span style="float:right;font-size:0.6em;font-weight:normal;">
+  <a href="help.html">🌐 Русский</a>
+</span></h1>
+<p>The program splits freestyle kayak recordings into individual attempts and
+recognizes which athlete performed each one. Everything you need is in the
+left column: <b>Files</b> → <b>Region of interest</b> → <b>Processing
+settings</b>.</p>
+
+<div class="toc">
+<b>Contents:</b>
+<a href="#quick">Quick start</a> ·
+<a href="#files">Files</a> ·
+<a href="#roi">Region of interest</a> ·
+<a href="#params">Processing settings</a> ·
+<a href="#slowmo">Slow motion</a> ·
+<a href="#strategy">Strategies</a> ·
+<a href="#athletes">Athletes and banks</a> ·
+<a href="#live">View without saving</a> ·
+<a href="#scan">Scan</a> ·
+<a href="#player">Video player</a> ·
+<a href="#hotkeys">Hotkeys</a> ·
+<a href="#logs">Logs</a> ·
+<a href="#tiles">Tiles</a> ·
+<a href="#faq">FAQ</a>
+</div>
+
+<h2 id="quick">Quick start</h2>
+<ol>
+  <li>Click <b>📅</b> and pick a day folder (clips, screenshots and markup
+      files will be created there).</li>
+  <li>Add the source videos with <b>Add files</b> in the «Files» panel.</li>
+  <li>In the «Region of interest» panel, outline the zone where the kayaker
+      performs tricks: «Rectangle» or «Polygon» mode, double-click finishes
+      the polygon.</li>
+  <li>If the camera recorded slow motion (96 fps on a Panasonic GH4) — enable
+      <b>Slow motion</b> and pick the factor.</li>
+  <li>Pick a strategy and press <b>⏵ Process</b>.</li>
+  <li>After cutting, assign attempts to athletes on the <b>Athletes</b> tab —
+      from then on the program will recognize them automatically.</li>
+</ol>
+
+<h2 id="files">Files</h2>
+<p>This is where the source videos of the day are selected. Files shown in red
+are missing on disk (e.g. the memory card is already unplugged). The selected
+list is saved in the day folder and restored when you reopen it. The first
+file is shown on the left — it is used for ROI markup.</p>
+
+<h2 id="roi">Region of interest</h2>
+<p>The program only watches the zone inside the ROI — tricks are performed in
+the feature bowl on the wave. Two modes:</p>
+<ul>
+  <li><b>Rectangle</b> — click twice (top-left and bottom-right corner);
+      the sides can be dragged.</li>
+  <li><b>Polygon</b> — click the points, double-click finishes the shape.</li>
+</ul>
+<p>«Clear» resets the ROI. The markup is stored in the day config.</p>
+
+<h2 id="params">Processing settings</h2>
+<p>All parameters are stored in the day config (processing.yaml) and restored
+when the day is opened — each day keeps its own settings. The defaults suit
+typical 25–30 fps footage with fast entries into the feature bowl.</p>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>What it does</th></tr>
+  <tr><td>Pause between attempts</td><td>2 s</td><td>Minimum pause after which
+      two entries into the ROI count as <b>different</b> attempts. Lower —
+      attempts split; higher — neighboring entries merge into one.</td></tr>
+  <tr><td>Min. attempt duration</td><td>2 s</td><td>Shorter attempts are
+      discarded. Lower — more junk entries; higher — risk of losing short
+      tricks.</td></tr>
+  <tr><td>Start padding</td><td>1.5 s</td><td>How many seconds before the ROI
+      entry are included in the clip (preroll) — so the approach is visible.</td></tr>
+  <tr><td>End padding</td><td>1.5 s</td><td>How many seconds after leaving
+      the ROI are appended to the clip (glide-out).</td></tr>
+  <tr><td>Min. detection strength</td><td>0.3</td><td>How «confidently» the
+      athlete must be present in the ROI for the start/continuation of an
+      attempt to count (0–1). Higher — fewer false positives, but fast/distant
+      entries may be missed.</td></tr>
+  <tr><td>Scan step, s</td><td>1 s</td><td>Sampling rate when scanning for
+      candidates (manual mode and fast «👁 View»). Lower — sharper boundaries
+      and a slower scan.</td></tr>
+  <tr><td>Scan threshold</td><td>0.25</td><td>YOLO detection threshold during
+      scanning (0–1) — deliberately below the normal analysis threshold so
+      entries at the ROI border are not missed.</td></tr>
+  <tr><td>OSNet samples/s per attempt</td><td>3</td><td>How many vest
+      embeddings per real second are taken inside an attempt for attribution.
+      More — better recognition, slower processing. 1–2 is enough in good
+      light.</td></tr>
+  <tr><td>Search start to the left, s</td><td>3.5 s</td><td>How far to the
+      left of a candidate the precise splitter searches for the true attempt
+      start (precise attribution / «Detect athletes»).</td></tr>
+</table>
+<div class="tip">Start with the defaults. If attempts merge — increase
+«Pause between attempts»; if the program catches kayakers passing by —
+increase «Min. detection strength» or shrink the ROI.</div>
+
+<h2 id="slowmo">Slow motion</h2>
+<p>High-resolution cameras often record «slow motion»: 96 fps captured, but
+the container is labeled 24 fps. Enable <b>Slow motion</b> and pick the
+factor:</p>
+<table>
+  <tr><th>Factor</th><th>Recording</th></tr>
+  <tr><td>1/2</td><td>48 fps in a 24 fps container</td></tr>
+  <tr><td>1/4</td><td>96 fps (Panasonic GH4) — the typical case</td></tr>
+  <tr><td>1/8</td><td>192 fps</td></tr>
+</table>
+<p>With slow motion enabled: attempt timings are in <b>real seconds</b>, cut
+clips are saved at normal (watchable) speed. For VFR files (r_frame_rate
+higher than avg, progressive) the factor is detected automatically; for the
+Panasonic GH4 slow motion is baked into container timestamps and cannot be
+told from metadata — enable the checkbox manually. Interlaced 1080/50i footage
+is not slow motion and is automatically treated as normal speed.</p>
+
+<h2 id="strategy">Strategies</h2>
+<table>
+  <tr><th>Save immediately</th><th>Detect athletes</th><th>Result</th></tr>
+  <tr><td>☑</td><td>☐</td><td>All detected attempts are cut (no attribution).</td></tr>
+  <tr><td>☐</td><td>☐</td><td>Preview candidates for manual selection.</td></tr>
+  <tr><td>☐</td><td>☑</td><td>Athlete scan: segments + attribution in the
+      originals, no cutting.</td></tr>
+  <tr><td>☑</td><td>☑</td><td>Full cycle: cutting + athlete assignment.</td></tr>
+</table>
+
+<h2 id="athletes">Athletes and banks</h2>
+<p>On the <b>Athletes</b> tab every cut attempt is a tile with a frame.
+Under the tile: the athlete selector (a colored chip) and a confirm button:</p>
+<ul>
+  <li><b>Orange chip</b> — automatic detection (with a confidence
+      percentage). Check it and press <b>✓NN%</b> to confirm.</li>
+  <li><b>Green chip</b> — confirmed manually.</li>
+  <li><b>Grey «— select —»</b> — athlete not determined; pick one from the
+      list or via «➕ New / search…» (with live suggestions; the 🔍 magnifier
+      searches by substring).</li>
+</ul>
+<p>Every confirmation adds the attempt profile to the athlete's <b>bank</b>.
+Bank layers (a closer layer overrides an athlete of the same name):</p>
+<ol>
+  <li><b>Base banks</b> — ship with the program (e.g. RussianCup2026,
+      collected at the Russian Cup), read-only.</li>
+  <li><b>Personal registry</b> — confirmations from all your days
+      (~/.FreestyleParser/athlete_registry.npz).</li>
+  <li><b>Day folder</b> — assignments in the current folder (mapping.yaml).</li>
+</ol>
+<p>Matching is <b>max over bank samples</b>: an athlete is recognized in a
+different jacket and a different season if at least one sample matches. A
+match requires both vest similarity (OSNet) and boat shape agreement.</p>
+<div class="tip">Delete a tile with the <b>🗑</b> button on the tile or in the
+player (press twice to protect from accidental deletion). To delete an empty
+athlete — <b>✕</b> next to their name on the «Athletes» tab.</div>
+
+<h2 id="scan">Scan</h2>
+<p>The <b>Scan</b> tab (in the «Athletes / Scan» panel) shows segments found
+in the originals without cutting: who entered the ROI, when, and who they are
+according to the bank. Useful for getting a picture of the day before full
+processing. The bank status shows how many athletes are available for
+recognition.</p>
+
+<h2 id="live">View without saving</h2>
+<p>The <b>👁 View</b> button scans the selected files <b>without writing
+anything to disk</b>: found attempts appear as in-memory tiles and can be
+watched in the built-in player right away.</p>
+<ul>
+  <li><b>Detect athletes</b> off — fast coarse scan (samples once per «Scan
+      step, s»); on — precise splitter (slow).</li>
+  <li>In the player, the <b>💾 Save</b> buttons / keys <b>S</b> (current) and
+      <b>A</b> (previous) <b>mark</b> an attempt: a checkbox appears in the
+      panel and the button shows «⏳ queued».</li>
+  <li>Writing to disk happens <b>in a batch after the player is closed</b> —
+      only the marked attempts. Nothing marked — nothing saved.</li>
+</ul>
+<div class="tip">This is a safe way to review a shooting day: the disk stays
+clean, and only the attempts you marked go into cutting.</div>
+
+<h2 id="player">Video player</h2>
+<p>Double-click a tile to open the built-in player:</p>
+<ul>
+  <li>Click the video — pause/play; drag the video — move the window.</li>
+  <li><b>☐ Repeat</b> — loop the clip.</li>
+  <li><b>☐ Continue viewing</b> — when the clip ends, the next attempt opens
+      automatically in the same window. It also works for candidates
+      (viewing from the source): when an attempt ends, the next candidate
+      opens; Shift+arrows browse them manually.</li>
+  <li>Athlete selector — the same chip as on the tile; choosing/confirming
+      updates the tile immediately.</li>
+  <li><b>🗑 Delete</b> — two-phase: the first click colors the button, the
+      second deletes the clip (with the screenshot and all assignments).</li>
+</ul>
+
+<h2 id="hotkeys">Hotkeys</h2>
+<table>
+  <tr><th>Keys</th><th>Action</th></tr>
+  <tr><td><kbd>Esc</kbd></td><td>Close the player</td></tr>
+  <tr><td><kbd>Space</kbd></td><td>Pause / play</td></tr>
+  <tr><td><kbd>→</kbd> / <kbd>←</kbd></td><td>Seek ±5 seconds</td></tr>
+  <tr><td><kbd>⇧→</kbd> / <kbd>⇧←</kbd></td><td>Next / previous attempt</td></tr>
+  <tr><td><kbd>S</kbd></td><td>In live mode: mark the current attempt for saving</td></tr>
+  <tr><td><kbd>A</kbd></td><td>In live mode: mark the previous attempt for saving</td></tr>
+</table>
+
+<h2 id="logs">Logs</h2>
+<p>The <b>Logs</b> panel (opened with the <b>▸ Logs</b> button in the
+bottom-left corner) shows what is going on: detected attempts with their
+boundaries, attribution, processing errors and interface messages. Look here
+when something goes wrong: the program writes why an attempt was skipped or
+not cut. The same text is written to files: <b>processing.log</b> in the day
+folder and <b>~/.FreestyleParser/app.log</b> (all sessions). Copy the panel
+text with the <b>📋 Copy all</b> button or a right-click on the text.</p>
+
+<h2 id="tiles">Attempt tiles</h2>
+<p>Tiles are laid out across the panel width — the number of columns adjusts
+to the window size automatically.</p>
+
+<h2 id="faq">FAQ</h2>
+<h3>The program doesn't find attempts</h3>
+<p>Check the ROI (the zone must cover the whole wave with the feature bowl)
+and the «Pause between attempts» / «Min. attempt duration» / «Min. detection
+strength» parameters. Try the «preview candidates» strategy (both checkboxes
+off) — it shows what the program sees at all — and lower the «Scan step» for
+denser sampling.</p>
+<h3>An athlete is recognized incorrectly</h3>
+<p>Confirm the correct attempts — the day folder mapping overrides the base
+bank. If the athlete is new (not in the bank), they will appear as
+«— select —», and after 2–3 confirmations they will start being recognized.</p>
+<h3>A 96 fps video was treated as normal speed</h3>
+<p>GH4 slow motion is baked into the timestamps; metadata doesn't differ.
+Enable «Slow motion» with factor 1/4 manually.</p>
+<h3>Processing was interrupted (laptop sleep, restart)</h3>
+<p>Just press «⏵ Process» again: finished files of the day are skipped, the
+unfinished file continues where it stopped, and already-cut attempts are not
+duplicated (the attempts journal in the day folder). Clip numbering continues
+without gaps. To deliberately re-process a file, remove its entries from
+<b>processed.yaml</b> and <b>attempts_index.yaml</b> in the day folder
+(the files are human-readable).</p>
+<h3>Where is the data stored</h3>
+<p>Everything for a day lives in the day folder (clips, jpg, mapping.yaml,
+attempt_profiles.npz). The personal registry and base banks are in
+~/.FreestyleParser/. Base banks are never modified by the program.</p>
+
+</body>
+</html>

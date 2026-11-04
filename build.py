@@ -44,7 +44,8 @@ def build_app():
         '--windowed',
         '--clean',
         f'--add-data=version.txt{data_sep}.',
-        f'--add-data=docs/help.html{data_sep}docs',  # справка из кнопки в UI
+        f'--add-data=docs/help.html{data_sep}docs',  # справка из кнопки в UI (ru)
+        f'--add-data=docs/help.en.html{data_sep}docs',  # справка (en)
         f'--add-data=requirements.txt{data_sep}.',
         f'--add-data=bin{data_sep}bin',  # ffmpeg и ffprobe, чтобы не требовались в системе
         f'--add-data=models/yolo11s-seg.pt{data_sep}./models',  # модель YOLO внутри exe

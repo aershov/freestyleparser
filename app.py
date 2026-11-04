@@ -2,6 +2,7 @@ import numpy as np
 import tkinter as tk
 import calendar
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 import cv2
 from PIL import Image, ImageTk
 import subprocess
@@ -3321,15 +3322,21 @@ class FreestyleParserApp:
             self._logs_visible = False
         else:
             # Tk 9 не перераспределяет pane по reqsize - пересоздаём pane
-            # с явной высотой ~1/7 окна (1/8..1/6 экрана приложения);
-            # высоту переподтверждаем несколько раз - Tk 9 её теряет
-            h = max(140, int(self.root.winfo_height() / 7))
+            # и жёстко фиксируем сайфш: верхняя панель занимает всё, кроме
+            # 1/6 высоты окна (панель логов = 1/6 экрана приложения)
+            total = self.root.winfo_height()
+            h = max(120, int(total / 6))
             self.main_frame.forget(self.frame_logs_wrap)
-            self.main_frame.add(self.frame_logs_wrap, height=h, minsize=100,
+            self.main_frame.add(self.frame_logs_wrap, height=h, minsize=80,
                                 stretch='never')
 
             def _assert_height():
                 try:
+                    # Классический PanedWindow при пере-добавлении pane
+                    # НЕ растягивает панели - остаётся пустое место.
+                    # Явно задаём высоты обеим панелям.
+                    self.main_frame.paneconfigure(self.top_frame,
+                                                  height=total - h - 6)
                     self.main_frame.paneconfigure(self.frame_logs_wrap,
                                                   height=h)
                 except tk.TclError:
@@ -5582,6 +5589,40 @@ class VideoPreviewPopup:
 
     MAX_WIDTH = 960
 
+    @staticmethod
+    def _freeze_label_width(lbl, samples):
+        """Фиксирует ширину Label по самому длинному из вариантов текста:
+        динамический текст иначе меняет ширину виджета и дёргает окно плеера."""
+        longest = max(samples, key=len)
+        fnt = tkfont.Font(font=lbl.cget('font'))
+        avg = max(1.0, fnt.measure(longest) / max(1, len(longest)))
+        lbl.configure(width=max(1, round(fnt.measure(longest) / avg)))
+
+    def _measure_stream_fps(self, fps_meta):
+        """Фактическая частота кадров потока (кадров на секунду файлового
+        времени, по POS_MSEC). Метаданные контейнера могут врать: mp4-клип
+        из 50i-источника декларирует 50 к/с, а декодер выдаёт 25 - по ним
+        плеер играл вдвое быстрее реального времени."""
+        cap = self.cap
+        ms_first = None
+        ms_last = None
+        n = 0
+        while n < 60:
+            if not cap.grab():
+                break
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if ms_first is None:
+                ms_first = ms
+            ms_last = ms
+            n += 1
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, 0.0)
+        except Exception:
+            pass
+        if n < 5 or ms_first is None or ms_last is None or ms_last <= ms_first:
+            return fps_meta
+        return (n - 1) / ((ms_last - ms_first) / 1000.0)
+
     def __init__(self, app, video_path, start_file_sec, title, factor=1,
                  attempt=None, live=False, live_index=0, interval=None,
                  clip_bytes=None, cand=None):
@@ -5617,6 +5658,9 @@ class VideoPreviewPopup:
             messagebox.showinfo(i18n.tr("Превью"), i18n.tr("Не удалось открыть видео"))
             return
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        # фактическая частота потока: метаданные mp4-клипов из 50i-источников
+        # заявляют 50 к/с, а декодер выдаёт 25 - иначе плеер играет x2
+        fps = self._measure_stream_fps(fps)
         # реальная скорость контента = fps * factor кадров/с; показываем
         # максимум 25 к/с, остальные кадры проматываем grab() - та же
         # скорость движения при меньшей нагрузке на декод
@@ -5641,16 +5685,30 @@ class VideoPreviewPopup:
         bar = tk.Frame(self.top)
         bar.pack(fill=tk.X)
         self.status_var = tk.StringVar()
-        tk.Label(bar, textvariable=self.status_var, anchor='w').pack(side=tk.LEFT, padx=6)
-        tk.Label(bar, text=i18n.tr("Space/клик - пауза   ← → ±2с   ↑ ↓ ±10с   "
-                                   "⇧↑ x2 (до x16)   ⇧↓ x0.5   "
-                                   "⇧→ след. попытка   ⇧← пред.   Esc - закрыть"),
-                 fg='#666666').pack(side=tk.RIGHT, padx=6)
+        self._status_lbl = tk.Label(bar, textvariable=self.status_var, anchor='w')
+        self._status_lbl.pack(side=tk.LEFT, padx=6)
+        # фиксированная ширина: секунды/скорость меняются каждый кадр,
+        # иначе окно плеера дёргается
+        self._freeze_label_width(self._status_lbl, [
+            i18n.tr("{state} x{speed:g} реал "
+                    "{time:.1f}{total}{size}",
+                    state="⏸", speed=0.0625, time=9999.9,
+                    total="/9999.9с", size=" · 9.9 ГБ · попытка ≈99.9 МБ"),
+        ])
         ext_btn = tk.Button(bar, text="⧉", width=2,
                             command=self.open_external)
         ext_btn.pack(side=tk.RIGHT, padx=6, pady=3)
         app._attach_tooltip(ext_btn, i18n.tr("Открыть во внешнем плеере\n"
                                              "(macOS - QuickTime, Windows/Linux - VLC)"))
+
+        # Подсказки хоткеев - отдельной строкой: иначе длинная подсказка
+        # в одной панели со статусом делает окно шире видео
+        hint_bar = tk.Frame(self.top)
+        hint_bar.pack(fill=tk.X)
+        tk.Label(hint_bar, text=i18n.tr("Space/клик - пауза   ← → ±2с   ↑ ↓ ±10с   "
+                                        "⇧↑ x2 (до x16)   ⇧↓ x0.5   "
+                                        "⇧→ след. попытка   ⇧← пред.   Esc - закрыть"),
+                 fg='#666666').pack(side=tk.LEFT, padx=6)
 
         # Панель управления: повтор, автопереход, выбор атлета
         ctrl = tk.Frame(self.top)
@@ -5667,6 +5725,15 @@ class VideoPreviewPopup:
             cb.pack(side=tk.LEFT, padx=4)
             # --- кнопки сохранения + индикация текущей/предыдущей ---
             self._save_busy = False
+            # варианты текста кнопок сохранения - для фиксации ширины
+            self._save_btn_samples = [
+                i18n.tr("💾 {word} —", word=w)
+                for w in (i18n.tr("Пред."), i18n.tr("Текущая"))
+            ] + [
+                i18n.tr("✓ {num} сохранена", num="0000"),
+                i18n.tr("⏳ {num} запланирована", num="0000"),
+                i18n.tr("💾 {word} {num}", word=i18n.tr("Текущая"), num="0000"),
+            ]
             self.save_prev_btn = tk.Label(ctrl, text=i18n.tr('💾 Пред. —'), font=('Arial', 9),
                                           cursor='hand2', padx=6, pady=2,
                                           bg='#c8e6c9')
@@ -5677,9 +5744,16 @@ class VideoPreviewPopup:
                                          bg='#c8e6c9')
             self.save_cur_btn.bind('<Button-1>', lambda e: self._save_live('cur'))
             self.save_cur_btn.pack(side=tk.LEFT, padx=4)
+            self._freeze_label_width(self.save_prev_btn, self._save_btn_samples)
+            self._freeze_label_width(self.save_cur_btn, self._save_btn_samples)
             self._live_status_var = tk.StringVar()
-            tk.Label(ctrl, textvariable=self._live_status_var,
-                     fg='#1565c0', font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=8)
+            self._live_status_lbl = tk.Label(ctrl, textvariable=self._live_status_var,
+                                             fg='#1565c0', font=('Arial', 9, 'bold'))
+            self._live_status_lbl.pack(side=tk.LEFT, padx=8)
+            self._freeze_label_width(self._live_status_lbl, [
+                i18n.tr("Текущая: {cur} · Пред.: {prev}",
+                        cur="0000", prev="0000"),
+            ])
         elif self._next_key or self._cand_key is not None:
             cb.pack(side=tk.LEFT, padx=4)
         else:
@@ -5755,6 +5829,15 @@ class VideoPreviewPopup:
         self._tick()
 
     def _tick(self):
+        # идемпотентность: гасим зависший after предыдущей цепочки.
+        # Иначе быстрое пауза/плей (двойной Space, assign из селектора)
+        # запускает вторую цепочку - и скорость удваивается
+        if getattr(self, '_after_id', None):
+            try:
+                self.top.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
         if not self.playing or not self.top.winfo_exists():
             return
         # сколько кадров файла пройти за тик показа: базовая скорость x speed
@@ -6036,6 +6119,7 @@ class VideoPreviewPopup:
             self.close()
             return
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fps = self._measure_stream_fps(fps)
         self.base_rate = fps * self.factor
         self.disp_fps = min(self.base_rate, 25.0)
         self.frame_delay = 1000.0 / max(1.0, self.disp_fps)

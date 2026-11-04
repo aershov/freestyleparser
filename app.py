@@ -3304,7 +3304,12 @@ class FreestyleParserApp:
             except tk.TclError:
                 pass
         self.root.bind_all('<MouseWheel>', on_wheel)
-        self.root.bind_all('<TouchpadScroll>', on_touchpad_scroll)
+        # TouchpadScroll - тип события Tk 9 (macOS CI-сборка собрана на Tk 8.6,
+        # там его нет) - bind падал с "bad event type or keysym"
+        try:
+            self.root.bind_all('<TouchpadScroll>', on_touchpad_scroll)
+        except tk.TclError:
+            pass
         self.root.bind_all('<Button-4>', on_wheel_x11)
         self.root.bind_all('<Button-5>', on_wheel_x11)
 

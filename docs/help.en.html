@@ -146,15 +146,18 @@ is not slow motion and is automatically treated as normal speed.</p>
   <tr><td>☑</td><td>☑</td><td>Full cycle: cutting + athlete assignment.</td></tr>
 </table>
 <p>Candidate scanning always uses keyframes (I-frames) only: minimal
-decoding, fast even from a flash drive. Samples are taken from I-frames at
-the «Scan step, s» interval (if I-frames are sparser than the step, all of
-them are used: 0.125 s GOP on GoPro slow-mo → one sample per second; 2 s GOP
-→ all I-frames). If I-frames are on average sparser than ~5 s, the scan
-automatically falls back to regular samples and reports it in the log. If
-I-frames are sparser than the chosen scan step, a warning and a step
-recommendation appear in the log. Keyframes of the next file are extracted
-in the background while the current one is scanned, so there is no pause
-between files. Scan speed is also visible
+decoding, fast even from a flash drive. Frames are streamed to the neural
+network (ffmpeg → pipe, no intermediate files): the first sample is ready
+within seconds, and if the network is slower than decoding, ffmpeg
+self-pauses (processing "catches up" with extraction). Samples are taken
+from I-frames at the «Scan step, s» interval (if I-frames are sparser than
+the step, all of them are used: 0.125 s GOP on GoPro slow-mo → one sample
+per second; 2 s GOP → all I-frames). If I-frames are on average sparser
+than ~5 s, the scan automatically falls back to regular samples and reports
+it in the log. If I-frames are sparser than the chosen scan step, a warning
+and a step recommendation appear in the log. The next file is opened in the
+background while the current one is scanned, so there is no pause between
+files. Scan speed is also visible
 in the log heartbeat (file position and samples/s every 30 s) and in the ETA
 under the progress bar.</p>
 

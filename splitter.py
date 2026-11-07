@@ -1,13 +1,11 @@
 import cv2
-import glob
 import i18n
 import numpy as np
 import os
+import queue
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -32,6 +30,9 @@ SCAN_CONFIDENCE = 0.25  # Пониженный порог YOLO для скани
 KEYFRAME_MAX_GAP = 5.0
 # Скан всегда по ключевым кадрам (I-кадрам); переключатель убран из настроек
 KEYFRAME_SCAN = True
+# Стриминговый скан: столько интервалов между I-кадрами потребляется на
+# бутстрапе для оценки GOP (кадры буферизуются и отдаются далее)
+KEYFRAME_BOOTSTRAP_GAPS = 8
 
 np.seterr(divide='ignore', invalid='ignore')
 
@@ -250,61 +251,7 @@ def _grab_sample_iter(cap, fps_container, fps_real, total_frames, frame_skip,
         yield real_sec, frame, frame_index, total_frames
 
 
-def _keyframe_sample_iter(kf_samples, slowmo_factor, step, range_start, range_end):
-    """Генератор сэмплов из заранее извлечённых опорных кадров.
-    kf_samples - [(file_time, path)]; берётся каждый step-й кадр."""
-    if not kf_samples:
-        return
-    for i, (ftime, path) in enumerate(kf_samples):
-        if i % step:
-            continue
-        real_sec = ftime / slowmo_factor if slowmo_factor > 1 else ftime
-        if range_start and real_sec < range_start:
-            continue
-        if range_end is not None and real_sec > range_end:
-            break
-        frame = cv2.imread(path)
-        if frame is None:
-            continue
-        yield real_sec, frame, i + 1, len(kf_samples)
-
-
-def _extract_keyframes(video_file, tmp_dir):
-    """Рендерит ключевые кадры видео в jpg (ffmpeg -skip_frame nokey: декодер
-    получает только I-кадры - гарантированно минимальное декодирование).
-    Метки времени берутся из showinfo того же прохода.
-    Возвращает ([(pts, path)], median_gap) или (None, 0) при сбое."""
-    ffmpeg = get_ffmpeg_path()
-    if not ffmpeg:
-        return None, 0.0
-    pattern = os.path.join(tmp_dir, 'kf_%06d.jpg')
-    cmd = [ffmpeg, '-hide_banner', '-skip_frame', 'nokey', '-i', video_file,
-           '-vf', f'showinfo,scale={YOLO_MAX_WIDTH}:-2', '-vsync', '0',
-           '-q:v', '3', '-y', pattern]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=1800)
-        if proc.returncode != 0:
-            return None, 0.0
-        out = proc.stderr.decode('utf-8', 'replace')
-    except Exception:
-        return None, 0.0
-    pts = []
-    for m in re.finditer(r'pts_time:([0-9.]+)', out):
-        try:
-            pts.append(float(m.group(1)))
-        except ValueError:
-            continue
-    files = sorted(glob.glob(os.path.join(tmp_dir, 'kf_*.jpg')))
-    if not files:
-        return None, 0.0
-    if len(pts) > len(files):
-        pts = pts[:len(files)]
-    while len(pts) < len(files):
-        pts.append(pts[-1] if pts else 0.0)
-    gaps = [b - a for a, b in zip(pts, pts[1:]) if b > a]
-    gaps.sort()
-    median_gap = gaps[len(gaps) // 2] if gaps else 0.0
-    return list(zip(pts, files)), median_gap
+_PTS_TIME_RE = re.compile(r'pts_time:([0-9]+(?:\.[0-9]+)?)')
 
 
 def _median_gap(pts):
@@ -316,24 +263,202 @@ def _median_gap(pts):
     return gaps[len(gaps) // 2]
 
 
-def _select_keyframes(kf_all, scan_interval):
-    """Выбирает из всех I-кадров сэмплы с шагом ~scan_interval. I-кадр
-    пропускается, только если накопленная пауза почти достигла шага скана
-    (допуск 0.5*GOP): иначе при GOP чуть меньше шага (например 1.99с при
-    шаге 2с) пропуск раздваивал бы эффективный шаг до ~4с, а при плотном
-    GOP квантование по сетке I-кадров съезжало бы вниз (0.78с вместо 1с).
-    Итоговый шаг лежит в интервале [шаг - 0.5*GOP; шаг + 0.5*GOP)."""
-    if not kf_all:
-        return []
-    gop = _median_gap([pts for pts, _ in kf_all])
-    threshold = max(0.0, scan_interval - gop * 0.5)
-    selected = []
-    last_t = None
-    for pts, path in kf_all:
-        if last_t is None or pts - last_t >= threshold - 1e-6:
-            selected.append((pts, path))
-            last_t = pts
-    return selected
+class _KeyframeStreamIter:
+    """Стриминговый скан по ключевым кадрам: ffmpeg декодирует только I-кадры
+    (-skip_frame nokey) и льёт их в stdout-пайп, потребитель (YOLO) читает
+    по мере поступления. Если нейросеть медленнее декодирования - ffmpeg
+    блокируется на записи в пайп (backpressure): процессинг "догоняет"
+    извлечение. Промежуточных jpg нет, ожидания полного прохода нет -
+    первый сэмпл готов через секунды после старта.
+    Бутстрап: первые KEYFRAME_BOOTSTRAP_GAPS интервалов между I-кадрами
+    потребляются внутрь (кадры буферизуются, потом отдаются) для оценки GOP;
+    до этого берутся все I-кадры - перестраховка в пользу плотности. После
+    бутстрапа выставляются rate/sample_count, дальше сэмплы выбираются на
+    лету с порогом (шаг - 0.5*GOP) - шаг в интервале [шаг - 0.5*GOP;
+    шаг + 0.5*GOP), без раздвоения при GOP чуть меньше шага.
+    Если GOP > KEYFRAME_MAX_GAP, ffmpeg недоступен или пайп сорвался -
+    откат к seek-скану по тому же cap."""
+
+    def __init__(self, cap, video_file, fps_real, total_frames, real_duration,
+                 scan_interval, slowmo_factor, range_start, range_end,
+                 sample_rate):
+        self.cap = cap
+        self.video_file = video_file
+        self.fps_real = fps_real
+        self.total_frames = total_frames
+        self.real_duration = real_duration
+        self.scan_interval = scan_interval
+        self.slowmo_factor = slowmo_factor
+        self.range_start = range_start
+        self.range_end = range_end
+        self.sample_rate = sample_rate
+        self.rate = sample_rate          # уточняется после бутстрапа
+        self.sample_count = int(real_duration * sample_rate) + 1
+        self._h_out = None
+        self._frame_bytes = 0
+        self._proc = None
+        self._pts_q = None
+        self._reader = None
+        self._taken = 0
+
+    def _start_ffmpeg(self):
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ffmpeg = get_ffmpeg_path()
+        if w <= 0 or h <= 0 or not ffmpeg:
+            return False
+        self._h_out = max(2, int(round(h * YOLO_MAX_WIDTH / w / 2.0)) * 2)
+        self._frame_bytes = YOLO_MAX_WIDTH * self._h_out * 3
+        cmd = [ffmpeg, '-hide_banner', '-nostdin', '-skip_frame', 'nokey',
+               '-i', self.video_file,
+               '-vf', f'showinfo,scale={YOLO_MAX_WIDTH}:{self._h_out}',
+               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-vsync', '0', 'pipe:1']
+        try:
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE)
+        except Exception:
+            self._proc = None
+            return False
+        self._pts_q = queue.Queue()
+
+        def _reader():
+            try:
+                try:
+                    for line in self._proc.stderr:
+                        m = _PTS_TIME_RE.search(line.decode('utf-8', 'replace'))
+                        if m:
+                            try:
+                                self._pts_q.put(float(m.group(1)))
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass  # stderr закрыт при terminate - штатно
+            finally:
+                self._pts_q.put(None)
+
+        self._reader = threading.Thread(target=_reader, daemon=True)
+        self._reader.start()
+        return True
+
+    def _read_frame(self):
+        """Читает ровно один кадр из пайпа; None - конец потока или сбой."""
+        buf = bytearray()
+        try:
+            while len(buf) < self._frame_bytes:
+                chunk = self._proc.stdout.read(self._frame_bytes - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            pts = self._pts_q.get(timeout=120)
+        except Exception:
+            return None
+        if pts is None:
+            return None
+        frame = np.frombuffer(bytes(buf), dtype=np.uint8)
+        return pts, frame.reshape(self._h_out, YOLO_MAX_WIDTH, 3)
+
+    def _real_sec(self, pts):
+        return pts / self.slowmo_factor if self.slowmo_factor > 1 else pts
+
+    def _in_range(self, real_sec):
+        if self.range_start is not None and real_sec < self.range_start:
+            return False
+        if self.range_end is not None and real_sec > self.range_end:
+            return False
+        return True
+
+    def _stop_ffmpeg(self):
+        proc, self._proc = self._proc, None
+        self._reader = None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            for s in (proc.stdout, proc.stderr):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def __iter__(self):
+        if not self._start_ffmpeg():
+            _log(i18n.tr("  Не удалось извлечь ключевые кадры - скан обычными сэмплами"))
+            yield from _seek_sample_iter(self.cap, self.fps_real, self.total_frames,
+                                         self.sample_rate, self.range_start,
+                                         self.range_end)
+            return
+        try:
+            # Бутстрап: потребляем первые I-кадры, пока не накопим достаточно
+            # интервалов для оценки GOP; кадры буферизуются и отдаются далее
+            buffered = []
+            gaps = []
+            last_pts = None
+            while len(gaps) < KEYFRAME_BOOTSTRAP_GAPS:
+                item = self._read_frame()
+                if item is None:
+                    break
+                pts, frame = item
+                buffered.append((pts, frame))
+                if last_pts is not None and pts > last_pts:
+                    gaps.append(pts - last_pts)
+                last_pts = pts
+            gop = _median_gap([pts for pts, _ in buffered])
+            if gop > KEYFRAME_MAX_GAP:
+                _log(i18n.tr("  Ключевые кадры редкие (шаг ~{gap:.1f}с > {max:.0f}с) - "
+                             "скан обычными сэмплами", gap=gop, max=KEYFRAME_MAX_GAP))
+                yield from _seek_sample_iter(self.cap, self.fps_real,
+                                             self.total_frames, self.sample_rate,
+                                             self.range_start, self.range_end)
+                return
+            threshold = max(0.0, self.scan_interval - gop * 0.5)
+            # Оценка эффективного шага: жадный отбор по сетке I-кадров даёт
+            # шаг в [threshold; threshold+GOP); матожидание - threshold+GOP/2
+            eff = max(gop, threshold + gop * 0.5)
+            if eff > 0:
+                self.rate = 1.0 / eff
+            if self.real_duration > 0 and eff > 0:
+                self.sample_count = max(2, int(self.real_duration / eff) + 1)
+            _log(i18n.tr("  Скан по ключевым кадрам (стриминг): шаг ~{step:.2f}с, "
+                         "~{n} сэмплов (I-кадры каждые {gop:.2f}с)",
+                         step=eff, n=self.sample_count, gop=gop))
+            if gop > self.scan_interval + 1e-6:
+                _log(i18n.tr("  Внимание: I-кадры ({gop:.2f}с) реже шага скана "
+                             "({si:.1f}с) - детекция грубее, возможны пропуски",
+                             gop=gop, si=self.scan_interval))
+                _log(i18n.tr("  Рекомендация: шаг скана {step} для этого файла "
+                             "(I-кадры каждые {gop:.2f}с)",
+                             step=_recommended_scan_step(gop), gop=gop))
+            last_t = None
+            for pts, frame in buffered:
+                if last_t is None or pts - last_t >= threshold - 1e-6:
+                    last_t = pts
+                    real_sec = self._real_sec(pts)
+                    if self._in_range(real_sec):
+                        self._taken += 1
+                        yield real_sec, frame, self._taken, self.sample_count
+            del buffered
+            while True:
+                item = self._read_frame()
+                if item is None:
+                    break
+                pts, frame = item
+                if last_t is not None and pts - last_t < threshold - 1e-6:
+                    continue
+                last_t = pts
+                real_sec = self._real_sec(pts)
+                if not self._in_range(real_sec):
+                    if self.range_end is not None and real_sec > self.range_end:
+                        break
+                    continue
+                self._taken += 1
+                yield real_sec, frame, self._taken, self.sample_count
+        finally:
+            self._stop_ffmpeg()
 
 
 def _recommended_scan_step(gop):
@@ -573,9 +698,11 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     model - предзагруженная модель YOLO (переиспользуется между вызовами).
     restrict_range - (start_real, end_real): анализировать только этот диапазон
     реального времени (для точной стадии ручного режима).
-    Скан всегда идёт по ключевым кадрам (I-кадрам): декодируется минимум,
-    быстро с флешки. Сэмплы выбираются из I-кадров с шагом params['scan_interval']
-    (реже шага - все I-кадры). Если I-кадры в среднем реже KEYFRAME_MAX_GAP сек -
+    Скан всегда идёт по ключевым кадрам (I-кадрам) стримингом: ffmpeg
+    декодирует только I-кадры в пайп, нейросеть потребляет по мере
+    поступления - без промежуточных файлов и ожидания полного прохода.
+    Шаг сэмплирования - params['scan_interval'] (при редких I-кадрах -
+    все I-кадры). Если I-кадры в среднем реже KEYFRAME_MAX_GAP сек -
     откат к обычным сэмплам. Только для scan_mode.
     log_fn - callback для лога (GUI-панель приложения); по умолчанию консоль.
     """
@@ -597,59 +724,44 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     range_start, range_end = restrict_range if restrict_range else (None, None)
     use_keyframes = scan_mode and KEYFRAME_SCAN
 
-    # Prefetch следующего файла: ffmpeg-проход по битстриму (десятки секунд
-    # на флешке) и медленное открытие MSMF делаются в фоне, пока YOLO
-    # сканирует текущий файл - паузы на стыке файлов исчезают.
-    kf_prefetch = {}     # file_index -> (tmp_dir, kf_all, kf_gap, elapsed, cap)
-    kf_prefetch_tmp = []  # временные папки prefetch для очистки в конце
-    kf_prefetch_started = set()
+    # Prefetch следующего файла: медленное открытие MSMF (на Windows до
+    # 10-30с на 4ГБ MTS с флешки) делается в фоне, пока YOLO сканирует
+    # текущий файл. Ключевые кадры при стриминге готовить заранее не нужно.
+    cap_prefetch = {}         # file_index -> (cap, elapsed)
+    cap_prefetch_started = set()
 
     def _kf_prefetch_cleanup():
-        for item in kf_prefetch.values():
-            cap = item[-1]
+        for cap in cap_prefetch.values():
             if cap is not None:
                 cap.release()
-        for d in kf_prefetch_tmp:
-            shutil.rmtree(d, ignore_errors=True)
-        kf_prefetch_tmp.clear()
-        kf_prefetch.clear()
+        cap_prefetch.clear()
 
     def _prefetch_worker(idx, path):
         try:
-            cap = open_capture(path)
-            tmp = None
-            kf_all = kf_gap = None
             t0 = time.time()
-            if cap.isOpened():
-                tmp = tempfile.mkdtemp(prefix='FreestyleParserKF_')
-                kf_prefetch_tmp.append(tmp)
-                kf_all, kf_gap = _extract_keyframes(path, tmp)
-            kf_prefetch[idx] = (tmp, kf_all, kf_gap, time.time() - t0, cap)
+            cap = open_capture(path)
+            cap_prefetch[idx] = (cap, time.time() - t0)
         except Exception:
-            kf_prefetch[idx] = (None, None, 0.0, 0.0, None)
+            cap_prefetch[idx] = (None, 0.0)
 
     for file_index, video_file in enumerate(video_files):
         _log(f"Processing {video_file}...")
-        prefetched = kf_prefetch.pop(file_index, None) if use_keyframes else None
+        prefetched = cap_prefetch.pop(file_index, None) if scan_mode else None
 
-        # Сразу запускаем в фоне подготовку следующего файла (открытие MSMF
-        # + ffmpeg-проход по битстриму) - она перекроется сканом текущего
+        # Сразу запускаем в фоне открытие следующего файла - оно перекроется
+        # сканом текущего
         nxt = file_index + 1
-        if use_keyframes and nxt < file_count and nxt not in kf_prefetch_started:
-            kf_prefetch_started.add(nxt)
+        if scan_mode and nxt < file_count and nxt not in cap_prefetch_started:
+            cap_prefetch_started.add(nxt)
             threading.Thread(target=_prefetch_worker, args=(nxt, video_files[nxt]),
                              daemon=True).start()
 
         if prefetched is not None:
-            tmp_dir, kf_all, kf_gap, kf_elapsed, cap = prefetched
-            if cap is not None and cap.isOpened():
-                _log(i18n.tr("  Файл открыт и ключевые кадры извлечены в фоне "
-                             "(за {sec:.1f}с)", sec=kf_elapsed))
-            else:
+            cap, open_elapsed = prefetched
+            if cap is None or not cap.isOpened():
                 _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
-                if tmp_dir is not None:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
                 continue
+            _log(i18n.tr("  Файл открыт в фоне (за {sec:.1f}с)", sec=open_elapsed))
         else:
             open_t0 = time.time()
             cap = open_capture(video_file)
@@ -657,17 +769,6 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                 _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
                 continue
             _log(i18n.tr("  Файл открыт за {sec:.1f}с", sec=time.time() - open_t0))
-            tmp_dir = None
-            kf_all = None
-            kf_gap = 0.0
-            if use_keyframes:
-                tmp_dir = tempfile.mkdtemp(prefix='FreestyleParserKF_')
-                _log(i18n.tr("  Извлечение ключевых кадров (ffmpeg читает файл целиком - "
-                             "может занять десятки секунд)"))
-                kf_t0 = time.time()
-                kf_all, kf_gap = _extract_keyframes(video_file, tmp_dir)
-                _log(i18n.tr("  Извлечение ключевых кадров завершено за {sec:.1f}с",
-                             sec=time.time() - kf_t0))
 
         fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -678,37 +779,15 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                          "fps контейнера {container:.1f} -> реальный fps {real:.1f}",
                          factor=slowmo_factor, container=fps_container, real=fps_real))
 
-        kf_samples = None
-        if use_keyframes and kf_all is None and tmp_dir is not None:
-            _log(i18n.tr("  Не удалось извлечь ключевые кадры - скан обычными сэмплами"))
-        if use_keyframes and kf_all is not None:
-            if kf_gap > KEYFRAME_MAX_GAP:
-                _log(i18n.tr("  Ключевые кадры редкие (шаг ~{gap:.1f}с > {max:.0f}с) - "
-                             "скан обычными сэмплами",
-                             gap=kf_gap, max=KEYFRAME_MAX_GAP))
-            else:
-                kf_samples = _select_keyframes(kf_all, scan_interval)
-                sel_gap = _median_gap([pts for pts, _ in kf_samples])
-                _log(i18n.tr("  Скан по ключевым кадрам: {n} сэмплов, шаг ~{step:.2f}с "
-                             "(I-кадры в файле каждые {gop:.2f}с)",
-                             n=len(kf_samples), step=sel_gap, gop=kf_gap))
-                if sel_gap > scan_interval + 1e-6:
-                    _log(i18n.tr("  Внимание: I-кадры ({gop:.2f}с) реже шага скана "
-                                 "({si:.1f}с) - детекция грубее, возможны пропуски",
-                                 gop=kf_gap, si=scan_interval))
-                    _log(i18n.tr("  Рекомендация: шаг скана {step} для этого файла "
-                                 "(I-кадры каждые {gop:.2f}с)",
-                                 step=_recommended_scan_step(kf_gap), gop=kf_gap))
-                kf_gap = sel_gap
-            if kf_samples is None and tmp_dir is not None:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                tmp_dir = None
-
-        if kf_samples:
-            sample_iter = _keyframe_sample_iter(kf_samples, slowmo_factor, 1,
-                                                range_start, range_end)
-            analysis_rate = 1.0 / kf_gap if kf_gap > 0 else sample_rate
-            sample_count = len(kf_samples)
+        stream = None
+        if use_keyframes:
+            stream = _KeyframeStreamIter(cap, video_file, fps_real, total_frames,
+                                         real_duration, scan_interval,
+                                         slowmo_factor, range_start, range_end,
+                                         sample_rate)
+            sample_iter = iter(stream)
+            analysis_rate = stream.rate  # уточнится после бутстрапа стрима
+            sample_count = stream.sample_count
         elif scan_mode:
             # Скан: редкие сэмплы точечным seek - не декодируем весь файл
             sample_iter = _seek_sample_iter(cap, fps_real, total_frames, sample_rate,
@@ -723,13 +802,15 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                                             frame_skip, range_start, range_end)
             sample_count = total_frames
 
-        detector = _Detector(model, roi, video_file,
-                             analysis_rate=analysis_rate,
-                             real_duration=real_duration,
-                             params=params, min_strength=min_strength,
-                             attempt_number=attempt_number, callback=callback,
-                             scan_mode=scan_mode,
-                             range_start=range_start, range_end=range_end)
+        detector = None
+        if stream is None:
+            detector = _Detector(model, roi, video_file,
+                                 analysis_rate=analysis_rate,
+                                 real_duration=real_duration,
+                                 params=params, min_strength=min_strength,
+                                 attempt_number=attempt_number, callback=callback,
+                                 scan_mode=scan_mode,
+                                 range_start=range_start, range_end=range_end)
 
         file_t0 = time.time()
         last_hb = file_t0
@@ -743,9 +824,28 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                     stopped = True
                     _kf_prefetch_cleanup()
                     return
+                if detector is None:
+                    # Стриминговый скан: rate известен только после бутстрапа
+                    detector = _Detector(model, roi, video_file,
+                                         analysis_rate=stream.rate,
+                                         real_duration=real_duration,
+                                         params=params, min_strength=min_strength,
+                                         attempt_number=attempt_number,
+                                         callback=callback, scan_mode=scan_mode,
+                                         range_start=range_start,
+                                         range_end=range_end)
                 sample_index += 1
                 if progress_callback is not None:
-                    progress_callback(file_index, file_count, sample_index, sample_count)
+                    if stream is not None:
+                        # Стриминг: точное число сэмплов заранее неизвестно
+                        # (шаг квантуется по сетке I-кадров), поэтому прогресс
+                        # - по позиции в файле (реальное время из pts)
+                        progress_callback(file_index, file_count,
+                                          int(real_sec * 100),
+                                          int(max(real_duration, real_sec) * 100))
+                    else:
+                        progress_callback(file_index, file_count, sample_index,
+                                          sample_count)
                 now = time.time()
                 if now - last_hb >= 30.0:
                     last_hb = now
@@ -758,13 +858,21 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                     stopped = True
                     _kf_prefetch_cleanup()
                     return
+            if stream is not None and progress_callback is not None:
+                # Финальные проценты: последний сэмпл не доходит до конца файла
+                progress_callback(file_index, file_count,
+                                  int(real_duration * 100), int(real_duration * 100))
         finally:
+            if stream is not None:
+                try:
+                    sample_iter.close()
+                except Exception:
+                    pass
             if not stopped:
-                result = detector.finish()
-                attempt_number = detector.attempt_number
+                if detector is not None:
+                    result = detector.finish()
+                    attempt_number = detector.attempt_number
             cap.release()
-            if tmp_dir is not None:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
         if result is False:
             _kf_prefetch_cleanup()
             return

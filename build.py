@@ -58,6 +58,7 @@ def build_app():
         '--collect-all=supervision',  # ByteTrack в attempts_v2; пакет импортируется только из воркеров - PyInstaller его не видит сам
         '--collect-all=lap',  # C-расширение, нужное supervision.ByteTrack
         '--collect-all=torchreid',  # OSNet-реид в Embedder; импортируется лениво из воркеров
+        '--collect-all=gdown',  # torchreid импортирует его на верхнем уровне; gdown читает свою метаданные (importlib.metadata) - без dist-info в exe падает PackageNotFoundError
         '--hidden-import=PIL._tkinter_finder',
         '--hidden-import=cv2',
         '--hidden-import=numpy',

@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0
+          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0 tensorboard==2.21.0
           pip install pyinstaller==6.14.1
 
       - name: Download FFmpeg
@@ -42,6 +42,11 @@ jobs:
 
       - name: Build EXE
         run: python build.py
+
+      # gdown-метаданные в бандле и пр.: v1.3.x падал в exe с
+      # 'No package metadata was found for gdown' - смоук ловит это до релиза
+      - name: Smoke-test bundle
+        run: python tools/smoke_test.py --bundle dist/FreestyleParser
 
       - name: Zip dist (onedir)
         run: Compress-Archive -Path dist/FreestyleParser -DestinationPath dist/FreestyleParser-windows-x64.zip -Force
@@ -92,7 +97,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0
+          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0 tensorboard==2.21.0
           pip install pyinstaller==6.14.1
 
       # Tkinter именно питона раннера попадёт в бинарник (PyInstaller пакует его tcl/tk),
@@ -107,6 +112,10 @@ jobs:
 
       - name: Build binary
         run: python build.py
+
+      # Linux собирается --onefile (нет _internal) - проверяем только окружение
+      - name: Smoke-test environment
+        run: python tools/smoke_test.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -130,7 +139,9 @@ jobs:
     # Homebrew-питон с Tcl/Tk 9: инсталляторы python.org (actions/setup-python)
     # бандлят Tk 8.6, а код рассчитан на Tk 9 (<TouchpadScroll> и т.п.);
     # локальная dev-сборка - тоже brew python 3.13 + Tk 9.0
-    runs-on: macos-14
+    # macos-14, не latest: исторически; macos-15 совместим (тоже brew python-tk@3.13
+    # с Tcl/Tk 9), остаётся запасным раннером при отказе выделения macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -155,7 +166,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0
+          pip install ultralytics==8.3.146 opencv-python==4.11.0.86 pillow==11.2.1 pyyaml==6.0.2 requests numpy==2.2.6 scipy==1.15.3 scikit-learn==1.7.0 supervision==0.25.1 lap==0.5.12 matplotlib==3.10.3 torchreid==0.2.5 gdown==6.4.0 tensorboard==2.21.0
           pip install pyinstaller==6.14.1
 
       - name: Download FFmpeg
@@ -167,6 +178,10 @@ jobs:
       # v1.3.14: tkinter не попал в бандл, приложение падало на старте
       - name: Verify tkinter in bundle
         run: find dist/FreestyleParser.app -name "_tkinter*" | grep . || exit 1
+
+      # gdown-метаданные в бандле (см. smoke_test.py) - как в Windows-джобе
+      - name: Smoke-test bundle
+        run: python tools/smoke_test.py --bundle dist/FreestyleParser.app/Contents/MacOS/FreestyleParser
 
       - name: Build DMG
         run: |

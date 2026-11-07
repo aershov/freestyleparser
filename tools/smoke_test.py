@@ -20,6 +20,7 @@ import importlib
 import importlib.metadata as md
 import os
 import sys
+import traceback
 
 PINNED = {
     'numpy': 'numpy',
@@ -53,6 +54,8 @@ def check(name, fn):
     except Exception as e:
         failures.append((name, e))
         print(f"  FAIL: {name}: {e}")
+        for line in traceback.format_exc().splitlines()[1:]:
+            print(f"        {line}")
 
 
 def smoke_env():

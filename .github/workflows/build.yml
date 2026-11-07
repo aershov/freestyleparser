@@ -139,7 +139,9 @@ jobs:
     # Homebrew-питон с Tcl/Tk 9: инсталляторы python.org (actions/setup-python)
     # бандлят Tk 8.6, а код рассчитан на Tk 9 (<TouchpadScroll> и т.п.);
     # локальная dev-сборка - тоже brew python 3.13 + Tk 9.0
-    runs-on: macos-14
+    # macos-14, не latest: исторически; macos-15 совместим (тоже brew python-tk@3.13
+    # с Tcl/Tk 9), остаётся запасным раннером при отказе выделения macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

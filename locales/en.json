@@ -416,13 +416,11 @@
   "  Не удалось извлечь ключевые кадры - скан обычными сэмплами": "  Failed to extract keyframes - scanning with regular samples",
   "  Точечный seek медленный ({t:.1f} с/сэмпл): прогноз ~{h:.1f} ч на этот файл": "  Precise seek is slow ({t:.1f} s/sample): projected ~{h:.1f} h for this file",
   "  Прогресс: {sec:.0f}/{dur:.0f}с, {rate:.1f} сэмплов/с": "  Progress: {sec:.0f}/{dur:.0f}s, {rate:.1f} samples/s",
-  "  Скан по ключевым кадрам: {n} сэмплов, шаг ~{step:.2f}с (I-кадры в файле каждые {gop:.2f}с)": "  Keyframe scan: {n} samples, ~{step:.2f}s apart (file has I-frames every {gop:.2f}s)",
   "Шаг сканирования: 1/2, 1 или 2 сек.\nМеньше - точнее границы, больше сэмплов, дольше скан.\nЕсли I-кадры файла реже шага - предупреждение и\nрекомендация появятся в логе.": "Scan step: 1/2, 1 or 2 s.\nLower - sharper boundaries, more samples, longer scan.\nIf the file has I-frames sparser than the step, a warning\nand a recommendation appear in the log.",
   "  Внимание: I-кадры ({gop:.2f}с) реже шага скана ({si:.1f}с) - детекция грубее, возможны пропуски": "  Warning: I-frames ({gop:.2f}s) are sparser than the scan step ({si:.1f}s) - detection is coarser, short attempts may be missed",
   "  Рекомендация: шаг скана {step} для этого файла (I-кадры каждые {gop:.2f}с)": "  Recommendation: scan step {step} for this file (I-frames every {gop:.2f}s)",
-  "  Извлечение ключевых кадров (ffmpeg читает файл целиком - может занять десятки секунд)": "  Extracting keyframes (ffmpeg reads the whole file - may take tens of seconds)",
-  "  Извлечение ключевых кадров завершено за {sec:.1f}с": "  Keyframe extraction finished in {sec:.1f}s",
   "Загрузка нейросети YOLO (при первом запуске - до ~20с)...": "Loading the YOLO neural network (up to ~20s on first start)...",
   "  Файл открыт за {sec:.1f}с": "  File opened in {sec:.1f}s",
-  "  Файл открыт и ключевые кадры извлечены в фоне (за {sec:.1f}с)": "  File opened and keyframes extracted in the background (in {sec:.1f}s)"
+  "  Скан по ключевым кадрам (стриминг): шаг ~{step:.2f}с, ~{n} сэмплов (I-кадры каждые {gop:.2f}с)": "  Keyframe scan (streaming): step ~{step:.2f}s, ~{n} samples (I-frames every {gop:.2f}s)",
+  "  Файл открыт в фоне (за {sec:.1f}с)": "  File opened in the background (in {sec:.1f}s)"
 }

@@ -232,7 +232,6 @@
   "Режим слоумо выключен.": "Slowmo mode off.",
   "{n:.0f} КБ": "{n:.0f} KB",
   "Сегодня": "Today",
-  "Шаг сканирования видео в ручном режиме и грубом live-скане, сек.\nМеньше - точнее границы, дольше скан.": "Video scan step in manual mode and coarse live scan, seconds.\nLower - more precise boundaries, slower scan.",
   "В окне кандидата попыток не найдено - пропущен": "No attempts found in the candidate window - skipped",
   "Не удалось записать отметку обработки: {err}": "Failed to write the processed mark: {err}",
   "Не удалось записать журнал попыток: {err}": "Failed to write the attempts journal: {err}",
@@ -412,5 +411,13 @@
   "Чт": "Thu",
   "Пт": "Fri",
   "Сб": "Sat",
-  "Вс": "Sun"
+  "Вс": "Sun",
+  "  Ключевые кадры редкие (шаг ~{gap:.1f}с > {max:.0f}с) - скан обычными сэмплами": "  Keyframes are sparse (~{gap:.1f}s apart > {max:.0f}s) - scanning with regular samples",
+  "  Не удалось извлечь ключевые кадры - скан обычными сэмплами": "  Failed to extract keyframes - scanning with regular samples",
+  "  Точечный seek медленный ({t:.1f} с/сэмпл): прогноз ~{h:.1f} ч на этот файл": "  Precise seek is slow ({t:.1f} s/sample): projected ~{h:.1f} h for this file",
+  "  Прогресс: {sec:.0f}/{dur:.0f}с, {rate:.1f} сэмплов/с": "  Progress: {sec:.0f}/{dur:.0f}s, {rate:.1f} samples/s",
+  "  Скан по ключевым кадрам: {n} сэмплов, шаг ~{step:.2f}с (I-кадры в файле каждые {gop:.2f}с)": "  Keyframe scan: {n} samples, ~{step:.2f}s apart (file has I-frames every {gop:.2f}s)",
+  "Шаг сканирования: 1/2, 1 или 2 сек.\nМеньше - точнее границы, больше сэмплов, дольше скан.\nЕсли I-кадры файла реже шага - предупреждение и\nрекомендация появятся в логе.": "Scan step: 1/2, 1 or 2 s.\nLower - sharper boundaries, more samples, longer scan.\nIf the file has I-frames sparser than the step, a warning\nand a recommendation appear in the log.",
+  "  Внимание: I-кадры ({gop:.2f}с) реже шага скана ({si:.1f}с) - детекция грубее, возможны пропуски": "  Warning: I-frames ({gop:.2f}s) are sparser than the scan step ({si:.1f}s) - detection is coarser, short attempts may be missed",
+  "  Рекомендация: шаг скана {step} для этого файла (I-кадры каждые {gop:.2f}с)": "  Recommendation: scan step {step} for this file (I-frames every {gop:.2f}s)"
 }

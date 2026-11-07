@@ -100,9 +100,10 @@ typical 25–30 fps footage with fast entries into the feature bowl.</p>
       athlete must be present in the ROI for the start/continuation of an
       attempt to count (0–1). Higher — fewer false positives, but fast/distant
       entries may be missed.</td></tr>
-  <tr><td>Scan step, s</td><td>1 s</td><td>Sampling rate when scanning for
-      candidates (manual mode and fast «👁 View»). Lower — sharper boundaries
-      and a slower scan.</td></tr>
+  <tr><td>Scan step, s</td><td>1 s (choices: 1/2, 1, 2)</td><td>Sampling step when scanning for
+      candidates (manual mode and fast «👁 View»). Lower — sharper boundaries,
+      a slower scan. If the file has I-frames sparser than the step, a warning
+      with a recommended step appears in the log.</td></tr>
   <tr><td>Scan threshold</td><td>0.25</td><td>YOLO detection threshold during
       scanning (0–1) — deliberately below the normal analysis threshold so
       entries at the ROI border are not missed.</td></tr>
@@ -144,6 +145,16 @@ is not slow motion and is automatically treated as normal speed.</p>
       originals, no cutting.</td></tr>
   <tr><td>☑</td><td>☑</td><td>Full cycle: cutting + athlete assignment.</td></tr>
 </table>
+<p>Candidate scanning always uses keyframes (I-frames) only: minimal
+decoding, fast even from a flash drive. Samples are taken from I-frames at
+the «Scan step, s» interval (if I-frames are sparser than the step, all of
+them are used: 0.125 s GOP on GoPro slow-mo → one sample per second; 2 s GOP
+→ all I-frames). If I-frames are on average sparser than ~5 s, the scan
+automatically falls back to regular samples and reports it in the log. If
+I-frames are sparser than the chosen scan step, a warning and a step
+recommendation appear in the log. Scan speed is also visible
+in the log heartbeat (file position and samples/s every 30 s) and in the ETA
+under the progress bar.</p>
 
 <h2 id="athletes">Athletes and banks</h2>
 <p>On the <b>Athletes</b> tab every cut attempt is a tile with a frame.

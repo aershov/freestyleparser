@@ -38,6 +38,7 @@ PINNED = {
     'torchvision': 'torchvision',
     'torchreid': 'torchreid',
     'gdown': 'gdown',
+    'tensorboard': 'tensorboard',
 }
 
 # Пакеты, импортируемые лениво из воркеров - PyInstaller сам их не видит,

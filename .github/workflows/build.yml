@@ -43,6 +43,11 @@ jobs:
       - name: Build EXE
         run: python build.py
 
+      # gdown-метаданные в бандле и пр.: v1.3.x падал в exe с
+      # 'No package metadata was found for gdown' - смоук ловит это до релиза
+      - name: Smoke-test bundle
+        run: python tools/smoke_test.py --bundle dist/FreestyleParser
+
       - name: Zip dist (onedir)
         run: Compress-Archive -Path dist/FreestyleParser -DestinationPath dist/FreestyleParser-windows-x64.zip -Force
 
@@ -108,6 +113,10 @@ jobs:
       - name: Build binary
         run: python build.py
 
+      # Linux собирается --onefile (нет _internal) - проверяем только окружение
+      - name: Smoke-test environment
+        run: python tools/smoke_test.py
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -167,6 +176,10 @@ jobs:
       # v1.3.14: tkinter не попал в бандл, приложение падало на старте
       - name: Verify tkinter in bundle
         run: find dist/FreestyleParser.app -name "_tkinter*" | grep . || exit 1
+
+      # gdown-метаданные в бандле (см. smoke_test.py) - как в Windows-джобе
+      - name: Smoke-test bundle
+        run: python tools/smoke_test.py --bundle dist/FreestyleParser.app/Contents/MacOS/FreestyleParser
 
       - name: Build DMG
         run: |

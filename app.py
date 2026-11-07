@@ -2493,8 +2493,10 @@ class FreestyleParserApp:
         self.main_frame = tk.PanedWindow(self.root, orient=tk.VERTICAL)
         # заметный шов: иначе на Windows границу панелей не видно и
         # не за что ухватиться мышью (ресайз кажется сломанным)
+        # отступ снизу 34px - полоса под язычок «Логи» (иначе на низком
+        # окне он накрывает кнопку «Обработать»)
         self.main_frame.configure(sashwidth=6, sashrelief=tk.RAISED)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 34))
 
         # === Плавающий выбор языка в правом верхнем углу (в титлбар ОС
         # Tkinter виджеты не помещает) - поверх пустого угла панели «Попытки» ===
@@ -3013,13 +3015,16 @@ class FreestyleParserApp:
 
         # === ЛОГИ ===
         # Логи: сворачиваемая панель, по умолчанию скрыта.
-        # Кнопка-язычок живёт ПОВЕРХ основного окна (в скрытой панели
-        # она была бы не видна), в левом нижнем углу.
-        self.logs_btn = tk.Label(self.main_frame, text=i18n.tr('▸ Логи'),
+        # Кнопка-язычок живёт в постоянной полосе внизу окна (под ней
+        # зарезервировано 34px в отступе main_frame) - на низком окне
+        # контент скроллится и никогда не оказывается под язычком.
+        self.logs_bar = tk.Frame(self.root)
+        self.logs_bar.place(relx=0.0, rely=1.0, x=14, y=-10,
+                            anchor='sw', relwidth=1.0, width=-28, height=24)
+        self.logs_btn = tk.Label(self.logs_bar, text=i18n.tr('▸ Логи'),
                                  cursor='hand2', font=('Arial', 10, 'bold'),
                                  padx=4, bg='#e8e8e8')
-        self.logs_btn.place(relx=0.0, rely=1.0, x=4, y=-4, anchor='sw')
-        self.logs_btn.lift()
+        self.logs_btn.pack(side=tk.LEFT, anchor='sw')
         self.logs_btn.bind('<Button-1>', lambda e: self._toggle_logs())
         self.frame_logs_wrap = tk.Frame(self.main_frame)
         self.main_frame.add(self.frame_logs_wrap)

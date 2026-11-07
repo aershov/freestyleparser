@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from ultralytics import YOLO
@@ -585,6 +586,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         params = DEFAULT_PROCESSING_PARAMS.copy()
     min_strength = params.get('min_detection_strength', 0.5)
     if model is None:
+        _log(i18n.tr("Загрузка нейросети YOLO (при первом запуске - до ~20с)..."))
         model = load_yolo_model()
 
     video_files = sorted(input_paths, key=os.path.basename)
@@ -595,12 +597,77 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     range_start, range_end = restrict_range if restrict_range else (None, None)
     use_keyframes = scan_mode and KEYFRAME_SCAN
 
+    # Prefetch следующего файла: ffmpeg-проход по битстриму (десятки секунд
+    # на флешке) и медленное открытие MSMF делаются в фоне, пока YOLO
+    # сканирует текущий файл - паузы на стыке файлов исчезают.
+    kf_prefetch = {}     # file_index -> (tmp_dir, kf_all, kf_gap, elapsed, cap)
+    kf_prefetch_tmp = []  # временные папки prefetch для очистки в конце
+    kf_prefetch_started = set()
+
+    def _kf_prefetch_cleanup():
+        for item in kf_prefetch.values():
+            cap = item[-1]
+            if cap is not None:
+                cap.release()
+        for d in kf_prefetch_tmp:
+            shutil.rmtree(d, ignore_errors=True)
+        kf_prefetch_tmp.clear()
+        kf_prefetch.clear()
+
+    def _prefetch_worker(idx, path):
+        try:
+            cap = open_capture(path)
+            tmp = None
+            kf_all = kf_gap = None
+            t0 = time.time()
+            if cap.isOpened():
+                tmp = tempfile.mkdtemp(prefix='FreestyleParserKF_')
+                kf_prefetch_tmp.append(tmp)
+                kf_all, kf_gap = _extract_keyframes(path, tmp)
+            kf_prefetch[idx] = (tmp, kf_all, kf_gap, time.time() - t0, cap)
+        except Exception:
+            kf_prefetch[idx] = (None, None, 0.0, 0.0, None)
+
     for file_index, video_file in enumerate(video_files):
         _log(f"Processing {video_file}...")
-        cap = open_capture(video_file)
-        if not cap.isOpened():
-            _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
-            continue
+        prefetched = kf_prefetch.pop(file_index, None) if use_keyframes else None
+
+        # Сразу запускаем в фоне подготовку следующего файла (открытие MSMF
+        # + ffmpeg-проход по битстриму) - она перекроется сканом текущего
+        nxt = file_index + 1
+        if use_keyframes and nxt < file_count and nxt not in kf_prefetch_started:
+            kf_prefetch_started.add(nxt)
+            threading.Thread(target=_prefetch_worker, args=(nxt, video_files[nxt]),
+                             daemon=True).start()
+
+        if prefetched is not None:
+            tmp_dir, kf_all, kf_gap, kf_elapsed, cap = prefetched
+            if cap is not None and cap.isOpened():
+                _log(i18n.tr("  Файл открыт и ключевые кадры извлечены в фоне "
+                             "(за {sec:.1f}с)", sec=kf_elapsed))
+            else:
+                _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
+                if tmp_dir is not None:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                continue
+        else:
+            open_t0 = time.time()
+            cap = open_capture(video_file)
+            if not cap.isOpened():
+                _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_file))
+                continue
+            _log(i18n.tr("  Файл открыт за {sec:.1f}с", sec=time.time() - open_t0))
+            tmp_dir = None
+            kf_all = None
+            kf_gap = 0.0
+            if use_keyframes:
+                tmp_dir = tempfile.mkdtemp(prefix='FreestyleParserKF_')
+                _log(i18n.tr("  Извлечение ключевых кадров (ffmpeg читает файл целиком - "
+                             "может занять десятки секунд)"))
+                kf_t0 = time.time()
+                kf_all, kf_gap = _extract_keyframes(video_file, tmp_dir)
+                _log(i18n.tr("  Извлечение ключевых кадров завершено за {sec:.1f}с",
+                             sec=time.time() - kf_t0))
 
         fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -612,14 +679,10 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                          factor=slowmo_factor, container=fps_container, real=fps_real))
 
         kf_samples = None
-        kf_gap = 0.0
-        tmp_dir = None
-        if use_keyframes:
-            tmp_dir = tempfile.mkdtemp(prefix='FreestyleParserKF_')
-            kf_all, kf_gap = _extract_keyframes(video_file, tmp_dir)
-            if kf_all is None:
-                _log(i18n.tr("  Не удалось извлечь ключевые кадры - скан обычными сэмплами"))
-            elif kf_gap > KEYFRAME_MAX_GAP:
+        if use_keyframes and kf_all is None and tmp_dir is not None:
+            _log(i18n.tr("  Не удалось извлечь ключевые кадры - скан обычными сэмплами"))
+        if use_keyframes and kf_all is not None:
+            if kf_gap > KEYFRAME_MAX_GAP:
                 _log(i18n.tr("  Ключевые кадры редкие (шаг ~{gap:.1f}с > {max:.0f}с) - "
                              "скан обычными сэмплами",
                              gap=kf_gap, max=KEYFRAME_MAX_GAP))
@@ -678,6 +741,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                 if should_continue is not None and not should_continue():
                     _log(i18n.tr("  Остановка обработки по запросу пользователя"))
                     stopped = True
+                    _kf_prefetch_cleanup()
                     return
                 sample_index += 1
                 if progress_callback is not None:
@@ -692,6 +756,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                 result = detector.process_sample(real_sec, frame)
                 if result is False:
                     stopped = True
+                    _kf_prefetch_cleanup()
                     return
         finally:
             if not stopped:
@@ -701,18 +766,6 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
             if tmp_dir is not None:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
         if result is False:
+            _kf_prefetch_cleanup()
             return
-            sample_index += 1
-            if progress_callback is not None:
-                progress_callback(file_index, file_count, sample_index, sample_count)
-
-            result = detector.process_sample(real_sec, frame)
-            if result is False:
-                cap.release()
-                return
-
-        result = detector.finish()
-        attempt_number = detector.attempt_number
-        cap.release()
-        if result is False:
-            return
+    _kf_prefetch_cleanup()

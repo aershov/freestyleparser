@@ -55,6 +55,30 @@ def _live_num_str(num):
     """Номер live-попытки в формате файла (0005)."""
     return f"{num:04d}"
 
+# Шаг скана: выбор из фиксированных значений (качество/скорость)
+SCAN_STEP_CHOICES = ['1/2', '1', '2']
+
+def _scan_step_to_str(value):
+    """Шаг скана (сек) -> строка комбобокса ('1/2', '1', '2')."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return '1'
+    if abs(v - 0.5) < 1e-6:
+        return '1/2'
+    if abs(v - 2.0) < 1e-6:
+        return '2'
+    return '1'
+
+def _scan_step_from_str(text):
+    """Строка комбобокса ('1/2', '1', '2') -> шаг скана в секундах."""
+    text = (text or '').strip()
+    if text in ('1/2', '0.5'):
+        return 0.5
+    if text == '2':
+        return 2.0
+    return 1.0
+
 def _natural_key(path):
     """Натуральный ключ сортировки файлов: CAM2 перед CAM10."""
     name = os.path.basename(path).lower()
@@ -901,7 +925,8 @@ class FreestyleParserApp:
                           next_attempt_number, params=self.processing_params,
                           progress_callback=self.on_processing_progress,
                           should_continue=lambda: self.processing,
-                          slowmo_factor=self._active_slowmo_factor)
+                          slowmo_factor=self._active_slowmo_factor,
+                          log_fn=self.log)
             self.log(i18n.tr("Файлы {files} успешно обработаны.", files=files))
             if self.processing:
                 for f in files:
@@ -936,7 +961,8 @@ class FreestyleParserApp:
                           progress_callback=self.on_processing_progress,
                           should_continue=lambda: self.processing,
                           slowmo_factor=self._active_slowmo_factor,
-                          scan_mode=True)
+                          scan_mode=True,
+                          log_fn=self.log)
             self.save_candidates()
             if self.processing:
                 for f in self.selected_files:
@@ -1023,7 +1049,8 @@ class FreestyleParserApp:
                           progress_callback=self.on_processing_progress,
                           should_continue=lambda: self.processing,
                           slowmo_factor=factor,
-                          scan_mode=True)
+                          scan_mode=True,
+                          log_fn=self.log)
             # NB: файлы НЕ помечаем processed - ничего не сохранено
             with self._live_lock:
                 n_total = len(self.live_attempts)
@@ -2012,7 +2039,8 @@ class FreestyleParserApp:
                                   should_continue=lambda: self.processing,
                                   slowmo_factor=slowmo,
                                   model=model,
-                                  restrict_range=(win_start, win_end))
+                                  restrict_range=(win_start, win_end),
+                                  log_fn=self.log)
                 except Exception as e:
                     self.log(i18n.tr("Ошибка точного анализа: {err} {trace}", err=e,
                                      trace=traceback.format_exc()), logging.ERROR)
@@ -2150,7 +2178,7 @@ class FreestyleParserApp:
             parts.append(f"{name} [{pos}]" if pos else name)
         t0 = getattr(self, '_progress_file_t0', None)
         fp = getattr(self, '_progress_file_percent', 0.0)
-        if t0 and fp > 2.0:
+        if t0 and fp > 0.5:
             parts.append(i18n.tr("осталось {eta}", eta=self._fmt_eta(
                 (time.time() - t0) * (100.0 - fp) / fp)))
         self.progress_info_var.set(' · '.join(parts))
@@ -2465,8 +2493,10 @@ class FreestyleParserApp:
         self.main_frame = tk.PanedWindow(self.root, orient=tk.VERTICAL)
         # заметный шов: иначе на Windows границу панелей не видно и
         # не за что ухватиться мышью (ресайз кажется сломанным)
+        # отступ снизу 34px - полоса под язычок «Логи» (иначе на низком
+        # окне он накрывает кнопку «Обработать»)
         self.main_frame.configure(sashwidth=6, sashrelief=tk.RAISED)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 34))
 
         # === Плавающий выбор языка в правом верхнем углу (в титлбар ОС
         # Tkinter виджеты не помещает) - поверх пустого угла панели «Попытки» ===
@@ -2651,8 +2681,10 @@ class FreestyleParserApp:
                 i18n.tr('Минимальная сила сигнала детекции (0-1) для начала/продолжения попытки.\n'
                         'Меньше - ловит тусклые/далёкие появления, больше - строгость.'),
             'scan_interval':
-                i18n.tr('Шаг сканирования видео в ручном режиме и грубом live-скане, сек.\n'
-                        'Меньше - точнее границы, дольше скан.'),
+                i18n.tr('Шаг сканирования: 1/2, 1 или 2 сек.\n'
+                        'Меньше - точнее границы, больше сэмплов, дольше скан.\n'
+                        'Если I-кадры файла реже шага - предупреждение и\n'
+                        'рекомендация появятся в логе.'),
             'scan_threshold':
                 i18n.tr('Порог YOLO при сканировании (0-1), ниже обычного анализа.\n'
                         'Меньше - больше кандидатов (в т.ч. ложных).'),
@@ -2671,13 +2703,20 @@ class FreestyleParserApp:
                 row_frame.pack(fill=tk.X, pady=2, padx=5)
             label = tk.Label(row_frame, text=label_text, anchor=tk.W)
             label.pack(side=tk.LEFT, padx=(0, 2))
-            var = tk.StringVar(value=str(self.processing_params[key]))
-            entry = tk.Entry(row_frame, textvariable=var, width=6)
-            entry.pack(side=tk.LEFT, padx=(0, 15))
+            var = tk.StringVar()
+            if key == 'scan_interval':
+                var.set(_scan_step_to_str(self.processing_params[key]))
+                widget = ttk.Combobox(row_frame, textvariable=var,
+                                      values=SCAN_STEP_CHOICES, width=4,
+                                      state='readonly')
+            else:
+                var.set(str(self.processing_params[key]))
+                widget = tk.Entry(row_frame, textvariable=var, width=6)
+            widget.pack(side=tk.LEFT, padx=(0, 15))
             self.param_vars[key] = var
             hint = param_hints.get(key, '')
             if hint:
-                self._attach_tooltip(entry, hint + i18n.tr("\n\nПо умолчанию: {default}",
+                self._attach_tooltip(widget, hint + i18n.tr("\n\nПо умолчанию: {default}",
                                      default=DEFAULT_PROCESSING_PARAMS.get(key, '?')))
 
         # --- Слоумо: чекбокс + коэффициент (в той же сетке параметров) ---
@@ -2976,13 +3015,16 @@ class FreestyleParserApp:
 
         # === ЛОГИ ===
         # Логи: сворачиваемая панель, по умолчанию скрыта.
-        # Кнопка-язычок живёт ПОВЕРХ основного окна (в скрытой панели
-        # она была бы не видна), в левом нижнем углу.
-        self.logs_btn = tk.Label(self.main_frame, text=i18n.tr('▸ Логи'),
+        # Кнопка-язычок живёт в постоянной полосе внизу окна (под ней
+        # зарезервировано 34px в отступе main_frame) - на низком окне
+        # контент скроллится и никогда не оказывается под язычком.
+        self.logs_bar = tk.Frame(self.root)
+        self.logs_bar.place(relx=0.0, rely=1.0, x=14, y=-10,
+                            anchor='sw', relwidth=1.0, width=-28, height=24)
+        self.logs_btn = tk.Label(self.logs_bar, text=i18n.tr('▸ Логи'),
                                  cursor='hand2', font=('Arial', 10, 'bold'),
                                  padx=4, bg='#e8e8e8')
-        self.logs_btn.place(relx=0.0, rely=1.0, x=4, y=-4, anchor='sw')
-        self.logs_btn.lift()
+        self.logs_btn.pack(side=tk.LEFT, anchor='sw')
         self.logs_btn.bind('<Button-1>', lambda e: self._toggle_logs())
         self.frame_logs_wrap = tk.Frame(self.main_frame)
         self.main_frame.add(self.frame_logs_wrap)
@@ -4415,6 +4457,9 @@ class FreestyleParserApp:
     def _sync_params_from_ui(self):
         """Считывает значения параметров из UI в processing_params"""
         for key, var in self.param_vars.items():
+            if key == 'scan_interval':
+                self.processing_params[key] = _scan_step_from_str(var.get())
+                continue
             try:
                 val = float(var.get())
                 self.processing_params[key] = val
@@ -4425,7 +4470,10 @@ class FreestyleParserApp:
     def _sync_ui_from_params(self):
         """Обновляет UI из processing_params"""
         for key, var in self.param_vars.items():
-            var.set(str(self.processing_params[key]))
+            if key == 'scan_interval':
+                var.set(_scan_step_to_str(self.processing_params[key]))
+            else:
+                var.set(str(self.processing_params[key]))
 
     def extract_frame(self, video_path, output_path, seek_s=3.0,
                       scale_w=None, scale_h=None, keyframe_only=True):
@@ -5299,6 +5347,7 @@ class FreestyleParserApp:
                 'params': dict(self.processing_params),
                 'slowmo_quarter': bool(self.slowmo_var.get()) if self.slowmo_var else False,
                 'slowmo_factor': self._ui_slowmo_factor() if self.slowmo_var else 1,
+                'scan_keyframes_only': True,
                 'strategy': self._strategy(),
                 'selected_files': [f for f in self.selected_files if isinstance(f, str)],
             }

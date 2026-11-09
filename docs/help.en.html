@@ -265,12 +265,12 @@ bank. If the athlete is new (not in the bank), they will appear as
 <p>GH4 slow motion is baked into the timestamps; metadata doesn't differ.
 Enable «Slow motion» with factor 1/4 manually.</p>
 <h3>Processing was interrupted (laptop sleep, restart)</h3>
-<p>Just press «⏵ Process» again: finished files of the day are skipped, the
-unfinished file continues where it stopped, and already-cut attempts are not
-duplicated (the attempts journal in the day folder). Clip numbering continues
-without gaps. To deliberately re-process a file, remove its entries from
-<b>processed.yaml</b> and <b>attempts_index.yaml</b> in the day folder
-(the files are human-readable).</p>
+<p>The «⏵ Process» button becomes «Continue»: the run resumes from the last
+cut attempt (the resume point is stored in <b>processing_state.yaml</b> in
+the day folder) and clip numbering continues. A «⟲ Restart» button appears
+next to it — start from attempt #1 with overwrite: the resume point and the
+attempts journal are reset. In auto mode each attempt is cut in a background
+thread, so detection never waits for the disk.</p>
 <h3>Where is the data stored</h3>
 <p>Everything for a day lives in the day folder (clips, jpg, mapping.yaml,
 attempt_profiles.npz). The personal registry and base banks are in

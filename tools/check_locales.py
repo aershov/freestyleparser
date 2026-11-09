@@ -23,7 +23,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CODE_FILES = ["app.py", "Components.py", "utils.py", "splitter.py",
-              "attempts_v2.py"]
+              "attempts_v2.py", "athlete_attribution.py"]
 EN = os.path.join(ROOT, "locales", "en.json")
 
 # Модули, в которых ищем tr-вызовы (относительно ROOT)
@@ -53,9 +53,15 @@ def is_cyrillic(s):
 def extract_keys(path):
     """Все константные ключи i18n.tr("...") из файла (AST)."""
     keys = set()
+    all_strs = set()
     with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read())
     for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and is_cyrillic(node.value):
+            # строковые литералы тоже "использование": ключи могут лежать
+            # в таблицах (STRATEGY_MODES и т.п.) и переводиться в рантайме
+            all_strs.add(node.value)
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "tr"):
             continue
@@ -67,7 +73,7 @@ def extract_keys(path):
             continue  # динамический ключ (переменная) - обрабатываем группами
         if isinstance(key, str):
             keys.add(key)  # любые строковые ключи (в т.ч. без кириллицы)
-    return keys
+    return keys, all_strs
 
 
 def main():
@@ -76,9 +82,12 @@ def main():
         en = json.load(f)
 
     used = set()
+    literals = set()
     for mod in CODE_FILES:
         path = os.path.join(ROOT, mod)
-        used |= extract_keys(path)
+        ks, strs = extract_keys(path)
+        used |= ks
+        literals |= strs
 
     # 1. В коде, но нет перевода
     missing = used - set(en)
@@ -89,7 +98,7 @@ def main():
     dynamic = set()
     for group in DYNAMIC_GROUPS.values():
         dynamic |= set(group)
-    dead = set(en) - used - dynamic - WHITELIST
+    dead = set(en) - used - literals - dynamic - WHITELIST
     for k in sorted(dead):
         warnings.append(f"ключ в en.json не используется: {k!r}")
 

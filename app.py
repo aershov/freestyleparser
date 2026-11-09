@@ -7,12 +7,17 @@ import cv2
 from PIL import Image, ImageTk
 import subprocess
 import datetime
+import json
 import threading
+import queue
 import yaml
 import logging
 import re
 import shutil
 from utils import *
+import splitter
+import athlete_attribution
+from athlete_attribution import AthleteAttribution
 import time
 import i18n
 import ui_tr
@@ -242,20 +247,17 @@ class FreestyleParserApp:
         self._candidates_lock = threading.RLock()
         self._ratings_lock = threading.Lock()
         self.need_update_attempts = False
-        self.athlete_mapping = {}  # Инициализируем пустой словарь
         self._thumb_model = None   # кеш YOLO для умных превью
         self._embedder = None      # кеш OSNet-эмбеддера для профилей из клипов
-        self.attempt_assignments = {}  # авто-привязки: {attempt: {athlete, sim, second}}
-        self._assignments_lock = threading.Lock()
-        self._registry_cache = None   # глобальный реестр атлетов (~/.FreestyleParser)
-        self._base_banks_cache = None  # базовые банки (read-only, кеш сессии)
-        self.athlete_segments = []    # сегменты скана атлетов (без нарезки)
-        self._segment_profiles = {}   # {key: {'vest', 'boat'}} профили сегментов
+        # Атрибутика атлетов: маппинг/assignments/сегменты/банки/реестр -
+        # вынесена в athlete_attribution.py, здесь делегирующие свойства
+        self.attribution = AthleteAttribution(self)
         self.need_update_segments = False
         self.need_update_files = False
         self.athlete_widgets = []
         self.filter_var = tk.StringVar(value=i18n.tr("Все"))
         self.selected_attempts = set()  # Множество выбранных попыток
+        self.selected_segments = set()  # Выбранные сегменты скана (нарезка)
         self.attempt_checkboxes = {}  # Словарь для хранения чекбоксов попыток
         self.attempt_ratings = {}  # Словарь для хранения рейтингов попыток: {attempt: {'up': bool, 'down': bool}}
         self.active_rating_filters = set()  # Множество активных фильтров по рейтингу
@@ -265,8 +267,8 @@ class FreestyleParserApp:
         self._active_slowmo_factor = 1  # коэффициент замедления текущей обработки
         self._audio_stream_cache = {}  # video_path -> bool (есть ли аудио-дорожка)
         self._file_duration_cache = {}  # video_path -> длительность файла, с
-        self.save_now_var = None     # [ ] Сразу сохранять (создаётся в setup_ui)
-        self.athletes_var = None     # [ ] Определять атлетов (создаётся в setup_ui)
+        self.strategy_var = None     # режим обработки (комбобокс, setup_ui)
+        self._thumb_photo_cache = {}
         self.candidates = []  # кандидаты попыток ручного режима: {file,start,end,thumbnail,selected,status}
         self.candidate_vars = {}  # ключ кандидата -> tk.BooleanVar чекбокса
         self.candidates_file = None  # путь candidates.yaml, обновляется в on_output_folder_changed
@@ -278,6 +280,10 @@ class FreestyleParserApp:
         self._live_lock = threading.Lock()
         self._live_next_num = 0
         self._live_player_opened = False
+        # единая точка продолжения: режим текущего прогона и номер последней
+        # закоммиченной попытки (пишутся в processing_state.yaml)
+        self._run_mode = None
+        self._run_last_number = 0
 
         # self.on_output_folder_changed()
 
@@ -291,6 +297,8 @@ class FreestyleParserApp:
             self.update_folder_status()
             print(f"Рабочая папка не существует: {self.output_folder} - "
                   f"выберите день (📅) или папку (Изменить)")
+        # «Обработать»/«Продолжить» - по точке продолжения текущей папки
+        self.update_process_button_state()
         # Запускаем периодическое обновление
         self.root.after(1000, self.periodic_update)
         # после отрисовки окна: пересчитать колонки сетки попыток
@@ -445,6 +453,8 @@ class FreestyleParserApp:
         self.selected_files = sorted([f for f in files if isinstance(f, str)],
                                      key=_natural_key)
         self._render_file_list()
+        self._refresh_strategy_values()
+        self._update_strategy_hint()
 
     def _restore_selected_files(self):
         """Восстанавливает выбор файлов этого дня (processing.yaml в папке дня):
@@ -531,13 +541,242 @@ class FreestyleParserApp:
                 pass
         return {}
 
+    def _log_source_diagnostics(self, video_path):
+        """Диагностика исходника в лог: разрешение, fps, кодек, длительность,
+        размер, GOP (кадров между I-кадрами) — влияет на скорость скана."""
+        name = os.path.basename(video_path)
+        try:
+            r = subprocess.run(
+                [get_ffprobe_path(), '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries',
+                 'stream=codec_name,width,height,avg_frame_rate:format=duration,size',
+                 '-of', 'json', self.get_absolute_path(video_path)],
+                capture_output=True, text=True, timeout=60)
+            info = json.loads(r.stdout or '{}')
+            st = (info.get('streams') or [{}])[0]
+            fmt = info.get('format') or {}
+            w, h = st.get('width'), st.get('height')
+            fps = st.get('avg_frame_rate') or ''
+            if '/' in fps:
+                num, den = fps.split('/')
+                fps = f"{float(num) / float(den):.2f}" if float(den) else '?'
+            dur = float(fmt.get('duration') or 0)
+            size = float(fmt.get('size') or 0)
+            gop = self._probe_gop(video_path)
+            self.log(i18n.tr("  Файл: {wxh}, {fps} fps, {codec}, "
+                             "{dur:.0f} мин, {gb:.1f} ГБ, GOP={gop} кадров",
+                             wxh=f"{w}x{h}", fps=fps or '?',
+                             codec=st.get('codec_name', '?'),
+                             dur=dur / 60.0, gb=size / 1e9, gop=gop or '?'))
+        except Exception as e:
+            self.log(i18n.tr("  Диагностика файла недоступна: {err}", err=e),
+                     logging.WARNING)
+
+    def _probe_gop(self, video_path):
+        """Размер GOP: кадров между первыми I-кадрами (по первым 300 кадрам)."""
+        r = subprocess.run(
+            [get_ffprobe_path(), '-v', 'error', '-read_intervals', '%+#300',
+             '-select_streams', 'v:0', '-show_entries', 'frame=pict_type',
+             '-of', 'csv=p=0', self.get_absolute_path(video_path)],
+            capture_output=True, text=True, timeout=60)
+        types = [l.strip().rstrip(',') for l in r.stdout.splitlines()
+                 if l.strip().rstrip(',')]
+        i_idx = [i for i, t in enumerate(types) if t == 'I']
+        return (i_idx[1] - i_idx[0]) if len(i_idx) >= 2 else (
+            i_idx[0] if i_idx else None)
+
+    def _log_file_done(self, base, size_bytes, t0):
+        """Итог по одному файлу: размер и время разбора."""
+        elapsed = max(0, int(time.time() - t0))
+        mins, secs = divmod(elapsed, 60)
+        self.log(i18n.tr("Файл {file} ({gb:.1f} ГБ) разобран за "
+                         "{mins} мин {secs:02d} с",
+                         file=base, gb=(size_bytes or 0) / 1e9,
+                         mins=mins, secs=secs))
+
     def _log_processing_summary(self, strategy, files, t0, completed):
         """Итог прогона в лог: тип процессинга, длительность, число файлов."""
-        mins, secs = divmod(max(0, int(time.time() - t0)), 60)
+        elapsed = max(0, int(time.time() - t0))
+        mins, secs = divmod(elapsed, 60)
         state = i18n.tr("завершён") if completed else i18n.tr("ПРЕРВАН")
         self.log(i18n.tr("Итог [{strategy}]: {state}, время {mins} мин {secs:02d} с, "
                  "файлов: {n}", strategy=strategy, state=state, mins=mins,
                  secs=secs, n=len(files)))
+        if completed and getattr(self, '_run_mode', None):
+            # калибровка оценки времени режима: сек прогона / мин видео
+            video_sec = sum(max(self._get_file_duration(f), 0.0) for f in files)
+            if video_sec > 60:
+                self._record_mode_timing(self._run_mode, video_sec / 60.0, elapsed)
+
+    def _speed_stats_file(self):
+        return os.path.join(self._app_folder, 'speed_stats.yaml')
+
+    def _mode_speed_factor(self, mode):
+        """Сек прогонa на минуту видео. Приоритет: факт прошлых завершённых
+        прогонов -> композиция проб (носитель: декодинг первого файла +
+        модель/атрибутика: эталонный ролик) -> встроенная прикидка.
+        Возвращает (фактор, источник)."""
+        data = {}
+        f = self._speed_stats_file()
+        if os.path.exists(f):
+            try:
+                with open(f, encoding='utf-8') as fh:
+                    data = yaml.safe_load(fh) or {}
+            except Exception:
+                data = {}
+        s = data.get(mode) or {}
+        total_s, total_min = float(s.get('run_seconds', 0)), float(s.get('video_minutes', 0))
+        if total_min >= 5:
+            return total_s / total_min, i18n.tr("по прошлым прогонам")
+        comp = self._probe_data()
+        if comp:
+            # стоимость сек видео: декодинг файла + YOLO-детекция;
+            # все режимы теперь на едином кейфрейм-скане, атлет-режимы
+            # добавляют reid-эмбеддинги по сэмплам зон (~x1.5)
+            cost = 1.0 / comp['user_rate'] + \
+                comp['user_density'] / (comp['ref_rate'] * comp['ref_density'])
+            if mode in ('attempts', 'athletes'):
+                cost *= 1.5
+            factor = 60.0 * cost  # сек прогона на минуту видео
+            return factor, i18n.tr("по пробе")
+        for code, _l, _d, default_f in self.STRATEGY_MODES:
+            if code == mode:
+                return default_f, i18n.tr("прикидка")
+        return 1.0, i18n.tr("прикидка")
+
+    def _probe_data(self):
+        """Компоненты оценки скорости (кэш за сессию, сборка в фоне):
+        user_rate/user_density - декодинг I-кадров первого файла (носитель);
+        ref_rate/ref_density - полный пайплайн на эталоне (модель);
+        reid_sec_per_embed - один OSNet-эмбеддинг (атрибутика)."""
+        cache = getattr(self, '_probe_data_val', None)
+        if cache is not None:
+            return cache
+        if getattr(self, '_probe_data_running', False):
+            return None
+        self._probe_data_running = True
+
+        def _do():
+            import splitter
+            comp = None
+            first = next((f for f in self.selected_files
+                          if isinstance(f, str)), None)
+            try:
+                stream = splitter.probe_stream_rate(first) \
+                    if first and not self.processing else None
+                model = splitter.probe_model_rate()
+                if stream and model and model['rate'] > 0:
+                    comp = {
+                        'user_rate': stream['rate'],
+                        'user_density': max(stream['density'], 0.01),
+                        'ref_rate': model['rate'],
+                        'ref_density': max(model['density'], 0.01),
+                        'reid_sec_per_embed': self._probe_reid_rate(),
+                    }
+            except Exception as e:
+                self.log(i18n.tr("Проба скорости не удалась: {e}", e=e), logging.WARNING)
+            self._probe_data_val = comp
+            self._probe_data_running = False
+            try:
+                self.root.after(0, self._update_strategy_hint)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+        return None
+
+    def _probe_reid_rate(self):
+        """Сек на один OSNet-эмбеддинг (atriбутика): 10 прогонов на кадрах
+        эталона, кэш за сессию."""
+        cached = getattr(self, '_probe_reid_val', None)
+        if cached is not None:
+            return cached
+        try:
+            import torch
+            import attempts_v2
+            ref = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'assets', 'reference_scan.mp4')
+            if not os.path.exists(ref):
+                return 0.05
+            device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+            emb = attempts_v2._get_embedder(device)
+            cap = cv2.VideoCapture(ref)
+            crops = []
+            while len(crops) < 10:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                crops.append(frame)
+            cap.release()
+            t0 = time.time()
+            for c in crops:
+                emb.embed(c)
+            dt = max(1e-4, (time.time() - t0) / max(1, len(crops)))
+            self._probe_reid_val = dt
+            return dt
+        except Exception as e:
+            self.log(i18n.tr("Проба атрибутики не удалась: {e}", e=e), logging.WARNING)
+            return 0.05  # консервативная оценка
+
+    def _record_mode_timing(self, mode, video_minutes, run_seconds):
+        """Накапливает факт (режим: сек прогона / мин видео) для оценки времени."""
+        data = {}
+        f = self._speed_stats_file()
+        if os.path.exists(f):
+            try:
+                with open(f, encoding='utf-8') as fh:
+                    data = yaml.safe_load(fh) or {}
+            except Exception:
+                data = {}
+        s = data.setdefault(mode, {'run_seconds': 0, 'video_minutes': 0})
+        s['run_seconds'] = float(s.get('run_seconds', 0)) + float(run_seconds)
+        s['video_minutes'] = float(s.get('video_minutes', 0)) + float(video_minutes)
+        tmp = f + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                yaml.safe_dump(data, fh, allow_unicode=True)
+            os.replace(tmp, f)
+        except Exception as e:
+            self.log(f"Ошибка записи speed_stats.yaml: {e}", logging.WARNING)
+
+    def _retranslate_strategy(self):
+        """Смена языка: комбобокс режима и подсказка переводятся заново
+        (StringVar не отслеживается ui_tr). Текущий код режима берём из
+        _last_mode_code - старый лейбл уже не матчится по префиксу."""
+        if getattr(self, 'strategy_var', None) is None:
+            return
+        mode = getattr(self, '_last_mode_code', 'manual')
+        self._refresh_strategy_values()
+        self.strategy_var.set(self._strategy_display(mode))
+        self._update_strategy_hint()
+
+    def _update_strategy_hint(self):
+        """Строка-подсказка под комбобоксом режима: описание + оценка времени
+        для выбранных файлов."""
+        if not hasattr(self, 'strategy_hint_var') or self.strategy_hint_var is None:
+            return
+        mode = self._strategy()
+        entry = next((e for e in self.STRATEGY_MODES if e[0] == mode),
+                     self.STRATEGY_MODES[0])
+        desc = i18n.tr(entry[2])
+        files = [f for f in self.selected_files if isinstance(f, str)]
+        disk = ''
+        if mode != 'manual' and files:
+            gb = self._strategy_disk_gb()
+            if gb > 0:
+                size = i18n.tr("{n:.0f} ГБ", n=gb) if gb >= 10 else i18n.tr("{n:.1f} ГБ", n=gb)
+                disk = i18n.tr(" · место: до {size}", size=size)
+        if files:
+            video_sec = sum(max(self._get_file_duration(f), 0.0) for f in files)
+            if video_sec > 0:
+                factor, src = self._mode_speed_factor(mode)
+                est = factor * (video_sec / 60.0)  # фактор - сек на минуту видео
+                hm = i18n.tr("~{m} мин", m=max(1, int(round(est / 60.0))))
+                self.strategy_hint_var.set(
+                    i18n.tr("{desc} · ~{eta} ({src}){disk}",
+                            desc=desc, eta=hm, src=src, disk=disk))
+                return
+        self.strategy_hint_var.set(desc + disk)
 
     def _is_processed(self, video_path, strategy):
         """Файл уже полностью обработан этой стратегией (отметка в
@@ -591,6 +830,195 @@ class FreestyleParserApp:
         except Exception as e:
             self.log(i18n.tr("Не удалось записать журнал попыток: {err}", err=e),
                      logging.WARNING)
+
+    # === Точка продолжения прогона (processing_state.yaml) ===
+    # Единый механизм над режимами: «коммит» = успешная нарезка попытки
+    # (или завершение файла). Файл на диске = прогон можно продолжить
+    # в том же режиме; полное завершение удаляет файл.
+
+    _STATE_LOCK = threading.Lock()
+
+    def _processing_state_file(self):
+        return os.path.join(self.output_folder, 'processing_state.yaml')
+
+    # Режимы обработки: (код, подпись, описание для подсказки, дефолтный
+    # множитель оценки времени до первой калибровки)
+    STRATEGY_MODES = [
+        ('manual', "Сканирование попыток (быстро, без сохранения)",
+         "Быстрый кейфрейм-скан: кандидаты с превью; сохраняете точечно "
+         "через «Нарезать»", 1.0),
+        ('attempts', "Сохранение попыток (быстро, нужно место)",
+         "Нарезка + определение атлетов в попытках: экспорт по людям "
+         "(медленнее: атрибутика атлетов)", 38.0),
+    ]
+
+    def _mode_label(self, mode):
+        for code, label, _desc, _f in self.STRATEGY_MODES:
+            if code == mode:
+                return i18n.tr(label)
+        return mode
+
+    def _strategy_disk_gb(self):
+        """Суммарный размер выбранных исходников (ГБ) - прикидка места
+        под нарезку (stream copy ~ размер исходника)."""
+        total = 0
+        for f in self.selected_files:
+            try:
+                if isinstance(f, str) and os.path.isfile(f):
+                    total += os.path.getsize(f)
+            except OSError:
+                pass
+        return total / 1e9
+
+    def _strategy_display(self, code):
+        """Дисплей-лейбл режима: базовое название + суффикс скорости
+        и требование по диску (N = суммарный размер исходников)."""
+        base = self._mode_label(code)
+        gb = self._strategy_disk_gb()
+        if code == 'athletes':
+            return base + i18n.tr(" + без записи на диск")
+        if code == 'manual':
+            # нарезки нет - место нужно только под сохранённые попытки
+            return base + i18n.tr(" + диск только под сохранённые попытки")
+        if gb > 0:
+            size = i18n.tr("{n:.0f} ГБ", n=gb) if gb >= 10 else i18n.tr("{n:.1f} ГБ", n=gb)
+            return base + i18n.tr(" + диск до {size}", size=size)
+        return base
+
+    def _refresh_strategy_values(self):
+        """Перестраивает пункты комбобокса (суффикс диска зависит от выбора
+        файлов); выбранная опция сохраняется по коду режима."""
+        if not hasattr(self, 'strategy_combo') or self.strategy_combo is None:
+            return
+        cur = self._strategy()
+        values = [self._strategy_display(code) for code, _l, _d, _f in self.STRATEGY_MODES]
+        self.strategy_combo['values'] = values
+        if cur in [code for code, _l, _d, _f in self.STRATEGY_MODES]:
+            self.strategy_var.set(self._strategy_display(cur))
+
+    def _save_processing_state(self, mode, file_index, pos, number=None, percent=None):
+        """Атомарно сохраняет точку продолжения: файлы до file_index
+        закоммичены полностью, в файле file_index нарезано до pos секунд
+        (реальных), последняя сохранённая попытка - number."""
+        if percent is None:
+            percent = getattr(self, '_progress_percent', 0.0) or 0.0
+        try:
+            data = {'mode': mode, 'status': 'interrupted',
+                    'files': [os.path.basename(f) for f in self.selected_files],
+                    'file_index': int(file_index), 'pos': float(pos),
+                    'number': int(number) if number else None,
+                    'percent': float(percent),
+                    'when': datetime.datetime.now().isoformat(timespec='seconds')}
+            tmp = self._processing_state_file() + '.tmp'
+            with self._STATE_LOCK:
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    yaml.dump(data, fh, allow_unicode=True)
+                os.replace(tmp, self._processing_state_file())
+        except Exception as e:
+            self.log(i18n.tr("Не удалось сохранить состояние прогона: {err}", err=e),
+                     logging.WARNING)
+
+    def _load_processing_state(self):
+        f = self._processing_state_file()
+        if os.path.exists(f):
+            try:
+                with open(f, encoding='utf-8') as fh:
+                    return yaml.safe_load(fh) or None
+            except Exception:
+                pass
+        return None
+
+    def _load_resume_state(self):
+        """Точка продолжения, применимая прямо сейчас: список файлов -
+        префикс текущего выделения, file_index в пределах, и режим прогона
+        совпадает с текущими чекбоксами."""
+        state = self._load_processing_state()
+        if not state or state.get('mode') != self._strategy():
+            return None
+        if not self._state_matches_files(state):
+            return None
+        return state
+
+    def _state_matches_files(self, state):
+        """Точку продолжения можно применить, если сохранённый список файлов
+        - префикс текущего выделения и file_index в его пределах."""
+        if not state:
+            return False
+        saved = state.get('files') or []
+        cur = [os.path.basename(f) for f in self.selected_files]
+        if not saved or len(saved) > len(cur):
+            return False
+        if saved != cur[:len(saved)]:
+            return False
+        return 0 <= int(state.get('file_index', 0)) < len(saved)
+
+    def _clear_processing_state(self):
+        try:
+            f = self._processing_state_file()
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+
+    def _clear_attempts_journal(self):
+        try:
+            f = self._attempts_index_file()
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+
+    def _clear_processed_marks(self):
+        """Снимает отметки processed.yaml для выбранных файлов
+        («Начать заново»: прогон должен пройти по всем файлам с нуля)."""
+        data = self._load_processed()
+        changed = False
+        for f in self.selected_files:
+            base = os.path.basename(f)
+            if base in data:
+                del data[base]
+                changed = True
+        if not changed:
+            return
+        try:
+            tmp = self._processed_file() + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                yaml.dump(data, fh, allow_unicode=True)
+            os.replace(tmp, self._processed_file())
+        except Exception as e:
+            self.log(i18n.tr("Не удалось очистить отметки processed.yaml: {err}", err=e),
+                     logging.WARNING)
+
+    def _run_file_index(self, source_video):
+        """Индекс исходника в текущем прогоне (для коммита)."""
+        base = os.path.basename(source_video)
+        for i, f in enumerate(self.selected_files):
+            if os.path.basename(f) == base:
+                return i
+        return None
+
+    def update_process_button_state(self):
+        """«Обработать» -> «Продолжить», если есть применимая точка
+        продолжения прогона (state + тот же режим + те же файлы).
+        Смена режима делает точку неприменимой: кнопка возвращается
+        в «Обработать», это пишется в лог."""
+        if not hasattr(self, 'button_process'):
+            return
+        if self.processing or self.scan_running or self.cut_running:
+            return
+        state = self._load_processing_state()
+        if state and self._state_matches_files(state):
+            if state.get('mode') == self._strategy():
+                self.button_process.config(text=i18n.tr("Продолжить"))
+                self.button_restart.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+                return
+            self.log(i18n.tr("Точка продолжения сохранена для режима «{saved}», "
+                             "а выбран режим «{cur}» - продолжение отменено, "
+                             "кнопка сброшена в «Обработать»",
+                             saved=self._mode_label(state.get('mode')),
+                             cur=self._mode_label(self._strategy())))
+        self.button_process.config(text=i18n.tr("Обработать"))
+        self.button_restart.pack_forget()
 
     def _mark_processed(self, video_path, strategy):
         """Отмечает исходник обработанным (после успешного прогона файла).
@@ -673,8 +1101,9 @@ class FreestyleParserApp:
         w = self.canvas.winfo_width()
         return w if w > 1 else 480
 
-    def start_processing(self):
-        """Запускает обработку видео"""
+    def start_processing(self, force_restart=False):
+        """Запускает обработку видео. force_restart - «Начать заново»:
+        точка продолжения и журнал попыток сбрасываются, нарезка с №1."""
 
         self._sync_params_from_ui()
         # на случай, если папка по умолчанию, надо добавить проверку и делать это только если output_folder не exists
@@ -687,7 +1116,47 @@ class FreestyleParserApp:
         if not self.roi:
             messagebox.showwarning(i18n.tr("Предупреждение"), i18n.tr("Сначала выберите область интереса"))
             return
+        if force_restart:
+            self._clear_processing_state()
+            self._clear_attempts_journal()
+            self._clear_processed_marks()
+        # Единая точка продолжения над режимами: state применим только
+        # при совпадении режима (см. _load_resume_state)
+        self._run_mode = self._strategy()
+        state = self._load_resume_state()
+        if state and not force_restart:
+            self._run_last_number = int(state.get('number') or 0)
+            percent = float(state.get('percent') or 0.0)
+            self._progress_percent = percent
+            self.progress_var.set(percent)
+            self.log(i18n.tr("Продолжаем прерванный прогон (режим «{mode}»): "
+                             "файл {n}/{count}, коммит на {pos:.0f}с, "
+                             "попытки с №{num}",
+                             mode=self._mode_label(self._run_mode),
+                             n=int(state.get('file_index', 0)) + 1,
+                             count=len(self.selected_files),
+                             pos=float(state.get('pos') or 0.0),
+                             num=self._run_last_number + 1))
+        else:
+            self._run_last_number = 0
         self.processing = True
+        # ETA прогона: точка отсчёта + взвешенный прогресс с чистого листа
+        self._progress_run_t0 = time.time()
+        self._progress_done_fraction = 0.0
+        self._progress_weights = None
+        # прогнозная длительность всего прогона (для блендинга ETA в начале)
+        self._run_est_total = self._predicted_run_sec()
+        self._disk_check_t = 0.0
+        # предупреждение о месте: пишущим режимам нужно ~размер исходников
+        if self._run_mode in ('auto', 'attempts'):
+            need = self._strategy_disk_gb()
+            free = self._disk_free_gb()
+            if free is not None and free < need:
+                self.log(i18n.tr("Внимание: на диске свободно {free:.1f} ГБ, "
+                                 "для нарезки может потребоваться ~{need:.1f} ГБ. "
+                                 "При нехватке места прогон остановится сам - "
+                                 "можно будет продолжить после освобождения",
+                                 free=free, need=need), logging.WARNING)
         self._active_slowmo_factor = self._ui_slowmo_factor()
         self.button_process.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
@@ -706,21 +1175,26 @@ class FreestyleParserApp:
             self._start_worker(self.process_videos)
 
     def _strategy(self):
-        """Стратегия из чекбоксов: 'auto'|'manual'|'attempts'|'athletes'.
-        Внутренние коды сохранены для совместимости processing.yaml."""
-        if not hasattr(self, 'save_now_var') or self.save_now_var is None:
-            return 'auto'
-        save_now = self.save_now_var.get()
-        athletes = self.athletes_var.get()
-        if save_now and athletes:
-            return 'attempts'
-        if save_now:
-            return 'auto'
-        return 'athletes' if athletes else 'manual'
+        """Режим из комбобокса: код 'manual'|'attempts'.
+        Коды сохранены для совместимости processing.yaml и
+        processing_state.yaml."""
+        if not hasattr(self, 'strategy_var') or self.strategy_var is None:
+            return 'manual'
+        label = self.strategy_var.get()
+        # дисплей-лейбл с динамическим суффиксом - сопоставляем по префиксу
+        for code, lbl, _desc, _f in self.STRATEGY_MODES:
+            if label.startswith(i18n.tr(lbl)):
+                self._last_mode_code = code
+                return code
+        return getattr(self, '_last_mode_code', 'manual')
 
     def on_strategy_change(self):
-        """Чекбоксы стратегии меняются - сохраняем конфиг"""
+        """Режим меняется - сохраняем конфиг, обновляем подсказку и
+        пересматриваем применимость точки продолжения (режим прогона
+        должен совпадать)"""
         self.save_processing_config()
+        self._update_strategy_hint()
+        self.update_process_button_state()
 
     def _start_worker(self, target):
         """Запускает поток обработки со страховкой: любая ошибка внутри воркера
@@ -853,37 +1327,59 @@ class FreestyleParserApp:
         return True
 
     def on_attempt_file_created(self, attempt):
-        ## TODO analyze best_frame
-        if self._attempt_already_cut(attempt.source_video, attempt.start):
-            # докатка прерванного прогона: эта попытка уже нарезана
-            self.log(i18n.tr("Попытка {attempt} ({src} ~{start:.0f}с) уже нарезана - пропускаю",
-                             attempt=attempt.number, src=os.path.basename(attempt.source_video),
-                             start=attempt.start))
-            return self.processing
+        """Синхронная нарезка попытки (ручные режимы: «Нарезать» кандидатов).
+        Авто-режим нарезает через фоновую очередь - см. process_videos."""
+        self._cut_attempt_now(attempt)
+        # сообщаем, продолжать или нет (если была отмена кнопкой - то остановимся)
+        return self.processing
+
+    def _cut_attempt_now(self, attempt):
+        """Нарезает одну попытку (jpg + mp4 + запись в журнал).
+        Вызывается из фонового потока нарезки (очередь), детекция не ждёт диск.
+        Возвращает True при успехе (тогда точка продолжения сдвигается)."""
         imwrite_unicode(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
-        # cv2.imwrite(os.path.join(self.output_folder, f"{attempt.number:04d}-base.jpg"), attempt.base_frame)
-        # person_roi_frame = extract_athlete_difference(attempt.base_frame, attempt.person_frame)
-        # colors = self.get_colors_from_athlete(attempt.base_frame, attempt.person_frame, None, 4, 8)
-        # pers_file_path = os.path.join(self.output_folder, f"{attempt.number:04d}-person-{colors}.jpg")
-        # cv2.imwrite(pers_file_path, attempt.person_frame)
-        # self.log(f"Colors {colors}")
         output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
         duration = attempt.end - attempt.start
         if duration <= 0:
             self.log(i18n.tr("Пропускаем попытку {attempt}: start={start:.2f}s >= end={end:.2f}s",
                              attempt=attempt.number, start=attempt.start, end=attempt.end))
-            return self.processing
+            return False
+        free = self._disk_free_gb()
+        if free is not None and free < 0.5:
+            self.log(i18n.tr("Попытка {attempt}: на диске меньше 0.5 ГБ - нарезка прервана, "
+                             "освободите место и нажмите «Продолжить»",
+                             attempt=attempt.number), logging.ERROR)
+            self.processing = False
+            return False
+        if self._is_source_video(output_file):
+            # страховка: не пишем поверх исходника (кейс-независимо)
+            self.log(i18n.tr("Попытка {attempt}: имя совпадает с исходником {file} - "
+                             "беру следующий свободный номер",
+                             attempt=attempt.number, file=os.path.basename(output_file)),
+                     logging.WARNING)
+            attempt.number = self._next_attempt_number()
+            output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
         slowmo = self._active_slowmo_factor
+        _t_cut = time.time()
         if not self._remux_clip(attempt.source_video, attempt.start, duration,
                                 output_file, slowmo,
                                 i18n.tr("попытка {attempt:04d}", attempt=attempt.number)):
-            return self.processing
+            return False
+        self.log(i18n.tr("  [perf] нарезка {n:04d} ({d:.0f}с): {dt:.1f}с",
+                         n=attempt.number, d=duration, dt=time.time() - _t_cut))
         self._record_attempt(attempt)
 
         self.need_update_attempts = True
         self.log(i18n.tr("Видео попытки готово: {file}", file=output_file))
-        # сообщаем, продолжать или нет (если была отмена кнопкой - то остановимся)
-        return self.processing
+        # Единый коммит точки продолжения: попытка полностью нарезана ->
+        # двигаем processing_state.yaml (для auto и attempts)
+        if self._run_mode in ('auto', 'attempts'):
+            fi = self._run_file_index(attempt.source_video)
+            if fi is not None:
+                self._save_processing_state(self._run_mode, fi, float(attempt.end),
+                                            int(attempt.number))
+            self._run_last_number = int(attempt.number)
+        return True
 
     def get_colors_from_athlete(self, frame_bg, frame_with, bbox=None, k=5, threshold=10):
         roi = extract_athlete_difference(frame_bg, frame_with, bbox)
@@ -905,32 +1401,97 @@ class FreestyleParserApp:
 
     def process_videos(self):
         """Обрабатывает видео в отдельном потоке (авто-режим: нарезать всё).
-        Повторный запуск после прерывания (сон, кнопка Стоп) продолжает:
-        файлы с отметкой processed.yaml пропускаются."""
+        Детекция - стриминговый скан по ключевым кадрам; нарезка каждой
+        попытки - в фоновом потоке через очередь, детекция не ждёт диск.
+        Прерванный прогон (сон, обрыв, кнопка Стоп) продолжается по
+        processing_state.yaml: fresh-запуск всегда с попытки №1 с перезаписью,
+        «Продолжить» - с последней нарезанной попытки."""
         t0 = time.time()
         try:
             from splitter import process_video
-            files = [f for f in self.selected_files
-                     if not self._is_processed(f, 'auto')]
-            skipped = len(self.selected_files) - len(files)
-            if skipped:
-                self.log(i18n.tr("{n} файл(ов) уже обработаны - пропускаю, "
-                                 "доделывается остаток", n=skipped))
-            if not files:
-                self.log(i18n.tr("Все выбранные файлы уже обработаны - "
-                                 "нечего делать (отметки в processed.yaml)"))
-                return
-            next_attempt_number = get_next_attempt_number(self.output_folder)
-            process_video(files, self.roi, lambda attempt: self.on_attempt_file_created(attempt),
-                          next_attempt_number, params=self.processing_params,
-                          progress_callback=self.on_processing_progress,
-                          should_continue=lambda: self.processing,
-                          slowmo_factor=self._active_slowmo_factor,
-                          log_fn=self.log)
+            files = list(self.selected_files)
+
+            state = self._load_resume_state()
+            if state:
+                start_file_index = int(state.get('file_index', 0))
+                resume_pos = float(state.get('pos', 0.0))
+                begin_number = self._run_last_number + 1
+            else:
+                start_file_index = 0
+                resume_pos = 0.0
+                begin_number = 1
+                self._clear_processing_state()
+
+            # Очередь нарезки: детектор только кладёт попытки, отдельный
+            # поток нарезает (remux ~1-3с на попытку) и коммитит точку
+            # продолжения (см. _cut_attempt_now)
+            cut_q = queue.Queue()
+            # дедуп перекрывающихся зон (как в ручном скане); при резюме
+            # закоммиченные попытки уже пропущены по pos - список чистый
+            self._cut_dedup_seen = []
+            self._cut_dedup_lock = threading.Lock()
+
+            def progress_hook(fi, fc, si, sc):
+                if fi != cur_file['idx']:
+                    cur_file['idx'] = fi
+                    # файл закоммичен целиком
+                    self._save_processing_state('auto', fi, 0.0,
+                                                self._run_last_number or None)
+                self.on_processing_progress(fi, fc, si, sc)
+
+            cur_file = {'idx': start_file_index}
+
+            def _cutter():
+                while True:
+                    attempt = cut_q.get()
+                    if attempt is None:
+                        break
+                    try:
+                        self._cut_attempt_now(attempt)
+                    except Exception as e:
+                        self.log(i18n.tr("Ошибка нарезки попытки {n}: {err}",
+                                         n=attempt.number, err=e), logging.ERROR)
+                    cut_q.task_done()
+
+            cutter = threading.Thread(target=_cutter, daemon=True)
+            cutter.start()
+
+            def on_attempt(attempt):
+                # тот же дедуп, что в ручном скане: зона, пересекающаяся
+                # с уже нарезанной, - дубль области (паддинги смыкаются)
+                with self._cut_dedup_lock:
+                    for (f, s, e) in self._cut_dedup_seen:
+                        if f == attempt.source_video and \
+                                max(s, attempt.start) < min(e, attempt.end):
+                            self.log(i18n.tr("Зона ({src} ~{start:.0f}с) пересекается "
+                                             "с уже нарезанной - пропускаю",
+                                             src=os.path.basename(attempt.source_video),
+                                             start=attempt.start))
+                            return True
+                    self._cut_dedup_seen.append(
+                        (attempt.source_video, attempt.start, attempt.end))
+                cut_q.put(attempt)
+                return True  # остановка - через should_continue
+
+            try:
+                process_video(files, self.roi, on_attempt, begin_number,
+                              params=self.processing_params,
+                              progress_callback=progress_hook,
+                              should_continue=lambda: self.processing,
+                              slowmo_factor=self._active_slowmo_factor,
+                              scan_mode=True,
+                              log_fn=self.log,
+                              start_file_index=start_file_index,
+                              resume_pos=resume_pos)
+            finally:
+                cut_q.put(None)
+                cutter.join(timeout=600)
             self.log(i18n.tr("Файлы {files} успешно обработаны.", files=files))
             if self.processing:
                 for f in files:
                     self._mark_processed(f, 'auto')
+                self._clear_processing_state()
+                self.log(i18n.tr("Прогон завершён полностью - точка продолжения сброшена"))
             self._log_processing_summary(i18n.tr("Нарезка всех попыток (авто)"),
                                          self.selected_files, t0, self.processing)
         except Exception as e:
@@ -954,7 +1515,7 @@ class FreestyleParserApp:
             from splitter import process_video
             existing = list(self.candidates)
             if existing:
-                self.log(i18n.tr("Пересканирование: {n} существующих кандидатов сохраняются, "
+                self.log(i18n.tr("Пересканирование: {n} существующих разметок сохраняются, "
                                  "новые добавляются без дублей", n=len(existing)))
             process_video(self.selected_files, self.roi, self.on_candidate_found,
                           1, params=self.processing_params,
@@ -967,11 +1528,11 @@ class FreestyleParserApp:
             if self.processing:
                 for f in self.selected_files:
                     self._mark_processed(f, 'manual')
-            self._log_processing_summary(i18n.tr("Скан кандидатов (ручной)"),
+            self._log_processing_summary(i18n.tr("Скан разметок (ручной)"),
                                          self.selected_files, t0, self.processing)
             pending = [c for c in self.candidates if c['status'] == 'pending']
-            self.log(i18n.tr("Сканирование завершено: всего кандидатов {n}. "
-                             "Снимите галочки с ненужных попыток и нажмите «Нарезать».", n=len(pending)))
+            self.log(i18n.tr("Сканирование завершено: всего разметок {n}. "
+                             "Снимите галочки с ненужных и нажмите «Нарезать».", n=len(pending)))
         except Exception as e:
             self.log(i18n.tr("Ошибка сканирования: {err} {trace}", err=e,
                              trace=traceback.format_exc()), logging.ERROR)
@@ -986,11 +1547,11 @@ class FreestyleParserApp:
         """Обновляет кнопки после завершения задачи; если работают другие - не трогаем."""
         if not still_busy:
             self.button_process.config(state=tk.NORMAL)
-            self.button_live.config(state=tk.NORMAL)
             self.button_stop.config(state=tk.DISABLED)
             self._progress_file_t0 = None
             if hasattr(self, 'progress_info_var'):
                 self.progress_info_var.set('')
+            self.update_process_button_state()
         self.update_cut_button_state()
 
     # === Режим «Просмотр без сохранения» ===
@@ -1012,13 +1573,10 @@ class FreestyleParserApp:
         self._live_next_num = self._next_attempt_number()
         self.processing = True
         self._active_slowmo_factor = self._ui_slowmo_factor()
-        # «Определять атлетов» ON -> точный сплиттер (attempts_v2, тяжёлый),
-        # OFF -> грубый скан сэмплами раз в scan_interval (splitter.py, быстрый).
-        # Эмбеддинги в live-режиме всё равно никуда не идут (атрибуции тут нет),
-        # так что OFF - предпочтительный вариант для быстрого просмотра
-        coarse = not (self.athletes_var and self.athletes_var.get())
+        # Грубый скан сэмплами раз в scan_interval (splitter.py, быстрый) -
+        # для всех режимов (эмбеддинги в live-режиме всё равно никуда не идут)
+        coarse = True
         self.button_process.config(state=tk.DISABLED)
-        self.button_live.config(state=tk.DISABLED)
         self.button_stop.config(state=tk.NORMAL)
         self._progress_percent = 0.0
         self.progress_var.set(0)
@@ -1127,6 +1685,13 @@ class FreestyleParserApp:
                                  "Поиск попыток: {file} ...", i=file_index + 1,
                                  n=len(self.selected_files),
                                  file=os.path.basename(video_path)))
+                self._log_source_diagnostics(video_path)
+                f_t0 = time.time()
+                f_size = 0
+                try:
+                    f_size = os.path.getsize(video_path)
+                except OSError:
+                    pass
                 tmp_dir = os.path.join(self.output_folder, f".attempts_tmp_{base}")
 
                 def on_found(r, src_path=video_path):
@@ -1151,6 +1716,7 @@ class FreestyleParserApp:
                     continue
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._log_file_done(base, f_size, f_t0)
             # NB: файлы НЕ помечаем processed - ничего не сохранено,
             # пользователь может потом нарезать их обычным режимом
             with self._live_lock:
@@ -1275,10 +1841,40 @@ class FreestyleParserApp:
         return True
 
     # === Режим 'Попытки (атриб.)': сплиттер попыток + автоатрибуция ===
+    # Логика атрибутики - в athlete_attribution.AthleteAttribution;
+    # ниже - делегирующие свойства и обёртки с прежними именами (UI не меняется)
 
-    ATTEMPT_SIM_THRESHOLD = 0.88   # минимальная похожесть для автоатрибуции
-    ATTEMPT_SIM_MARGIN = 0.03      # отрыв от второго кандидата
-    W_REID, W_BOAT = 0.7, 0.3      # вклад OSNet и лодки в похожесть
+    @property
+    def athlete_mapping(self):
+        return self.attribution.athlete_mapping
+
+    @athlete_mapping.setter
+    def athlete_mapping(self, value):
+        self.attribution.athlete_mapping = value
+
+    @property
+    def attempt_assignments(self):
+        return self.attribution.attempt_assignments
+
+    @attempt_assignments.setter
+    def attempt_assignments(self, value):
+        self.attribution.attempt_assignments = value
+
+    @property
+    def athlete_segments(self):
+        return self.attribution.athlete_segments
+
+    @athlete_segments.setter
+    def athlete_segments(self, value):
+        self.attribution.athlete_segments = value
+
+    @property
+    def _segment_profiles(self):
+        return self.attribution.segment_profiles
+
+    @_segment_profiles.setter
+    def _segment_profiles(self, value):
+        self.attribution.segment_profiles = value
 
     def _roi_bbox_percentages(self):
         """BBox ROI в процентах (L, T, R, B) из прямоугольника или полигона."""
@@ -1294,241 +1890,82 @@ class FreestyleParserApp:
         return len(roi) == 4 and all(isinstance(v, (int, float)) for v in roi)
 
     def _next_attempt_number(self):
-        """Следующий свободный номер попытки в папке дня."""
+        """Следующий свободный номер попытки в папке дня. Регистронезависимо
+        (.MP4 тоже): если исходник лежит в рабочей папке и называется NNNN.mp4,
+        его номер резервируется - иначе нарезка перезапишет исходник."""
         nums = []
         if os.path.exists(self.output_folder):
             for f in os.listdir(self.output_folder):
-                if f.endswith('.mp4') and f[:4].isdigit():
+                if f.lower().endswith('.mp4') and f[:4].isdigit():
                     nums.append(int(f[:4]))
         return max(nums, default=0) + 1
 
+    def _is_source_video(self, path):
+        """True, если path - один из выбранных исходников (без учета регистра:
+        на кейс-независимых ФС 0001.mp4 и 0001.MP4 - один и тот же файл)."""
+        try:
+            target = os.path.normcase(os.path.abspath(path))
+            for f in self.selected_files:
+                if os.path.normcase(os.path.abspath(f)) == target:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _load_profile_store(self):
         """Профили попыток дня: {basename: {'vest': vec, 'boat': vec}}."""
-        store_file = os.path.join(self.output_folder, 'attempt_profiles.npz')
-        if not os.path.exists(store_file):
-            return {}
-        d = np.load(store_file, allow_pickle=True)
-        store = {}
-        for i, name in enumerate(d['names']):
-            store[str(name)] = {'vest': d['vest'][i], 'boat': d['boat'][i]}
-        return store
-
+        return self.attribution.load_profile_store()
     def _save_profile_store(self, store):
-        store_file = os.path.join(self.output_folder, 'attempt_profiles.npz')
-        names = list(store.keys())
-        np.savez(store_file,
-                 names=np.array(names),
-                 vest=np.array([store[n]['vest'] for n in names]),
-                 boat=np.array([store[n]['boat'] for n in names]))
-
-    # === Глобальный реестр атлетов (~/.FreestyleParser, живёт между папками) ===
-
-    REGISTRY_SAMPLES_MAX = 20  # сэмплов профилей на атлета
-
+        self.attribution.save_profile_store(store)
     def _registry_file(self):
-        return os.path.join(self._app_folder, 'athlete_registry.npz')
-
+        return self.attribution.registry_file()
     def _load_registry(self):
         """Реестр: {имя: {'vest': [векторы 1664], 'boat': [векторы 18]}}.
         Кешируется; пополняется подтверждениями попыток и сегментов."""
-        if self._registry_cache is not None:
-            return self._registry_cache
-        reg = {}
-        f = self._registry_file()
-        if os.path.exists(f):
-            try:
-                d = np.load(f, allow_pickle=True)
-                for i, name in enumerate(d['names']):
-                    name = str(name)
-                    reg.setdefault(name, {'vest': [], 'boat': []})
-                    reg[name]['vest'].append(d['vest'][i])
-                    reg[name]['boat'].append(d['boat'][i])
-            except Exception as e:
-                self.log(f"Ошибка загрузки реестра атлетов: {e}", logging.WARNING)
-        self._registry_cache = reg
-        return reg
-
+        return self.attribution.load_registry()
     def _save_registry(self, reg):
-        f = self._registry_file()
-        try:
-            names, vests, boats = [], [], []
-            for name, s in reg.items():
-                for v, b in zip(s['vest'], s['boat']):
-                    names.append(name)
-                    vests.append(v)
-                    boats.append(b)
-            if names:
-                np.savez(f, names=np.array(names),
-                         vest=np.array(vests), boat=np.array(boats))
-            elif os.path.exists(f):
-                os.remove(f)
-            self._registry_cache = reg
-        except Exception as e:
-            self.log(f"Ошибка сохранения реестра атлетов: {e}", logging.ERROR)
-
+        self.attribution.save_registry(reg)
     def _registry_add_sample(self, name, vest, boat):
         """Добавляет профиль подтверждённой попытки/сегмента в реестр."""
-        import attempts_v2
-        if vest is None or float(np.linalg.norm(vest[attempts_v2.VEST_DIM:])) < 1e-6:
-            return
-        reg = self._load_registry()
-        s = reg.setdefault(name, {'vest': [], 'boat': []})
-        s['vest'].append(np.asarray(vest, dtype=float))
-        s['boat'].append(np.asarray(boat if boat is not None else np.zeros(18),
-                                    dtype=float))
-        if len(s['vest']) > self.REGISTRY_SAMPLES_MAX:
-            s['vest'] = s['vest'][-self.REGISTRY_SAMPLES_MAX:]
-            s['boat'] = s['boat'][-self.REGISTRY_SAMPLES_MAX:]
-        self._save_registry(reg)
-
+        self.attribution.registry_add_sample(name, vest, boat)
     def _registry_banks(self):
         """Банки из реестра: СЫРЫЕ сэмплы по атлетам (списки векторов).
         Усреднение не делаем: сэмплы разных скинов (лето/зима, куртки)
         в среднем не совпадут ни с чем - сравнение идёт max по сэмплам."""
-        banks = {}
-        for name, s in self._load_registry().items():
-            if not s['vest']:
-                continue
-            banks[name] = {
-                'vest': [v / max(np.linalg.norm(v), 1e-9) for v in s['vest']],
-                'boat': [b / max(b.sum(), 1e-9) for b in s['boat']]}
-        return banks
-
-    # === Сегменты скана атлетов (без нарезки) ===
-
+        return self.attribution.registry_banks()
     def _segments_file(self):
-        return os.path.join(self.output_folder, 'segments.yaml')
-
+        return self.attribution.segments_file()
     def _segment_store_file(self):
-        return os.path.join(self.output_folder, 'segment_profiles.npz')
-
+        return self.attribution.segment_store_file()
     def _load_segments(self):
-        self.athlete_segments = []
-        self._segment_profiles = {}
-        f = self._segments_file()
-        if os.path.exists(f):
-            try:
-                with open(f, 'r', encoding='utf-8') as fh:
-                    data = yaml.safe_load(fh) or {}
-                self.athlete_segments = data.get('segments', [])
-            except Exception as e:
-                self.log(f"Ошибка загрузки segments: {e}", logging.WARNING)
-        sf = self._segment_store_file()
-        if os.path.exists(sf):
-            try:
-                d = np.load(sf, allow_pickle=True)
-                self._segment_profiles = {
-                    str(n): {'vest': d['vest'][i], 'boat': d['boat'][i]}
-                    for i, n in enumerate(d['names'])}
-            except Exception as e:
-                self.log(f"Ошибка загрузки профилей сегментов: {e}", logging.WARNING)
-
+        self.attribution.load_segments()
     def _save_segments(self):
-        try:
-            with open(self._segments_file(), 'w', encoding='utf-8') as fh:
-                yaml.dump({'segments': self.athlete_segments}, fh,
-                          allow_unicode=True)
-        except Exception as e:
-            self.log(f"Ошибка сохранения segments: {e}", logging.ERROR)
-
+        self.attribution.save_segments()
     def _save_segment_profiles(self):
-        names = list(self._segment_profiles)
-        try:
-            if names:
-                np.savez(self._segment_store_file(),
-                         names=np.array(names),
-                         vest=np.array([self._segment_profiles[n]['vest']
-                                        for n in names]),
-                         boat=np.array([self._segment_profiles[n]['boat']
-                                        for n in names]))
-            elif os.path.exists(self._segment_store_file()):
-                os.remove(self._segment_store_file())
-        except Exception as e:
-            self.log(f"Ошибка сохранения профилей сегментов: {e}", logging.ERROR)
-
+        self.attribution.save_segment_profiles()
     def _base_banks(self):
         """Базовые банки ~/.FreestyleParser/banks/*.npz (read-only, формат
         как у registry.npz: names/vest/boat, строки-сэмплы). Возвращаем
         СЫРЫЕ сэмплы списками - сравнение max по сэмплам (скины/сезоны).
         Кешируется на сессию (банки read-only); вызывается на каждую плитку."""
-        if getattr(self, '_base_banks_cache', None) is not None:
-            return self._base_banks_cache
-        samples = {}
-        bdir = os.path.join(self._app_folder, 'banks')
-        if os.path.isdir(bdir):
-            for fn in sorted(os.listdir(bdir)):
-                if not fn.endswith('.npz'):
-                    continue
-                try:
-                    d = np.load(os.path.join(bdir, fn), allow_pickle=True)
-                    for i, n in enumerate(d['names']):
-                        samples.setdefault(str(n), []).append(
-                            (d['vest'][i], d['boat'][i]))
-                except Exception as e:
-                    self.log(f"Ошибка загрузки банка {fn}: {e}", logging.WARNING)
-        banks = {}
-        for name, s in samples.items():
-            banks[name] = {
-                'vest': [v / max(np.linalg.norm(v), 1e-9) for v, _ in s],
-                'boat': [b / max(b.sum(), 1e-9) for _, b in s]}
-        self._base_banks_cache = banks
-        return banks
-
+        return self.attribution.base_banks()
     def _athlete_banks(self, store):
         """Банки атлетов по приоритету: подтверждённый маппинг папки >
         личный реестр > базовые банки. Локальные затирают базовые
         при совпадении имён."""
-        banks = {}
-        for athlete, files in self.athlete_mapping.items():
-            entries = [store[os.path.basename(f)] for f in files
-                       if os.path.basename(f) in store]
-            if not entries:
-                continue
-            # каждая попытка дня - отдельный сэмпл банка
-            banks[athlete] = {
-                'vest': [e['vest'] / max(np.linalg.norm(e['vest']), 1e-9)
-                         for e in entries],
-                'boat': [e['boat'] / max(e['boat'].sum(), 1e-9)
-                         for e in entries]}
-        merged = dict(self._base_banks())
-        merged.update(self._registry_banks())
-        merged.update(banks)
-        return merged
-
+        return self.attribution.athlete_banks(store)
     def _attempt_athlete_sim(self, profile, bank):
         """Похожесть попытки и банка: MAX по сэмплам банка (скины, сезоны,
         ракурсы). Сэмпл = OSNet+жилет косинус + совпадение бина лодки."""
-        # errstate: spurious overflow/divide-by-zero warning от Accelerate BLAS
-        # (macOS) на матмуле таких размеров - результат корректен, проверено
-        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-            vests = bank['vest'] if isinstance(bank['vest'], list) \
-                else [bank['vest']]
-            boats = bank['boat'] if isinstance(bank['boat'], list) \
-                else [bank['boat']]
-            best, best_reid = -1.0, 0.0
-            for v, b in zip(vests, boats):
-                s_reid = float(profile['vest'] @ v)
-                b_hist = profile['boat']
-                if b_hist.sum() > 0:
-                    bp = b_hist / b_hist.sum()
-                    top = int(np.argmax(bp))
-                    bt = int(np.argmax(b))
-                    dist = min(abs(top - bt), 18 - abs(top - bt))
-                    s_boat = 1.0 if dist <= 1 else 0.0
-                    s = self.W_REID * s_reid + self.W_BOAT * s_boat
-                else:
-                    s = s_reid * self.W_REID / (self.W_REID + self.W_BOAT)
-                if s > best:
-                    best, best_reid = s, s_reid
-            return best, best_reid
-
+        return self.attribution.attempt_athlete_sim(profile, bank)
     def process_attempts(self):
         """Стратегия 'Попытки (атриб.)': сплиттер попыток (YOLO-seg + трекинг),
         нарезка попыток и автоатрибуция по банкам подтверждённых атлетов."""
         t0 = time.time()
         try:
-            import attempts_v2
-            roi_bbox = self._roi_bbox_percentages()
+            # ROI как в сканировании: полигон/прям без преобразований -
+            # иначе детекция уходит (bbox-кроп меняет масштаб атлета для YOLO)
+            roi = self.roi
             store = self._load_profile_store()
             # Удаляем записи, для которых нет .mp4 файлов (старые попытки из прошлых запусков)
             stale = [n for n in store if not os.path.exists(os.path.join(self.output_folder, n))]
@@ -1540,70 +1977,98 @@ class FreestyleParserApp:
             # мёртвые привязки маппинга - до построения банков и нумерации,
             # иначе новая попытка с тем же номером унаследует чужую привязку
             self._prune_athlete_mapping()
-            banks = self._athlete_banks(store)
-            if banks:
-                self.log(i18n.tr("Банки атлетов: {names}", names=', '.join(banks.keys())))
-            else:
-                self.log(i18n.tr("Банков атлетов пока нет - попытки будут нарезаны без атрибуции "
-                                 "(после привязки попыток к атлетам атрибуция заработает)"))
-            number = self._next_attempt_number()
+            # атрибуция атлетов на текущем этапе отключена: режим только
+            # нарезает попытки (единый кейфрейм-детектор, без OSNet/банков)
+            # Единая точка продолжения: резюме по закоммиченной зоне
+            resume = self._load_resume_state()
+            resume_file_index = int(resume.get('file_index', 0)) if resume else 0
+            resume_pos = float(resume.get('pos') or 0.0) if resume else 0.0
+            number = self._run_last_number + 1 if resume else self._next_attempt_number()
             start_pad = float(self.processing_params.get('attempt_start_padding', 2))
             # запас на вход атлета в ROI, как в точном анализе старого пайплайна
             margin = float(self.processing_params.get('scan_interval', 2.5)) + 1.0
             end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
             found_in_file = [0]
 
+            # Очередь нарезки: скан-поток только отдаёт границы попыток,
+            # отдельный поток снимает превью и режет (remux) - детекция
+            # не ждёт диск (как в авто-режиме, см. process_videos)
+            cut_q = queue.Queue()
+            self._cut_dedup_seen = []
+            self._cut_dedup_lock = threading.Lock()
+
+            def _cutter():
+                while True:
+                    info = cut_q.get()
+                    if info is None:
+                        break
+                    try:
+                        if info.best_frame is None:
+                            # превью: единая логика детектора - кадр, где
+                            # атлет ближе всего к центру ROI; если кадр не
+                            # передан, снимаем полный кадр по thumb_t
+                            if info.thumb_frame is not None:
+                                info.best_frame = info.thumb_frame
+                            else:
+                                src = open_capture(info.source_video)
+                                src.set(cv2.CAP_PROP_POS_MSEC,
+                                        (info.thumb_t or info.start) * self._active_slowmo_factor * 1000)
+                                ok, best_frame = src.read()
+                                src.release()
+                                info.best_frame = best_frame if ok \
+                                    else np.zeros((360, 640, 3), np.uint8)
+                        self._cut_attempt_now(info)
+                    except Exception as e:
+                        self.log(i18n.tr("Ошибка нарезки попытки {n}: {err}",
+                                         n=info.number, err=e), logging.ERROR)
+                    cut_q.task_done()
+
+            cutter = threading.Thread(target=_cutter, daemon=True)
+            cutter.start()
+
             def on_attempt_found(r):
-                """Прогрессивная нарезка: попытка режется сразу после закрытия."""
                 nonlocal number
-                # докатка прерванного прогона: не расходуем номер на дубль
-                if self._attempt_already_cut(r['source'], r['start']):
-                    self.log(i18n.tr("Попытка ({src} ~{start:.0f}с) уже нарезана - пропускаю",
+                # резюме: попытка целиком в закоммиченной зоне - не режем повторно
+                if resume and self._run_file_index(r['source']) == resume_file_index \
+                        and float(r['end']) <= resume_pos:
+                    self.log(i18n.tr("Попытка ({src} ~{start:.0f}с) уже нарезана (закоммичена) - пропускаю",
                                      src=os.path.basename(r['source']), start=r['start']))
-                    return
-                # preroll = start_pad (2с до входа) — даёт каякеру появиться во 2й секунде
+                    return True
+                # дедуп перекрывающихся зон (как в авто-режиме)
+                with self._cut_dedup_lock:
+                    for (f, s, e) in self._cut_dedup_seen:
+                        if f == r['source'] and max(s, r['start']) < min(e, r['end']):
+                            self.log(i18n.tr("Зона ({src} ~{start:.0f}с) пересекается "
+                                             "с уже нарезанной - пропускаю",
+                                             src=os.path.basename(r['source']),
+                                             start=r['start']))
+                            return True
+                    self._cut_dedup_seen.append(
+                        (r['source'], r['start'], r['end']))
+                # границы от детектора сырые; паддинг применяем здесь один раз
                 preroll = max(0.0, r['start'] - start_pad)
-                # thumbnail: кадр, где атлет ближе всего к центру ROI
-                # (attempts_v2 считает thumb_t по дистанции bbox-центра)
-                thumb_t = r.get('thumb_t') or r['start']
-                src = open_capture(r['source'])
-                src.set(cv2.CAP_PROP_POS_MSEC, thumb_t * self._active_slowmo_factor * 1000)
-                ok, best_frame = src.read()
-                src.release()
-                if not ok:
-                    best_frame = np.zeros((360, 640, 3), np.uint8)
                 from splitter import AttemptInfo
                 info = AttemptInfo(r['source'], preroll,
                                    r['end'] + end_pad, number,
-                                   best_frame, None, None, None)
-                self.on_attempt_file_created(info)
-                out_name = f"{number:04d}.mp4"
-                number += 1
-                found_in_file[0] += 1
+                                   None, None, None, None,
+                                   thumb_t=r.get('thumb_t') or r['start'],
+                                   thumb_frame=r.get('thumb_frame'))
+                cut_q.put(info)
                 self.log(i18n.tr("  Попытка {attempt}: {start:.1f}-{end:.1f}с "
                                  "(лодка {boat}°)",
-                                 attempt=out_name, start=r['start'], end=r['end'],
+                                 attempt=f"{number:04d}.mp4", start=r['start'],
+                                 end=r['end'],
                                  boat=r['boat_top'] * 10 if r['boat_top'] is not None else '-'))
-                if r['reid'] is None:
-                    return
-                if not os.path.exists(os.path.join(self.output_folder, out_name)):
-                    return
-                vest_full = np.concatenate([r['vest'], r['reid']]) \
-                    if r['vest'] is not None else r['reid']
-                n = np.linalg.norm(vest_full)
-                store[out_name] = {
-                    'vest': vest_full / max(n, 1e-9),
-                    'boat': r['boat'] if r['boat'] is not None else np.zeros(18)}
-                # предложение атлета сразу по факту появления попытки:
-                # банки из текущего (в т.ч. только что подтверждённого) маппинга
-                self.refresh_auto_assignments(store=store)
+                number += 1
+                found_in_file[0] += 1
+                return True
 
             for file_index, video_path in enumerate(self.selected_files):
                 if not self.processing:
                     break
                 base = os.path.splitext(os.path.basename(video_path))[0]
-                if self._is_processed(video_path, 'attempts'):
-                    # продолжение прерванного прогона: файл уже нарезан
+                if file_index < resume_file_index:
+                    # резюме: файлы до точки продолжения закоммичены полностью
                     self.log(i18n.tr("[{i}/{n}] {file}: уже обработан - пропускаю",
                                      i=file_index + 1, n=len(self.selected_files),
                                      file=os.path.basename(video_path)))
@@ -1612,48 +2077,67 @@ class FreestyleParserApp:
                                  "Поиск попыток: {file} ...", i=file_index + 1,
                                  n=len(self.selected_files),
                                  file=os.path.basename(video_path)))
+                self._log_source_diagnostics(video_path)
+                f_t0 = time.time()
+                f_size = 0
+                try:
+                    f_size = os.path.getsize(video_path)
+                except OSError:
+                    pass
                 tmp_dir = os.path.join(self.output_folder, f".attempts_tmp_{base}")
                 try:
                     pstats = {}
-                    results = attempts_v2.process_video(
-                        video_path, tmp_dir, roi=roi_bbox,
+                    results = splitter.process_video_athletes(
+                        video_path, roi,
                         should_continue=lambda: self.processing,
-                        stats_out=pstats,
-                        slowmo_factor=self._active_slowmo_factor,
-                        min_pause=float(self.processing_params.get('min_pause_duration', 2.5)),
-                        min_attempt_duration=float(self.processing_params.get('min_attempt_duration', 3.0)),
-                        reid_embed_rate=float(self.processing_params.get('reid_embed_rate', 5)),
-                        attempt_found_cb=lambda r, src=video_path: on_attempt_found({**r, 'source': src}),
                         log_cb=self.log,
-                        progress_cb=lambda fi, tf, fi_=file_index, nf=len(self.selected_files):
-                            self.on_processing_progress(fi_, nf, fi, tf))
+                        params=self.processing_params,
+                        reid_embed_rate=float(self.processing_params.get('reid_embed_rate', 5)),
+                        slowmo_factor=self._active_slowmo_factor,
+                        athlete_attribution=False,
+                        attempt_found_cb=lambda r, src=video_path: on_attempt_found({**r, 'source': src}),
+                        progress_cb=lambda pos, tot, fi_=file_index, nf=len(self.selected_files):
+                            self.on_processing_progress(fi_, nf, pos, tot))
                 except Exception as e:
                     self.log(i18n.tr("Ошибка обработки {file}: {err}", file=base, err=e), logging.ERROR)
                     continue
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._log_file_done(base, f_size, f_t0)
                 if self.processing:
                     self._mark_processed(video_path, 'attempts')
+                    # файл закоммичен целиком
+                    self._save_processing_state('attempts', file_index + 1, 0.0,
+                                                self._run_last_number or None)
 
                 self._save_profile_store(store)
                 if not results and self.processing:
-                    pr = pstats.get('presence_ratio', 0.0)
-                    self.log(i18n.tr("  Попыток не найдено. Главный атлет присутствовал в ROI "
-                                     "в {pr:.0f}% времени. Если попытки в файле точно есть - "
+                    self.log(i18n.tr("  Попыток не найдено. Если попытки в файле точно есть - "
                                      "проверьте ROI (атлет должен быть целиком внутри области) "
-                                     "и пороги (мин. длительность попытки)", pr=pr * 100),
+                                     "и пороги (мин. длительность попытки)"),
                              logging.WARNING)
 
                 self._save_profile_store(store)
 
-            # автоатрибуция новых попыток
-            self._auto_assign_attempts(store, banks)
-            self._log_processing_summary(i18n.tr("Попытки (атрибуция)"),
+            # дожидаемся нарезки хвоста очереди перед завершением прогона
+            cut_q.put(None)
+            cutter.join(timeout=600)
+
+            if self.processing:
+                self._clear_processing_state()
+                self.log(i18n.tr("Прогон завершён полностью - точка продолжения сброшена"))
+            self._log_processing_summary(i18n.tr("Сохранение попыток"),
                                          self.selected_files, t0, self.processing)
         except Exception as e:
             self.log(i18n.tr("Ошибка режима попыток: {err} {trace}", err=e,
                              trace=traceback.format_exc()), logging.ERROR)
         finally:
+            # страховка: нарежчик не должен остаться в вечном ожидании очереди
+            if 'cut_q' in locals():
+                try:
+                    cut_q.put_nowait(None)
+                except Exception:
+                    pass
             self.processing = False
             self.root.after(0, lambda: self._after_worker_ui(False))
             self.root.after(0, self.update_attempt_thumbnails)
@@ -1662,59 +2146,20 @@ class FreestyleParserApp:
     def _try_auto_assign(self, store, name, banks):
         """Уверенное авто-присвоение одной попытки (под lock вызывающего).
         True - присвоена (провизорная привязка сохранена сразу)."""
-        sims = {a: self._attempt_athlete_sim(store[name], b)[0]
-                for a, b in banks.items()}
-        srt = sorted(sims.items(), key=lambda kv: -kv[1])
-        best, best_sim = srt[0]
-        second_sim = srt[1][1] if len(srt) >= 2 else 0.0
-        if best_sim >= self.ATTEMPT_SIM_THRESHOLD and best_sim - second_sim >= self.ATTEMPT_SIM_MARGIN:
-            self.attempt_assignments[name] = {'athlete': best,
-                                              'sim': round(best_sim, 3),
-                                              'second': round(second_sim, 3)}
-            self._save_assignments()
-            self.need_update_attempts = True  # плитки обновятся постепенно
-            self.log(i18n.tr("  Автоатрибуция: {name} → {best} (sim={sim:.2f}) "
-                             "- подтвердите на сетке превью",
-                             name=name, best=best, sim=best_sim))
-            return True
-        hint = ', '.join(f'{a}={s:.2f}' for a, s in srt[:2])
-        self.log(i18n.tr("  {name}: требует подтверждения ({hint})", name=name, hint=hint))
-        return False
-
+        return self.attribution.try_auto_assign(store, name, banks)
     def _auto_assign_attempts(self, store, banks):
         """Автоприсвоение новых попыток: уверенные - в provизорные привязки
         (assignments.yaml, до подтверждения пользователем), спорные - в лог.
         Банки строятся только из подтверждённого маппинга, поэтому ошибка
         авто-привязки не отравляет дальнейшую атрибуцию.
         Вызывается в конце прогона и после каждого подтверждения."""
-        if not banks:
-            return
-        with self._assignments_lock:
-            assigned_names = {os.path.basename(f)
-                              for files in self.athlete_mapping.values() for f in files}
-            fresh = [n for n in store
-                     if n not in assigned_names and n not in self.attempt_assignments]
-            n_auto = 0
-            for name in fresh:
-                if self._try_auto_assign(store, name, banks):
-                    n_auto += 1
-        if fresh:
-            self.log(i18n.tr("Автоатрибуция: предложено {n} из {total}", n=n_auto, total=len(fresh)))
-
+        self.attribution.auto_assign_attempts(store, banks)
     def refresh_auto_assignments(self, store=None):
         """Пересобирает банки (по подтверждённому маппингу) и немедленно
         перепредлагает авто-привязки - подтверждение учитывается сразу.
         store=None -> загрузить с диска; иначе используется живой store
         (вызов из on_attempt_found в рабочем потоке)."""
-        try:
-            if store is None:
-                store = self._load_profile_store()
-            banks = self._athlete_banks(store)
-            if banks:
-                self._auto_assign_attempts(store, banks)
-        except Exception as e:
-            self.log(i18n.tr("Ошибка пересчёта автоатрибуции: {err}", err=e), logging.ERROR)
-
+        self.attribution.refresh_auto_assignments(store=store)
     def process_athlete_scan(self):
         """Стратегия 'Скан атлетов': тот же keyframe-сплиттер, но БЕЗ нарезки
         клипов - сегменты присутствия атлетов с мгновенной атрибуцией по
@@ -1723,8 +2168,8 @@ class FreestyleParserApp:
         Подтверждение сегмента пополняет реестр."""
         t0 = time.time()
         try:
-            import attempts_v2
-            roi_bbox = self._roi_bbox_percentages()
+            # ROI как в сканировании (полигон/прям без преобразований)
+            roi = self.roi
             self._prune_athlete_mapping()
             banks = self._athlete_banks(self._load_profile_store())
             if banks:
@@ -1734,7 +2179,8 @@ class FreestyleParserApp:
                                  "подтвердите атлета на строке сегмента - банк пополнится"))
             segs = list(self.athlete_segments)
             profiles = self._segment_profiles
-            state = {'counter': 0, 'file': None}
+            state = {'counter': 0, 'file': None,
+                     'num': max([s.get('num', 0) for s in segs] or [0]) + 1}
 
             def on_segment_found(r):
                 src = r['source']
@@ -1749,10 +2195,12 @@ class FreestyleParserApp:
                 key = f"{base}#{state['counter']}"
                 state['counter'] += 1
                 seg = {'key': key, 'file': base, 'source': src,
+                       'num': state['num'],
                        'start': round(float(r['start']), 2),
                        'end': round(float(r['end']), 2),
                        'thumb_t': round(float(r.get('thumb_t') or r['start']), 2),
                        'athlete': None, 'sim': None, 'confirmed': False}
+                state['num'] += 1
                 srt = []
                 if r['reid'] is not None:
                     vest_full = np.concatenate([r['vest'], r['reid']]) \
@@ -1768,8 +2216,8 @@ class FreestyleParserApp:
                         best, s = srt[0]
                         second = srt[1][1] if len(srt) > 1 else 0.0
                         seg['sim'] = round(float(s), 3)
-                        if s >= self.ATTEMPT_SIM_THRESHOLD and \
-                                s - second >= self.ATTEMPT_SIM_MARGIN:
+                        if s >= self.attribution.ATTEMPT_SIM_THRESHOLD and \
+                                s - second >= self.attribution.ATTEMPT_SIM_MARGIN:
                             seg['athlete'] = best
                 segs.append(seg)
                 if seg['athlete']:
@@ -1778,18 +2226,23 @@ class FreestyleParserApp:
                     who = f"{srt[0][0]} {seg['sim'] * 100:.0f}%?"
                 else:
                     who = i18n.tr("не разобрано")
-                self.log(i18n.tr("  Сегмент: {who} — {start:.1f}–{end:.1f}с "
-                                 "({file})", who=who, start=seg['start'],
-                                 end=seg['end'], file=base))
+                self.log(i18n.tr("  Сегмент №{num}: {who} — {start:.1f}–{end:.1f}с "
+                                 "({file})", num=seg['num'], who=who,
+                                 start=seg['start'], end=seg['end'], file=base))
                 # живое обновление панели: сегменты появляются по мере скана
                 self.athlete_segments = list(segs)
                 self.need_update_segments = True
+                self.need_update_attempts = True  # плитки в основной сетке
+
+            # Единая точка продолжения: резюме по закоммиченным файлам
+            resume = self._load_resume_state()
+            resume_file_index = int(resume.get('file_index', 0)) if resume else 0
 
             for file_index, video_path in enumerate(self.selected_files):
                 if not self.processing:
                     break
-                if self._is_processed(video_path, 'athletes'):
-                    # продолжение прерванного прогона: сегменты файла уже есть
+                if file_index < resume_file_index:
+                    # резюме: файлы до точки продолжения закоммичены полностью
                     self.log(i18n.tr("[{i}/{n}] {file}: уже обработан - пропускаю",
                                      i=file_index + 1, n=len(self.selected_files),
                                      file=os.path.basename(video_path)))
@@ -1799,33 +2252,45 @@ class FreestyleParserApp:
                                  "Скан атлетов: {file} ...", i=file_index + 1,
                                  n=len(self.selected_files),
                                  file=os.path.basename(video_path)))
+                self._log_source_diagnostics(video_path)
+                f_t0 = time.time()
+                f_size = 0
+                try:
+                    f_size = os.path.getsize(video_path)
+                except OSError:
+                    pass
                 tmp_dir = os.path.join(self.output_folder, f".scan_tmp_{base}")
                 try:
-                    attempts_v2.process_video(
-                        video_path, tmp_dir, roi=roi_bbox,
+                    splitter.process_video_athletes(
+                        video_path, roi,
                         should_continue=lambda: self.processing,
-                        slowmo_factor=self._active_slowmo_factor,
-                        min_pause=float(self.processing_params.get('min_pause_duration', 2.5)),
-                        min_attempt_duration=float(self.processing_params.get('min_attempt_duration', 3.0)),
-                        reid_embed_rate=float(self.processing_params.get('reid_embed_rate', 5)),
-                        collect_tiles=False,
-                        attempt_found_cb=lambda r, src=video_path: on_segment_found({**r, 'source': src}),
                         log_cb=self.log,
-                        progress_cb=lambda fi, tf, fi_=file_index, nf=len(self.selected_files):
-                            self.on_processing_progress(fi_, nf, fi, tf))
+                        params=self.processing_params,
+                        reid_embed_rate=float(self.processing_params.get('reid_embed_rate', 5)),
+                        slowmo_factor=self._active_slowmo_factor,
+                        attempt_found_cb=lambda r, src=video_path: on_segment_found({**r, 'source': src}),
+                        progress_cb=lambda pos, tot, fi_=file_index, nf=len(self.selected_files):
+                            self.on_processing_progress(fi_, nf, pos, tot))
                 except Exception as e:
                     self.log(i18n.tr("Ошибка обработки {file}: {err}", file=base, err=e), logging.ERROR)
                     continue
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._log_file_done(base, f_size, f_t0)
                 if self.processing:
                     self._mark_processed(video_path, 'athletes')
+                    # файл закоммичен целиком
+                    self._save_processing_state('athletes', file_index + 1, 0.0,
+                                                self._run_last_number or None)
 
             self.athlete_segments = segs
             self._save_segments()
             self._save_segment_profiles()
             self.log(i18n.tr("Скан атлетов завершён: {n} сегментов. "
                              "Подтверждайте атлетов на вкладке 'Скан'", n=len(segs)))
+            if self.processing:
+                self._clear_processing_state()
+                self.log(i18n.tr("Прогон завершён полностью - точка продолжения сброшена"))
             self._log_processing_summary(i18n.tr("Скан атлетов"),
                                          self.selected_files, t0, self.processing)
         except Exception as e:
@@ -1857,6 +2322,7 @@ class FreestyleParserApp:
                              athlete=athlete, file=seg['file']))
         self._save_segments()
         self.update_segments_panel()
+        self.need_update_attempts = True  # плитки сегментов в основной сетке
         self.update_athlete_list()
 
     def remove_segment_assignment(self, seg):
@@ -1866,6 +2332,7 @@ class FreestyleParserApp:
         seg['confirmed'] = False
         self._save_segments()
         self.update_segments_panel()
+        self.need_update_attempts = True
 
 
     def on_candidate_found(self, attempt):
@@ -1880,20 +2347,24 @@ class FreestyleParserApp:
             idx = len(self.candidates) + 1
             thumb_path = os.path.join(self.output_folder, f"cand_{idx:03d}.jpg")
             try:
-                imwrite_unicode(thumb_path, attempt.best_frame)
+                # единая логика превью: кадр, где атлет ближе всего к центру ROI
+                frame = attempt.thumb_frame \
+                    if attempt.thumb_frame is not None else attempt.best_frame
+                imwrite_unicode(thumb_path, frame)
             except Exception:
                 thumb_path = None
             self.candidates.append({
                 'file': attempt.source_video,
                 'start': float(attempt.start),
                 'end': float(attempt.end),
+                'thumb_t': float(attempt.thumb_t) if attempt.thumb_t is not None else None,
                 'thumbnail': thumb_path,
                 'num': idx,
                 'selected': True,
                 'status': 'pending',
             })
         self.need_update_attempts = True
-        self.log(i18n.tr("Кандидат #{idx}: {file} "
+        self.log(i18n.tr("Разметка #{idx}: {file} "
                          "{start:.1f}s..{end:.1f}s", idx=idx,
                          file=os.path.basename(attempt.source_video),
                          start=attempt.start, end=attempt.end))
@@ -1924,12 +2395,28 @@ class FreestyleParserApp:
         self.update_cut_button_state()
         self.save_candidates()
 
+    def _make_cut_button(self, parent):
+        """Кнопка «✂️ Нарезать» в заголовке секции разметок: пересоздаётся
+        при каждой перерисовке сетки (родитель-сепаратор уничтожается)."""
+        self.button_cut_selected = tk.Button(
+            parent, text=i18n.tr("✂️ Нарезать"),
+            command=self.cut_selected_candidates, state=tk.DISABLED,
+            relief=tk.RAISED, bd=2, bg="#dff0d8", activebackground="#c8e6c9",
+            font=('Arial', 10, 'bold'), padx=8, pady=2)
+        self.button_cut_selected.pack(side=tk.LEFT, padx=(10, 2))
+        self._attach_tooltip(self.button_cut_selected,
+                             i18n.tr("Нарезать отмеченные разметки в видеофайлы"))
+        self.update_cut_button_state()
+
     def update_cut_button_state(self):
         """Обновляет кнопку нарезки выбранных кандидатов: количество и примерный объём выхлопа"""
+        btn = getattr(self, 'button_cut_selected', None)
+        if btn is None or not btn.winfo_exists():
+            return
         with self._candidates_lock:
             selected = [c for c in self.candidates
                         if c['status'] == 'pending' and c.get('selected')]
-        n = len(selected)
+        n = len(selected) + len(getattr(self, 'selected_segments', set()))
         # компактный текст: панель попыток узкая, длинная подпись обрезается
         text = i18n.tr("✂️ Нарезать")
         if n > 0:
@@ -1946,18 +2433,21 @@ class FreestyleParserApp:
                     else i18n.tr("✂️ Нарезать ({n})", n=n)
             except Exception:
                 text = i18n.tr("✂️ Нарезать ({n})", n=n)
-            self.button_cut_selected.config(state=tk.NORMAL, text=text)
+            btn.config(state=tk.NORMAL, text=text)
         else:
-            self.button_cut_selected.config(state=tk.DISABLED, text=text)
+            btn.config(state=tk.DISABLED, text=text)
 
     def cut_selected_candidates(self):
-        """Нарезает выбранных кандидатов: точный анализ границ + вырезка.
-        Может запускаться во время сканирования - идут параллельно."""
+        """Нарезает выбранных кандидатов (точный анализ) и сегменты скана
+        (прямой remux). Может запускаться во время сканирования."""
         with self._candidates_lock:
             selected = [c for c in self.candidates
                         if c['status'] == 'pending' and c.get('selected')]
-        if not selected:
-            messagebox.showwarning(i18n.tr("Предупреждение"), i18n.tr("Не выбрано ни одного кандидата"))
+        selected_segs = [s for s in self.athlete_segments
+                         if s.get('key') in self.selected_segments
+                         and not s.get('cut_as')]
+        if not selected and not selected_segs:
+            messagebox.showwarning(i18n.tr("Предупреждение"), i18n.tr("Не выбрано ни одной разметки"))
             return
         if self.cut_running:
             return
@@ -1970,113 +2460,125 @@ class FreestyleParserApp:
         self.button_stop.config(state=tk.NORMAL)
         self._progress_percent = 0.0
         self.progress_var.set(0)
-        self.log(i18n.tr("Нарезка {n} кандидатов, слоумо "
-                         "{slowmo}", n=len(selected),
+        self.log(i18n.tr("Нарезка {n} разметок, слоумо "
+                         "{slowmo}", n=len(selected) + len(selected_segs),
                          slowmo=(i18n.tr("1/{f}", f=self._active_slowmo_factor)
                                  if self._active_slowmo_factor > 1 else i18n.tr("нет"))))
-        threading.Thread(target=self._cut_candidates_thread, args=(selected,), daemon=True).start()
+        threading.Thread(target=self._cut_candidates_thread,
+                         args=(selected, selected_segs), daemon=True).start()
 
-    def _cut_candidates_thread(self, selected):
-        """Точная стадия ручного режима: для каждого кандидата - полный анализ
-        в узком окне вокруг него и вырезка найденных попыток."""
+    def _cut_candidates_thread(self, selected, selected_segs=None):
+        """Нарезка выбранных разметок и сегментов скана: границы от единого
+        кейфрейм-детектора скана, прямой remux с preroll/padding. Отдельной
+        точной стадии больше нет - детектор один, границы уже точные."""
         t0 = time.time()
+        stopped = False
         try:
-            from splitter import load_yolo_model
+            start_pad = float(self.processing_params.get('attempt_start_padding', 2))
+            end_pad = float(self.processing_params.get('attempt_end_padding', 0.5))
             slowmo = self._active_slowmo_factor
-            model = load_yolo_model()
-            start_pad = self.processing_params['attempt_start_padding']
-            end_pad = self.processing_params['attempt_end_padding']
-            scan_interval = float(self.processing_params.get('scan_interval', 2.5))
-            margin = scan_interval + 1.0  # запас на неточность скана
-            # окна уже нарезанных кандидатов (включая прошлые запуски) - чтобы не нарезать дубль
+            # окна уже нарезанных разметок (включая прошлые запуски) - чтобы
+            # не нарезать дубль
             with self._candidates_lock:
                 cut_windows = [(c['file'], c['start'], c['end'])
                                for c in self.candidates if c['status'] == 'cut']
-            cut_count = 0
-            total = len(selected)
-            stopped = False
-            for i, cand in enumerate(selected):
+            items = [('cand', c) for c in selected] + \
+                [('seg', s) for s in (selected_segs or [])]
+            items.sort(key=lambda kv: (kv[1].get('file', kv[1].get('source', '')),
+                                       float(kv[1].get('start', 0))))
+            number = self._next_attempt_number()
+            store = self._load_profile_store()
+            cut, skipped = 0, 0
+            total = len(items)
+            from splitter import AttemptInfo
+            for i, (kind, it) in enumerate(items):
                 if not self.processing:
                     stopped = True
                     remaining = total - i
                     self.log(i18n.tr("Нарезка остановлена: обработано {done} из {total}, "
-                                     "осталось {remaining} кандидатов. Повторный запуск "
+                                     "осталось {remaining}. Повторный запуск "
                                      "«Нарезать» продолжит с того же места.",
-                                     done=i, total=total, remaining=remaining))
+                                     done=i, total=total, remaining=remaining),
+                             logging.WARNING)
                     break
-                left = total - i
-                if any(f == cand['file'] and max(s, cand['start']) < min(e, cand['end'])
+                src = it.get('file') or it.get('source')
+                start = float(it.get('start', 0))
+                end = float(it.get('end', 0))
+                if any(f == src and max(s, start) < min(e, end)
                        for f, s, e in cut_windows):
-                    self.log(i18n.tr("[{i}/{total}, осталось {left}] Кандидат "
+                    self.log(i18n.tr("[{i}/{total}, осталось {left}] Разметка "
                                      "{file} {start:.1f}s..{end:.1f}s "
                                      "пересекается с уже нарезанной попыткой - пропущен",
-                                     i=i + 1, total=total, left=left - 1,
-                                     file=os.path.basename(cand['file']),
-                                     start=cand['start'], end=cand['end']))
+                                     i=i + 1, total=total, left=total - i - 1,
+                                     file=os.path.basename(src),
+                                     start=start, end=end))
                     continue
-                # влево ищем точное начало: margin по умолчанию (шаг скана + 1)
-                # или явный 'precise_left_margin' (кандидат может опаздывать)
-                left_margin = float(self.processing_params.get('precise_left_margin', 0)
-                                    or 0) or margin
-                win_start = max(0.0, cand['start'] - start_pad - left_margin)
-                win_end = cand['end'] + end_pad + margin
-                next_num = get_next_attempt_number(self.output_folder)
-                self.log(i18n.tr("[{i}/{total}, осталось {left}] Точный анализ "
+                thumb_t = float(it.get('thumb_t') or start or 0)
+                cap = open_capture(src)
+                cap.set(cv2.CAP_PROP_POS_MSEC, thumb_t * slowmo * 1000)
+                ok, frame = cap.read()
+                cap.release()
+                if not ok:
+                    frame = np.zeros((360, 640, 3), np.uint8)
+                self.log(i18n.tr("[{i}/{total}, осталось {left}] Нарезка "
                                  "{file} {start:.1f}s..{end:.1f}s",
-                                 i=i + 1, total=total, left=left - 1,
-                                 file=os.path.basename(cand['file']),
-                                 start=cand['start'], end=cand['end']))
-                found = []
-
-                def fine_callback(attempt, found=found):
-                    found.append(attempt)
-                    return self.on_attempt_file_created(attempt)
-
-                try:
-                    from splitter import process_video
-                    process_video([cand['file']], self.roi, fine_callback, next_num,
-                                  params=self.processing_params,
-                                  should_continue=lambda: self.processing,
-                                  slowmo_factor=slowmo,
-                                  model=model,
-                                  restrict_range=(win_start, win_end),
-                                  log_fn=self.log)
-                except Exception as e:
-                    self.log(i18n.tr("Ошибка точного анализа: {err} {trace}", err=e,
-                                     trace=traceback.format_exc()), logging.ERROR)
-                if found:
-                    cand['status'] = 'cut'
-                    cut_count += len(found)
-                    cut_windows.append((cand['file'], cand['start'], cand['end']))
+                                 i=i + 1, total=total, left=total - i - 1,
+                                 file=os.path.basename(src), start=start, end=end))
+                info = AttemptInfo(src, max(0.0, start - start_pad),
+                                   end + end_pad, number, frame, None, None, None)
+                if self._cut_attempt_now(info):
+                    name = f"{number:04d}.mp4"
+                    cut += 1
+                    cut_windows.append((src, start, end))
+                    if kind == 'cand':
+                        it['status'] = 'cut'
+                    else:
+                        it['cut_as'] = name
+                        prof = self._segment_profiles.get(it.get('key'))
+                        if prof is not None:
+                            store[name] = {'vest': prof['vest'], 'boat': prof['boat']}
+                        athlete = it.get('athlete')
+                        if it.get('confirmed') and athlete:
+                            lst = self.athlete_mapping.setdefault(athlete, [])
+                            if name not in lst:
+                                lst.append(name)
+                            self.save_athlete_mapping()
                 else:
-                    self.log(i18n.tr("В окне кандидата попыток не найдено - пропущен"))
+                    skipped += 1
+                number += 1
                 self.save_candidates()
-            if not stopped:
-                self.log(i18n.tr("Нарезка завершена: попыток {n} из {total} кандидатов",
-                                 n=cut_count, total=total))
-                self._log_processing_summary(i18n.tr("Нарезка выбранных кандидатов"),
-                                             [c['file'] for c in selected],
-                                             t0, True)
+            self._save_profile_store(store)
+            self._save_segments()
+            self.log(i18n.tr("Нарезка завершена: {cut} нарезано, {skip} пропущено "
+                             "за {sec:.0f}с", cut=cut, skip=skipped,
+                             sec=time.time() - t0))
+            self.refresh_auto_assignments(store=store)
+        except Exception as e:
+            self.log(i18n.tr("Ошибка нарезки разметок: {err} {trace}", err=e,
+                             trace=traceback.format_exc()), logging.ERROR)
         finally:
             self.cut_running = False
             self.processing = self.scan_running
             still_busy = self.processing
+            self.selected_segments.clear()
             self.need_update_attempts = True
+            self.need_update_segments = True
             self.root.after(0, lambda: self._after_worker_ui(still_busy))
+            self.root.after(0, self.update_athlete_list)
 
     def clear_pending_candidates(self):
         """Удаляет всех неподтверждённых (ненарезанных) кандидатов - для чистого
         пересканирования с нуля. Уже нарезанные не трогаются."""
         if self.cut_running:
-            messagebox.showinfo(i18n.tr("Кандидаты"), i18n.tr("Дождитесь завершения нарезки"))
+            messagebox.showinfo(i18n.tr("Разметки попыток"), i18n.tr("Дождитесь завершения нарезки"))
             return
         with self._candidates_lock:
             pending = [c for c in self.candidates if c['status'] == 'pending']
             if not pending:
-                messagebox.showinfo(i18n.tr("Кандидаты"), i18n.tr("Нет кандидатов для очистки"))
+                messagebox.showinfo(i18n.tr("Разметки попыток"), i18n.tr("Нет разметок для очистки"))
                 return
             if not messagebox.askyesno(i18n.tr("Подтверждение"),
-                                       i18n.tr("Удалить {n} кандидатов (ненарезанных)?", n=len(pending))):
+                                       i18n.tr("Удалить {n} разметок (ненарезанных)?", n=len(pending))):
                 return
             for cand in pending:
                 thumb = cand.get('thumbnail')
@@ -2091,7 +2593,7 @@ class FreestyleParserApp:
         self.update_cut_button_state()
         self.update_attempt_thumbnails()
         self._render_file_list()
-        self.log(i18n.tr("Кандидаты очищены (удалено {n})", n=len(pending)))
+        self.log(i18n.tr("Разметки очищены (удалено {n})", n=len(pending)))
 
     def save_candidates(self):
         """Сохраняет кандидатов в candidates.yaml (потокобезопасно)"""
@@ -2100,6 +2602,7 @@ class FreestyleParserApp:
                 return
             data = {'candidates': [
                 {'file': c['file'], 'start': c['start'], 'end': c['end'],
+                 'thumb_t': c.get('thumb_t'),
                  'thumbnail': self.get_relative_path(c['thumbnail'])
                  if c.get('thumbnail') else None,
                  'num': c.get('num'),
@@ -2111,7 +2614,7 @@ class FreestyleParserApp:
             with open(self.candidates_file, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, allow_unicode=True)
         except Exception as e:
-            self.log(i18n.tr("Ошибка сохранения кандидатов: {err}", err=e))
+            self.log(i18n.tr("Ошибка сохранения разметок: {err}", err=e))
 
     def load_candidates(self):
         """Загружает кандидатов из candidates.yaml"""
@@ -2131,32 +2634,90 @@ class FreestyleParserApp:
                         'file': self.get_absolute_path(c.get('file', '')),
                         'start': float(c.get('start', 0)),
                         'end': float(c.get('end', 0)),
+                        'thumb_t': float(c['thumb_t']) if c.get('thumb_t') is not None else None,
                         'thumbnail': thumb,
                         'num': int(c.get('num') or 0),
                         'selected': bool(c.get('selected')),
                         'status': c.get('status', 'pending'),
                     })
             except Exception as e:
-                self.log(i18n.tr("Ошибка загрузки кандидатов: {err}", err=e))
+                self.log(i18n.tr("Ошибка загрузки разметок: {err}", err=e))
+
+    def _ensure_progress_weights(self):
+        """Веса файлов по длительности: большие файлы - большая доля бара.
+        Ленивая инициализация из рабочего потока; при сбое - равные веса."""
+        if getattr(self, '_progress_weights', None) is not None:
+            return
+        try:
+            w = [max(self._get_file_duration(f), 1.0)
+                 for f in self.selected_files]
+        except Exception:
+            w = [1.0] * len(self.selected_files)
+        if not w or sum(w) <= 0:
+            w = [1.0] * max(1, len(self.selected_files))
+        self._progress_weights = w
+
+    def _disk_free_gb(self):
+        """Свободное место на диске рабочей папки (ГБ) или None."""
+        try:
+            import shutil
+            return shutil.disk_usage(self.output_folder).free / 1e9
+        except Exception:
+            return None
+
+    def _check_disk_space_running(self):
+        """Периодическая проверка в пишущих режимах: место кончилось -
+        корректная остановка (точка продолжения коммитится по попыткам)."""
+        if self._run_mode not in ('auto', 'attempts'):
+            return
+        free = self._disk_free_gb()
+        if free is not None and free < 0.5:
+            self.log(i18n.tr("Место на диске закончилось ({free:.1f} ГБ) - "
+                             "обработка остановлена. Точка продолжения сохранена - "
+                             "освободите место и нажмите «Продолжить»",
+                             free=free), logging.ERROR)
+            self.processing = False
 
     def on_processing_progress(self, file_index, file_count, frame_index, total_frames):
         """Прогресс обработки. Вызывается из рабочего потока, поэтому только считаем
-        процент - сам прогрессбар обновляет periodic_update в главном потоке."""
+        процент - сам прогрессбар обновляет periodic_update в главном потоке.
+        Доля считается взвешенно по длительности файлов, ETA - и для файла, и
+        для всего прогона."""
         if file_count <= 0:
             return
+        now = time.time()
+        if now - getattr(self, '_disk_check_t', 0.0) >= 10.0:
+            self._disk_check_t = now
+            self._check_disk_space_running()
         now = time.time()
         # новый файл (или новый запуск) - сбрасываем точку отсчёта ETA
         if getattr(self, '_progress_file_index', None) != file_index or frame_index <= 1:
             self._progress_file_index = file_index
             self._progress_file_t0 = now
+            self._progress_file_fp0 = None
             self._progress_file_pos = f"{file_index + 1}/{file_count}"
             if 0 <= file_index < len(self.selected_files):
                 self._progress_file_name = os.path.basename(self.selected_files[file_index])
             else:
                 self._progress_file_name = ''
-        file_progress = frame_index / total_frames if total_frames > 0 else 0.0
-        self._progress_percent = 100.0 * (file_index + min(file_progress, 1.0)) / file_count
-        self._progress_file_percent = 100.0 * min(file_progress, 1.0)
+            if file_index <= 0:
+                # старт прогона (или возврат к первому файлу после резюме)
+                self._progress_run_t0 = now
+                self._progress_run_fd0 = None
+        self._ensure_progress_weights()
+        file_progress = min(frame_index / total_frames, 1.0) if total_frames > 0 else 0.0
+        if getattr(self, '_progress_file_fp0', None) is None:
+            # при резюме прогресс файла может начинаться не с нуля
+            self._progress_file_fp0 = file_progress
+        w = self._progress_weights
+        fi = min(max(file_index, 0), len(w) - 1)
+        done = sum(w[:fi]) + w[fi] * file_progress
+        if getattr(self, '_progress_run_fd0', None) is None:
+            # при резюме доля прогона стартует с уже сделанной части
+            self._progress_run_fd0 = done
+        self._progress_done_fraction = done / sum(w)
+        self._progress_percent = 100.0 * self._progress_done_fraction
+        self._progress_file_percent = 100.0 * file_progress
 
     @staticmethod
     def _fmt_eta(seconds):
@@ -2166,8 +2727,20 @@ class FreestyleParserApp:
             return i18n.tr("~{m} мин {s} с", m=seconds // 60, s=seconds % 60)
         return i18n.tr("~{s} с", s=seconds)
 
+    def _predicted_run_sec(self):
+        """Прогнозная длительность прогона (сек) по оценке режима."""
+        try:
+            files = [f for f in self.selected_files if isinstance(f, str)]
+            video_min = sum(max(self._get_file_duration(f), 0.0) for f in files) / 60.0
+            if video_min <= 0:
+                return 0.0
+            factor, _src = self._mode_speed_factor(self._strategy())
+            return factor * video_min
+        except Exception:
+            return 0.0
+
     def _update_progress_info(self):
-        """Строка под прогресс-баром: имя файла + ETA текущего файла"""
+        """Строка под прогресс-баром: имя файла + ETA файла и всего прогона"""
         if not self.processing:
             self.progress_info_var.set('')
             return
@@ -2177,10 +2750,25 @@ class FreestyleParserApp:
         if name:
             parts.append(f"{name} [{pos}]" if pos else name)
         t0 = getattr(self, '_progress_file_t0', None)
-        fp = getattr(self, '_progress_file_percent', 0.0)
-        if t0 and fp > 0.5:
-            parts.append(i18n.tr("осталось {eta}", eta=self._fmt_eta(
-                (time.time() - t0) * (100.0 - fp) / fp)))
+        fp = getattr(self, '_progress_file_percent', 0.0) / 100.0
+        fp0 = getattr(self, '_progress_file_fp0', None) or 0.0
+        if t0 and fp - fp0 > 0.005:
+            # ETA от прироста прогресса в этой сессии (при резюме файл
+            # может начинаться не с нуля)
+            parts.append(i18n.tr("файлу осталось {eta}", eta=self._fmt_eta(
+                (time.time() - t0) * (1.0 - fp) / (fp - fp0))))
+        rt0 = getattr(self, '_progress_run_t0', None)
+        fd = getattr(self, '_progress_done_fraction', 0.0)
+        fd0 = getattr(self, '_progress_run_fd0', None) or 0.0
+        if rt0 and fd - fd0 > 0.005:
+            elapsed = time.time() - rt0
+            eta_obs = elapsed * (1.0 - fd) / (fd - fd0)
+            # в начале сессии наблюдаемая ETA шумная - блендим с прогнозом;
+            # после 25% прироста верим только наблюдениям
+            w = min(1.0, (fd - fd0) / 0.25)
+            eta_pred = getattr(self, '_run_est_total', 0.0) * (1.0 - fd)
+            eta = w * eta_obs + (1.0 - w) * eta_pred if eta_pred > 0 else eta_obs
+            parts.append(i18n.tr("всего осталось {eta}", eta=self._fmt_eta(eta)))
         self.progress_info_var.set(' · '.join(parts))
 
     def setup_logger(self):
@@ -2211,6 +2799,10 @@ class FreestyleParserApp:
         self.gui_handler = GuiLogHandler(self)
         self.gui_handler.setFormatter(formatter)
         self.logger.addHandler(self.gui_handler)
+
+        # версия - первой строкой: пользователь копирует лог вместе с ней
+        self.logger.info("FreestyleParser v%s (Python %s)",
+                         APP_VERSION, sys.version.split()[0])
 
     def _redirect_day_log(self):
         """Перенаправляет день-хендлер логгера в текущую папку дня:
@@ -2252,78 +2844,17 @@ class FreestyleParserApp:
 
     def load_athlete_mapping(self):
         """Загружает маппинг атлетов из файла"""
-        mapping_file = os.path.join(self.output_folder, "mapping.yaml")
-        if os.path.exists(mapping_file):
-            try:
-                with open(mapping_file, 'r', encoding='utf-8') as f:
-                    mapping = yaml.safe_load(f)
-                    if mapping is None:  # Если файл пустой или содержит только комментарии
-                        self.athlete_mapping = {}
-                    else:
-                        # Преобразуем относительные пути в абсолютные
-                        self.athlete_mapping = {
-                            self._repair_mojibake(name): list(set(attempts))  # Convert back to a list if needed
-                            for name, attempts in mapping.items()
-                        }
-            except Exception as e:
-                self.log(i18n.tr("Ошибка при загрузке маппинга: {err}", err=str(e)))
-                self.athlete_mapping = {}
-        else:
-            self.athlete_mapping = {}
-        self._prune_athlete_mapping()
-
-    @staticmethod
-    def _repair_mojibake(name):
-        """Чинит имена, испорченные чтением UTF-8 как cp1251 (Windows-сборки
-        до v1.3.1 писали mapping.yaml в utf-8, а читали без encoding - кириллица
-        превращалась в 'Ã�Â¿Ã�Â¾Ã�...'). Если обратное преобразование однозначно
-        удается - возвращаем чиненое имя, иначе как есть."""
-        if not isinstance(name, str) or all(ord(c) < 128 for c in name):
-            return name
-        for enc in ('cp1251', 'cp1252'):
-            try:
-                return name.encode(enc).decode('utf-8')
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                continue
-        return name
+        self.attribution.load_athlete_mapping()
 
     def _prune_athlete_mapping(self):
         """Убирает из маппинга привязки к несуществующим файлам.
         Пустые атлеты не удаляются (атлет мог быть только что создан)."""
-        pruned = []
-        for athlete in list(self.athlete_mapping.keys()):
-            kept = [name for name in self.athlete_mapping[athlete]
-                    if os.path.exists(os.path.join(self.output_folder, name))]
-            pruned += [f"{athlete}: {name}"
-                       for name in self.athlete_mapping[athlete] if name not in kept]
-            self.athlete_mapping[athlete] = kept
-        if pruned:
-            self.log(i18n.tr("Убраны мёртвые привязки маппинга: {names}", names=', '.join(pruned)))
-            self.save_athlete_mapping()
-        return pruned
-
+        return self.attribution.prune_athlete_mapping()
     def _load_assignments(self):
         """Загружает авто-привязки (провизорные, до подтверждения пользователем)."""
-        f = os.path.join(self.output_folder, "assignments.yaml")
-        if os.path.exists(f):
-            try:
-                with open(f, 'r', encoding='utf-8') as fh:
-                    self.attempt_assignments = yaml.safe_load(fh) or {}
-            except Exception as e:
-                self.log(i18n.tr("Ошибка загрузки assignments: {err}", err=e))
-                self.attempt_assignments = {}
-        else:
-            self.attempt_assignments = {}
-
+        self.attribution.load_assignments()
     def _save_assignments(self):
-        f = os.path.join(self.output_folder, "assignments.yaml")
-        try:
-            with open(f, 'w', encoding='utf-8') as fh:
-                yaml.dump(self.attempt_assignments, fh,
-                          default_flow_style=False, allow_unicode=True)
-        except Exception as e:
-            self.log(i18n.tr("Ошибка сохранения assignments: {err}", err=e))
-
+        self.attribution.save_assignments()
     def confirm_assignment(self, attempt, athlete_name=None):
         """Подтверждает привязку попытки (auto -> confirmed в mapping.yaml)."""
         a = self.attempt_assignments.get(attempt)
@@ -2392,18 +2923,7 @@ class FreestyleParserApp:
         self.refresh_auto_assignments()
 
     def save_athlete_mapping(self):
-        mapping_file = os.path.join(self.output_folder, "mapping.yaml")
-        try:
-            # Преобразуем абсолютные пути в относительные
-            mapping = {
-                name: list(set([self.get_relative_path(path) for path in attempts]))
-                for name, attempts in self.athlete_mapping.items()
-            }
-            with open(mapping_file, 'w', encoding='utf-8') as f:
-                yaml.dump(mapping, f, default_flow_style=False, allow_unicode=True)
-        except Exception as e:
-            self.log(i18n.tr("Ошибка при сохранении маппинга: {err}", err=str(e)))
-
+        self.attribution.save_athlete_mapping()
     def save_ratings(self):
         """Сохраняет рейтинги попыток в файл (может зваться из фонового потока)"""
         ratings_file = os.path.join(self.output_folder, "ratings.yaml")
@@ -2554,7 +3074,7 @@ class FreestyleParserApp:
         self.label_files = tk.Label(files_left, text=i18n.tr("Входные файлы:"))
         self.label_files.pack(anchor=tk.W)
 
-        self.listbox_files = tk.Listbox(files_left, height=5, width=22)
+        self.listbox_files = tk.Listbox(files_left, height=3, width=22)
         self.listbox_files.pack(fill=tk.X, padx=5)
         self.listbox_files.bind('<<ListboxSelect>>', self.on_file_select)
 
@@ -2740,30 +3260,29 @@ class FreestyleParserApp:
                                      "параметры считаются в реальных секундах."))
         self._attach_tooltip(self.slowmo_combo, i18n.tr("Во сколько раз запись замедлена"))
 
-        # --- Стратегия обработки: 2 чекбокса = 4 комбинации ---
-        # [ ] Сразу сохранять  [ ] Определять атлетов
-        # ☑☐ - резать всё найденное; ☐☐ - превью-кандидаты для отбора;
-        # ☐☑ - сегменты+атлеты в оригиналах (скан атлетов); ☑☑ - резать всё
-        # с привязкой к атлетам
+        # --- Стратегия обработки: комбобокс с человеко-сценариями ---
         strategy_frame = tk.Frame(self.frame_output)
         strategy_frame.pack(fill=tk.X, padx=5, pady=(2, 0))
-        tk.Label(strategy_frame, text=i18n.tr("Стратегия:")).pack(side=tk.LEFT, padx=(0, 5))
-        self.save_now_var = tk.BooleanVar(value=True)
-        self.athletes_var = tk.BooleanVar(value=False)
-        cb_save_now = tk.Checkbutton(strategy_frame, text=i18n.tr("Сразу сохранять"),
-                                     variable=self.save_now_var,
-                                     command=self.on_strategy_change)
-        cb_save_now.pack(side=tk.LEFT)
-        self._attach_tooltip(cb_save_now,
-                             i18n.tr("Вкл: попытки сразу режутся в файлы.\n"
-                                     "Выкл: сначала кандидаты, потом «Нарезать»."))
-        cb_athletes = tk.Checkbutton(strategy_frame, text=i18n.tr("Определять атлетов"),
-                                     variable=self.athletes_var,
-                                     command=self.on_strategy_change)
-        cb_athletes.pack(side=tk.LEFT, padx=(5, 0))
-        self._attach_tooltip(cb_athletes,
-                             i18n.tr("Вкл: точный анализ + эмбеддинги + автоатрибуция (медленно).\n"
-                                     "Выкл: быстрый скан без атрибуции."))
+        tk.Label(strategy_frame, text=i18n.tr("Режим:")).pack(side=tk.LEFT, padx=(0, 5))
+        self.strategy_var = tk.StringVar(
+            value=i18n.tr(self.STRATEGY_MODES[0][1]))
+        self._last_mode_code = 'manual'  # для смены языка (лейблы не парсятся)
+        self.strategy_combo = ttk.Combobox(
+            strategy_frame, textvariable=self.strategy_var, state='readonly',
+            values=[self._strategy_display(code)
+                    for code, _l, _d, _f in self.STRATEGY_MODES])
+        self.strategy_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.strategy_combo.bind('<<ComboboxSelected>>',
+                                 lambda e: self.on_strategy_change())
+        # строка-подсказка: описание режима + оценка времени
+        self.strategy_hint_var = tk.StringVar(value='')
+        tk.Label(self.frame_output, textvariable=self.strategy_hint_var,
+                 fg='#777', font=('Arial', 8), justify=tk.LEFT,
+                 wraplength=440).pack(fill=tk.X, padx=8, anchor='w')
+        # комбобокс режима и подсказка - StringVar, ui_tr их не отслеживает:
+        # переводим заново при смене языка
+        i18n.on_language_changed(self._retranslate_strategy)
+        self._update_strategy_hint()
 
         # --- Управление процессом ---
         self.progress_var = tk.DoubleVar()
@@ -2783,20 +3302,17 @@ class FreestyleParserApp:
                              i18n.tr("Найти и нарезать попытки по выбранным файлам\n"
                                      "(стратегия - чекбоксами выше)"))
 
+        # «Заново» появляется рядом с «Продолжить»: сброс точки продолжения,
+        # журнал попыток очищается, нарезка с попытки №1 с перезаписью
+        self.button_restart = tk.Button(control_inner, text=i18n.tr("⟲ Заново"),
+                                        command=lambda: self.start_processing(force_restart=True))
+        self._attach_tooltip(self.button_restart,
+                             i18n.tr("Начать прогон с нуля: сбросить точку продолжения,\n"
+                                     "очистить журнал попыток, резать с №1 с перезаписью"))
+
         self.button_stop = tk.Button(control_inner, text=i18n.tr("Остановить"), state=tk.DISABLED, command=self.stop_processing)
         self.button_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
         self._attach_tooltip(self.button_stop, i18n.tr("Остановить обработку"))
-
-        # Режим «Просмотр без сохранения»: скан в фоне, попытки живут в памяти,
-        # просмотр в плеере, сохранение - по кнопкам (или A/S) в плеере
-        self.button_live = tk.Button(control_inner, text=i18n.tr("👁 Просмотр"), command=self.start_live_preview)
-        self.button_live.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-        self._attach_tooltip(self.button_live,
-                             i18n.tr("Сканировать попытки без сохранения на диск.\n"
-                                     "Просмотр в плеере, сохранение - кнопками в плеере\n"
-                                     "или клавишами A (предыдущая) / S (текущая).\n"
-                                     "«Определять атлетов» вкл -> точный сплиттер (медленно),\n"
-                                     "выкл -> грубый быстрый скан (шаг scan_interval)."))
 
 
         # === ПРАВЫЙ БЛОК ===
@@ -2862,16 +3378,8 @@ class FreestyleParserApp:
         self._attach_tooltip(self.delete_button,
                              i18n.tr("Удалить выбранные попытки\n(видео и превью-файлы)"))
 
-        # Кнопка нарезки выбранных кандидатов (ручной режим).
-        # Ярко выделена, чтобы читалась как кнопка, а не надпись.
-        self.button_cut_selected = tk.Button(
-            self.actions_frame, text=i18n.tr("✂️ Нарезать"),
-            command=self.cut_selected_candidates, state=tk.DISABLED,
-            relief=tk.RAISED, bd=2, bg="#dff0d8", activebackground="#c8e6c9",
-            font=('Arial', 10, 'bold'), padx=8, pady=2)
-        self.button_cut_selected.pack(side=tk.RIGHT, padx=5)
-        self._attach_tooltip(self.button_cut_selected,
-                             i18n.tr("Нарезать отмеченных кандидатов в видеофайлы"))
+        # Кнопка нарезки выбранных кандидатов создаётся в заголовке блока
+        # разметок (рядом с ☑/☐/🧹) при отрисовке сетки - см. _make_cut_button.
 
         # Создаем canvas и scrollbar для попыток
         self.attempts_canvas = tk.Canvas(self.frame_attempts)
@@ -3449,9 +3957,15 @@ class FreestyleParserApp:
             self.update_attempt_thumbnails()
 
     def update_attempt_thumbnails(self):
-        """Обновляет превью попыток"""
+        """Обновляет превью попыток. Фото кэшируются (path+mtime) - повторная
+        перерисовка сетки не ресайзит 4K-jpg заново; отсутствующие превью
+        генерируются в фоне (ffmpeg-сик по большому MTS - секунды, нельзя
+        на UI-потоке, иначе окно «зависает»)."""
         # сохраняем позицию скролла, чтобы перерисовка её не сбрасывала
         scroll_pos = self.attempts_canvas.yview()
+        # колонки по фактической ширине канваса (не ждём события resize)
+        if self.attempts_canvas.winfo_width() > 1:
+            self._attempts_cols_current = self._attempts_cols()
         # Очищаем текущие превью
         for widget in self.attempts_scrollable_frame.winfo_children():
             widget.destroy()
@@ -3474,6 +3988,15 @@ class FreestyleParserApp:
 
         # Сортируем попытки по имени
         attempts.sort()
+
+        # фоновая догенерация отсутствующих превью
+        missing = [a for a in attempts
+                   if not os.path.exists(os.path.join(
+                       self.output_folder, f"{os.path.splitext(a)[0]}.jpg"))]
+        if missing and not getattr(self, '_thumb_gen_running', False):
+            self._thumb_gen_running = True
+            threading.Thread(target=self._generate_missing_thumbs,
+                             args=(list(missing),), daemon=True).start()
 
         # Создаем сетку для превью
         row = 0
@@ -3506,89 +4029,89 @@ class FreestyleParserApp:
                 except Exception as e:
                     self.log(i18n.tr("Ошибка превью {attempt}: {err}", attempt=attempt, err=e))
 
+            photo = None
             if os.path.exists(thumbnail_path):
                 try:
-                    # Загружаем изображение
-                    image = Image.open(thumbnail_path)
-                    # Изменяем размер
-                    image = image.resize((self.TILE_W, self.TILE_H), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(image)
+                    photo = self._thumb_photo(thumbnail_path)
+                except Exception:
+                    photo = None
+            try:
 
-                    # Создаем метку с изображением
-                    label = tk.Label(frame, image=photo)
-                    label.image = photo  # Сохраняем ссылку
-                    label.pack()
+                # Создаем метку с изображением
+                label = tk.Label(frame, image=photo)
+                label.image = photo  # Сохраняем ссылку
+                label.pack()
 
-                    # Создаем фрейм для имени файла и чекбокса
-                    name_frame = tk.Frame(frame)
-                    name_frame.pack()
+                # Создаем фрейм для имени файла и чекбокса
+                name_frame = tk.Frame(frame)
+                name_frame.pack()
 
-                    # Создаем чекбокс
-                    var = tk.BooleanVar(value=attempt in self.selected_attempts)
-                    checkbox = tk.Checkbutton(name_frame, variable=var, 
-                                            command=lambda a=attempt, v=var: self.on_attempt_checkbox_change(a, v))
-                    checkbox.pack(side=tk.LEFT, padx=(0, 5))
+                # Создаем чекбокс
+                var = tk.BooleanVar(value=attempt in self.selected_attempts)
+                checkbox = tk.Checkbutton(name_frame, variable=var, 
+                                        command=lambda a=attempt, v=var: self.on_attempt_checkbox_change(a, v))
+                checkbox.pack(side=tk.LEFT, padx=(0, 5))
                     
-                    # Сохраняем ссылку на чекбокс
-                    self.attempt_checkboxes[attempt] = var
+                # Сохраняем ссылку на чекбокс
+                self.attempt_checkboxes[attempt] = var
 
-                    # Добавляем имя файла
-                    name_label = tk.Label(name_frame, text=os.path.basename(attempt))
-                    name_label.pack(side=tk.LEFT)
+                # Добавляем имя файла
+                name_label = tk.Label(name_frame, text=os.path.basename(attempt))
+                name_label.pack(side=tk.LEFT)
 
-                    # Добавляем кнопки рейтинга
-                    rating_frame = tk.Frame(name_frame)
-                    rating_frame.pack(side=tk.RIGHT, padx=(10, 0))
+                # Добавляем кнопки рейтинга
+                rating_frame = tk.Frame(name_frame)
+                rating_frame.pack(side=tk.RIGHT, padx=(10, 0))
 
-                    # Инициализируем рейтинг для попытки, если его нет
-                    if attempt not in self.attempt_ratings:
-                        self.attempt_ratings[attempt] = {'up': False, 'down': False}
+                # Инициализируем рейтинг для попытки, если его нет
+                if attempt not in self.attempt_ratings:
+                    self.attempt_ratings[attempt] = {'up': False, 'down': False}
 
-                    # Кнопка "палец вверх"
-                    up_button = tk.Button(rating_frame, text="👍", width=3, height=1,
-                                       command=lambda a=attempt: self.toggle_attempt_rating(a, "up"),
-                                       font=('Arial', 9, 'normal'), bd=1)
-                    up_button.pack(side=tk.LEFT, padx=1)
+                # Кнопка "палец вверх"
+                up_button = tk.Button(rating_frame, text="👍", width=3, height=1,
+                                   command=lambda a=attempt: self.toggle_attempt_rating(a, "up"),
+                                   font=('Arial', 9, 'normal'), bd=1)
+                up_button.pack(side=tk.LEFT, padx=1)
                     
-                    # Кнопка "палец вниз"
-                    down_button = tk.Button(rating_frame, text="👎", width=3, height=1,
-                                         command=lambda a=attempt: self.toggle_attempt_rating(a, "down"),
-                                         font=('Arial', 9, 'normal'), bd=1)
-                    down_button.pack(side=tk.LEFT, padx=1)
+                # Кнопка "палец вниз"
+                down_button = tk.Button(rating_frame, text="👎", width=3, height=1,
+                                     command=lambda a=attempt: self.toggle_attempt_rating(a, "down"),
+                                     font=('Arial', 9, 'normal'), bd=1)
+                down_button.pack(side=tk.LEFT, padx=1)
 
-                    # Обновляем стиль кнопок в зависимости от текущего состояния
-                    self._rating_buttons[attempt] = (up_button, down_button)
-                    self.update_rating_button_style(up_button, down_button, self.attempt_ratings[attempt])
+                # Обновляем стиль кнопок в зависимости от текущего состояния
+                self._rating_buttons[attempt] = (up_button, down_button)
+                self.update_rating_button_style(up_button, down_button, self.attempt_ratings[attempt])
 
-                    # Добавляем обработчики событий
-                    label.bind('<Button-1>', lambda e, a=attempt: self.on_attempt_drag_start(e, a))
-                    label.bind('<Double-Button-1>', lambda e, a=attempt: self.on_attempt_double_click(e, a))
+                # Добавляем обработчики событий
+                label.bind('<Button-1>', lambda e, a=attempt: self.on_attempt_drag_start(e, a))
+                label.bind('<Double-Button-1>', lambda e, a=attempt: self.on_attempt_double_click(e, a))
 
-                    # Статус атрибуции: подтверждено / авто / нет + быстрые действия
-                    self._attempt_labels[attempt] = label
-                    assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
-                                             if attempt in files), None)
-                    auto = self.attempt_assignments.get(attempt)
-                    srt = sims_cache.get(attempt, [])
-                    self._build_attr_row(frame, attempt, srt)
+                # Статус атрибуции: подтверждено / авто / нет + быстрые действия
+                self._attempt_labels[attempt] = label
+                assigned_athlete = next((ath for ath, files in self.athlete_mapping.items()
+                                         if attempt in files), None)
+                auto = self.attempt_assignments.get(attempt)
+                srt = sims_cache.get(attempt, [])
+                self._build_attr_row(frame, attempt, srt)
 
-                    # tooltip: кандидаты атрибуции с процентами
-                    tip = self._attribution_tip(attempt, assigned_athlete, srt)
-                    if tip:
-                        self._bind_tooltip(label, tip)
-                    label.bind('<ButtonRelease-1>', lambda e, a=attempt: self.on_attempt_drag_end(e, a))
+                # tooltip: кандидаты атрибуции с процентами
+                tip = self._attribution_tip(attempt, assigned_athlete, srt)
+                if tip:
+                    self._bind_tooltip(label, tip)
+                label.bind('<ButtonRelease-1>', lambda e, a=attempt: self.on_attempt_drag_end(e, a))
 
-                    # Добавляем контекстное меню
-                    label.bind('<Button-3>', lambda e, a=attempt: self.show_attempt_context_menu(e, a))
+                # Добавляем контекстное меню
+                label.bind('<Button-3>', lambda e, a=attempt: self.show_attempt_context_menu(e, a))
 
-                except Exception as e:
-                    self.log(i18n.tr("Ошибка при создании превью для {attempt}: {err}", attempt=attempt, err=str(e)))
+            except Exception as e:
+                self.log(i18n.tr("Ошибка при создании превью для {attempt}: {err}", attempt=attempt, err=str(e)))
 
-                # Обновляем позицию для следующего превью
-                col += 1
-                if col >= max_cols:
-                    col = 0
-                    row += 1
+            # Обновляем позицию для следующего превью
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
 
         # --- Кандидаты ручного режима (ещё не нарезанные) ---
         pending = [c for c in self.candidates if c['status'] == 'pending']
@@ -3597,15 +4120,20 @@ class FreestyleParserApp:
             sep_frame = tk.Frame(self.attempts_scrollable_frame)
             sep_frame.grid(row=row + 1, column=0, columnspan=max_cols, pady=(12, 2))
             tk.Label(sep_frame,
-                     text=i18n.tr("—— Кандидаты ({n}): снимите галочки с ненужных, "
-                                  "затем «Нарезать» ——", n=len(pending)),
+                     text=i18n.tr("—— Разметки попыток ({n}): снимите галочки с ненужных ——",
+                                  n=len(pending)),
                      fg="#555555").pack(side=tk.LEFT)
             # Очистка ненарезанных кандидатов (для пересканирования с нуля)
             clear_btn = tk.Button(sep_frame, text="🧹", width=3, bd=1,
                                   command=self.clear_pending_candidates)
             clear_btn.pack(side=tk.LEFT, padx=8)
-            self._attach_tooltip(clear_btn, i18n.tr("Удалить всех ненарезанных кандидатов\n"
+            self._attach_tooltip(clear_btn, i18n.tr("Удалить все ненарезанные разметки\n"
                                                     "(пересканировать с нуля)"))
+            tk.Button(sep_frame, text="☑", width=3, bd=1,
+                      command=lambda: self._select_all_pending(True)).pack(side=tk.LEFT, padx=2)
+            tk.Button(sep_frame, text="☐", width=3, bd=1,
+                      command=lambda: self._select_all_pending(False)).pack(side=tk.LEFT, padx=2)
+            self._make_cut_button(sep_frame)
             crow, ccol = row + 2, 0
             for cand in pending:
                 frame = tk.Frame(self.attempts_scrollable_frame)
@@ -3622,7 +4150,7 @@ class FreestyleParserApp:
                         img_label.image = photo
                         img_label.pack()
                     except Exception as e:
-                        self.log(i18n.tr("Ошибка превью кандидата: {err}", err=e))
+                        self.log(i18n.tr("Ошибка превью разметки: {err}", err=e))
 
                 name_frame = tk.Frame(frame)
                 name_frame.pack()
@@ -3743,8 +4271,110 @@ class FreestyleParserApp:
                     lcol = 0
                     lrow += 1
 
+        # --- Сегменты скана атлетов (режим «обзор без сохранения») ---
+        segs = sorted(self.athlete_segments,
+                      key=lambda s: (s.get('file', ''), s.get('start', 0)))
+        if segs:
+            names = list(self.athlete_mapping)
+            names += [n for n in self._registry_banks() if n not in names]
+            names += [n for n in self._base_banks() if n not in names]
+            filt = self.filter_var.get()
+            seg_row = (lrow + 1) if live else \
+                ((crow + 1) if 'crow' in locals() else (row + 1))
+            sep_frame = tk.Frame(self.attempts_scrollable_frame)
+            sep_frame.grid(row=seg_row, column=0, columnspan=max_cols, pady=(12, 2))
+            tk.Label(sep_frame,
+                     text=i18n.tr("—— Разметки попыток — с атлетами ({n}) ——",
+                                  n=len(segs)),
+                     fg="#555555").pack(side=tk.LEFT)
+            tk.Button(sep_frame, text="☑", width=3, bd=1,
+                      command=lambda: self._select_all_segments(True)).pack(side=tk.LEFT, padx=2)
+            tk.Button(sep_frame, text="☐", width=3, bd=1,
+                      command=lambda: self._select_all_segments(False)).pack(side=tk.LEFT, padx=2)
+            self._attach_tooltip(sep_frame,
+                                 i18n.tr("Выбрать все / снять все - по видимым с учётом фильтра;\n"
+                                         "«Нарезать» режет выбранные сегменты из исходника"))
+            missing_thumbs = []
+            srow, scol = seg_row + 1, 0
+            shown = 0
+            for seg in segs:
+                if seg.get('cut_as'):
+                    continue  # уже нарезан как попытка
+                athlete = seg.get('athlete')
+                if filt == i18n.tr('Неизвестно') and athlete:
+                    continue
+                if filt == i18n.tr('На подтверждение') and seg.get('confirmed'):
+                    continue
+                if filt not in (i18n.tr('Все'), i18n.tr('Неизвестно'),
+                                i18n.tr('На подтверждение')) and athlete != filt:
+                    continue
+                shown += 1
+                sframe = tk.Frame(self.attempts_scrollable_frame)
+                sframe.grid(row=srow, column=scol, padx=5, pady=5)
+                jpg = self._segment_thumb_path(seg)
+                photo = None
+                if os.path.exists(jpg):
+                    try:
+                        photo = self._thumb_photo(jpg)
+                    except Exception:
+                        photo = None
+                else:
+                    missing_thumbs.append(dict(seg))
+                img_label = tk.Label(sframe, image=photo,
+                                     width=self.TILE_W, height=self.TILE_H,
+                                     text='…' if photo is None else '')
+                img_label.image = photo
+                img_label.pack()
+                # клик - открыть плеер на моменте сегмента
+                for w in (img_label,):
+                    w.bind('<Button-1>', lambda e, s=seg: self.open_video(
+                        s.get('source'), at_real_seconds=s.get('thumb_t')))
+                name_frame = tk.Frame(sframe)
+                name_frame.pack()
+                seg_var = tk.BooleanVar(value=seg.get('key') in self.selected_segments)
+                seg_var.trace_add('write', lambda *_a, k=seg.get('key'), v=seg_var:
+                                  self._on_segment_check(k, v))
+                tk.Checkbutton(name_frame, variable=seg_var).pack(side=tk.LEFT, padx=(0, 3))
+                seg_choices = [i18n.tr('— снять'), i18n.tr('➕ Новый / поиск…')] + names
+                if seg.get('confirmed'):
+                    chip = self._athlete_chip(
+                        name_frame, f"{athlete}", seg_choices,
+                        lambda ch, s=seg: self._on_segment_select(s, ch),
+                        bg='#4caf50')
+                elif athlete:
+                    chip = self._athlete_chip(
+                        name_frame, f"{athlete}", seg_choices,
+                        lambda ch, s=seg: self._on_segment_select(s, ch),
+                        bg='#ff9800')
+                    ok = tk.Label(name_frame, text=f"✓{seg.get('sim', 0) * 100:.0f}%",
+                                  bg='#4caf50', fg='white',
+                                  font=('Arial', 8, 'bold'), cursor='hand2',
+                                  padx=3, pady=1)
+                    ok.bind('<Button-1>',
+                            lambda e, s=seg, b=athlete: self.confirm_segment(s, b))
+                    ok.pack(side=tk.LEFT)
+                else:
+                    chip = self._athlete_chip(
+                        name_frame, None, seg_choices,
+                        lambda ch, s=seg: self._on_segment_select(s, ch))
+                chip.pack(side=tk.LEFT)
+                t0, t1 = seg.get('start', 0.0), seg.get('end', 0.0)
+                tk.Label(sframe, font=('Arial', 8), fg='#555',
+                         text=f"№{seg.get('num', '?')}  "
+                              f"{os.path.splitext(seg.get('file', '?'))[0]}  "
+                              f"{int(t0 // 60)}:{t0 % 60:04.1f}–{int(t1 // 60)}:{t1 % 60:04.1f}"
+                          ).pack()
+                scol += 1
+                if scol >= max_cols:
+                    scol = 0
+                    srow += 1
+            if missing_thumbs and not getattr(self, '_seg_thumbs_running', False):
+                self._seg_thumbs_running = True
+                threading.Thread(target=self._generate_segment_thumbs,
+                                 args=(missing_thumbs,), daemon=True).start()
+
         # подсказка для пустой панели: ни попыток, ни кандидатов, ни live
-        if not attempts and not pending and not live:
+        if not attempts and not pending and not live and not segs:
             hint = tk.Label(self.attempts_scrollable_frame,
                             text=i18n.tr("Здесь появятся попытки после обработки\n"
                                          "Выберите файлы, нарисуйте область интереса "
@@ -3954,6 +4584,11 @@ class FreestyleParserApp:
         changed_assign = False
         for attempt in names:
             video_path = os.path.join(self.output_folder, attempt)
+            if self._is_source_video(video_path):
+                # страховка: выбранный исходник не удаляем
+                self.log(i18n.tr("{attempt} - исходник, удаление пропущено", attempt=attempt),
+                         logging.WARNING)
+                continue
             thumbnail_path = os.path.join(
                 self.output_folder, f"{os.path.splitext(attempt)[0]}.jpg")
             try:
@@ -3978,6 +4613,10 @@ class FreestyleParserApp:
             self.log(i18n.tr("Удален файл: {attempt}", attempt=attempt))
         if changed_assign:
             self._save_assignments()
+        # точка продолжения больше не соответствует содержимому папки
+        # (номера попыток удалены) - сбрасываем, иначе следующий прогон
+        # продолжит нумерацию с несуществующих номеров
+        self._clear_processing_state()
 
     def delete_attempt_file(self, attempt):
         """Удаление одной попытки (двухфазная кнопка в плеере) + обновление UI"""
@@ -3988,21 +4627,67 @@ class FreestyleParserApp:
         self.update_athlete_list()
 
     def delete_selected_attempts(self):
-        """Удаляет выбранные попытки"""
-        if not self.selected_attempts:
+        """Удаляет выбранные попытки, сегменты скана и ненарезанных кандидатов."""
+        seg_keys = set(getattr(self, 'selected_segments', set()) or ())
+        with self._candidates_lock:
+            sel_cands = [c for c in self.candidates
+                         if c['status'] == 'pending' and c.get('selected')]
+        if not self.selected_attempts and not seg_keys and not sel_cands:
             messagebox.showwarning(i18n.tr("Предупреждение"), i18n.tr("Не выбрано ни одной попытки для удаления"))
             return
 
-        # Запрашиваем подтверждение
-        count = len(self.selected_attempts)
-        result = messagebox.askyesno(i18n.tr("Подтверждение"),
-                                   i18n.tr("Вы уверены, что хотите удалить {n} попытку(и)?\n"
-                                           "Это действие нельзя отменить.", n=count))
+        # Запрашиваем подтверждение: честно называем, что именно удаляется
+        parts = []
+        if self.selected_attempts:
+            parts.append(i18n.tr("попыток: {n}", n=len(self.selected_attempts)))
+        if seg_keys:
+            parts.append(i18n.tr("разметок (с атлетами): {n}", n=len(seg_keys)))
+        if sel_cands:
+            parts.append(i18n.tr("разметок (ручной скан): {n}", n=len(sel_cands)))
+        result = messagebox.askyesno(
+            i18n.tr("Подтверждение"),
+            i18n.tr("Удалить безвозвратно:\n{parts}?", parts='\n'.join(parts)))
 
         if result:
             names = list(self.selected_attempts)
             self._delete_attempt_files(names)
             self.selected_attempts.clear()
+
+            # выбранные сегменты скана: из списка, профилей и превью
+            if seg_keys:
+                for seg in list(self.athlete_segments):
+                    if seg.get('key') not in seg_keys:
+                        continue
+                    jpg = self._segment_thumb_path(seg)
+                    if os.path.exists(jpg):
+                        try:
+                            os.remove(jpg)
+                        except OSError:
+                            pass
+                    self._segment_profiles.pop(seg.get('key'), None)
+                    self.athlete_segments.remove(seg)
+                self.selected_segments.clear()
+                self._save_segments()
+                self._save_segment_profiles()
+                self.need_update_segments = True
+
+            # выбранные ненарезанные кандидаты ручного скана
+            if sel_cands:
+                with self._candidates_lock:
+                    thumbs = [c.get('thumbnail') for c in sel_cands]
+                    keys = {id(c) for c in sel_cands}
+                    self.candidates = [c for c in self.candidates if id(c) not in keys]
+                    self.candidate_vars = {}
+                for t in thumbs:
+                    if t and os.path.exists(t):
+                        try:
+                            os.remove(t)
+                        except OSError:
+                            pass
+                self.save_candidates()
+                self.need_update_attempts = True
+                self.update_cut_button_state()
+                self.log(i18n.tr("Удалено разметок: {n}", n=len(sel_cands)))
 
             # Сохраняем почищенные маппинг и рейтинги
             self.save_athlete_mapping()
@@ -4174,7 +4859,8 @@ class FreestyleParserApp:
                           i18n.tr("Попытка {attempt:04d}", attempt=attempt.number), factor=factor,
                           attempt=attempt,
                           interval=(start_real, float(attempt.end) + end_pad),
-                          clip_bytes=self._estimate_output_bytes(src, dur_real))
+                          clip_bytes=self._estimate_output_bytes(src, dur_real),
+                          from_original=True)
 
     def show_candidate_video(self, cand):
         """Двойной клик по кандидату: видео из оригинала с позиции кандидата
@@ -4202,7 +4888,7 @@ class FreestyleParserApp:
         Закрывается кликом или Esc."""
         thumb = cand.get('thumbnail')
         if not thumb or not os.path.exists(thumb):
-            messagebox.showinfo(i18n.tr("Превью"), i18n.tr("Превью кандидата не найдено"))
+            messagebox.showinfo(i18n.tr("Превью"), i18n.tr("Превью разметки не найдено"))
             return
         try:
             img = Image.open(thumb)
@@ -4487,11 +5173,11 @@ class FreestyleParserApp:
         - keyframe_only: '-skip_frame nokey' - декодируются только кей-фреймы,
           самый быстрый путь; при сбое вызывающий код может повторить без него.
         """
-        cmd = [get_ffmpeg_path(), '-ss', str(max(0.0, float(seek_s))),
-               '-i', self.get_absolute_path(video_path),
-               '-vframes', '1', '-q:v', '2']
+        cmd = [get_ffmpeg_path(), '-ss', str(max(0.0, float(seek_s)))]
         if keyframe_only:
             cmd += ['-skip_frame', 'nokey']
+        cmd += ['-i', self.get_absolute_path(video_path),
+                '-vframes', '1', '-q:v', '2']
         if scale_w and scale_h:
             cmd += ['-vf', f'scale={int(scale_w)}:{int(scale_h)}']
         elif scale_w:
@@ -4512,6 +5198,127 @@ class FreestyleParserApp:
                                timeout=120)
             else:
                 raise
+
+    def _thumb_photo(self, thumbnail_path):
+        """PhotoImage плитки с кэшем (path -> mtime, фото): перерисовка сетки
+        из ~100 плиток не ресайзит 4K-jpg заново (LANCZOS ~0.1-0.2с на плитку,
+        раньше это замораживало UI при каждой привязке атлета)."""
+        cache = getattr(self, '_thumb_photo_cache', None)
+        if cache is None:
+            cache = self._thumb_photo_cache = {}
+        try:
+            mtime = os.path.getmtime(thumbnail_path)
+        except OSError:
+            mtime = 0.0
+        hit = cache.get(thumbnail_path)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        image = Image.open(thumbnail_path)
+        image = image.resize((self.TILE_W, self.TILE_H), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        cache[thumbnail_path] = (mtime, photo)
+        # подрезаем кэш: держим только текущие пути
+        if len(cache) > 400:
+            live = {os.path.join(self.output_folder,
+                                 f"{os.path.splitext(a)[0]}.jpg")
+                    for a in self.attempt_checkboxes}
+            for k in [k for k in cache if k not in live]:
+                cache.pop(k, None)
+        return photo
+
+    def _segment_thumb_path(self, seg):
+        """Файл превью сегмента скана (кадр исходника на thumb_t)."""
+        return os.path.join(self.output_folder, f"seg_{seg.get('key', '')}.jpg")
+
+    def _on_segment_check(self, key, var):
+        """Галка выбора сегмента для нарезки."""
+        if var.get():
+            self.selected_segments.add(key)
+        else:
+            self.selected_segments.discard(key)
+        self.update_cut_button_state()
+
+    def _select_all_segments(self, select):
+        """Выбрать все / снять все по ВИДИМЫМ сегментам (с учётом фильтра)."""
+        filt = self.filter_var.get()
+        for seg in self.athlete_segments:
+            if seg.get('cut_as'):
+                continue
+            athlete = seg.get('athlete')
+            visible = True
+            if filt == i18n.tr('Неизвестно'):
+                visible = not athlete
+            elif filt == i18n.tr('На подтверждение'):
+                visible = not seg.get('confirmed')
+            elif filt not in (i18n.tr('Все'), i18n.tr('Неизвестно'),
+                              i18n.tr('На подтверждение')):
+                visible = athlete == filt
+            if not visible:
+                continue
+            if select:
+                self.selected_segments.add(seg.get('key'))
+            else:
+                self.selected_segments.discard(seg.get('key'))
+        self.need_update_attempts = True
+        self.update_cut_button_state()
+
+    def _select_all_pending(self, select):
+        """Выбрать все / снять все по ненарезанным кандидатам ручного скана."""
+        with self._candidates_lock:
+            for c in self.candidates:
+                if c['status'] == 'pending':
+                    c['selected'] = bool(select)
+        self.need_update_attempts = True
+        self.update_cut_button_state()
+
+    def _generate_segment_thumbs(self, segs):
+        """Фоновая догенерация превью сегментов (кадр исходника на thumb_t):
+        ffmpeg-сик по большому MTS - секунды, нельзя на UI-потоке."""
+        for seg in segs:
+            jpg = self._segment_thumb_path(seg)
+            if os.path.exists(jpg):
+                continue
+            try:
+                t = float(seg.get('thumb_t') or seg.get('start') or 0.0)
+                self.extract_frame(seg.get('source'), jpg,
+                                   seek_s=t * self._active_slowmo_factor)
+            except Exception as e:
+                self.log(i18n.tr("Ошибка превью сегмента {key}: {err}",
+                                 key=seg.get('key', '?'), err=e), logging.WARNING)
+        self._seg_thumbs_running = False
+        try:
+            if self._winfo_exists_safe():
+                self.root.after(0, self._refresh_after_thumbs)
+        except RuntimeError:
+            pass
+
+    def _generate_missing_thumbs(self, missing):
+        """Фоновая догенерация превью попыток (ffmpeg), по одной; готово -
+        перерисовка сетки в главном потоке."""
+        for a in missing:
+            if not self._winfo_exists_safe():
+                break
+            video = os.path.join(self.output_folder, a)
+            thumb = os.path.join(self.output_folder,
+                                 f"{os.path.splitext(a)[0]}.jpg")
+            if not os.path.exists(thumb) and os.path.exists(video):
+                self.generate_thumbnail(video, thumb, self.roi)
+        self._thumb_gen_running = False
+        try:
+            self.root.after(0, self._refresh_after_thumbs)
+        except RuntimeError:
+            pass
+
+    def _winfo_exists_safe(self):
+        try:
+            return bool(self.root.winfo_exists())
+        except Exception:
+            return False
+
+    def _refresh_after_thumbs(self):
+        """Перерисовка сетки после фоновой догенерации превью (главный поток)"""
+        if self._winfo_exists_safe():
+            self.update_attempt_thumbnails()
 
     def generate_thumbnail(self, video_path, output_path, roi=None):
         """Превью попытки: полный кадр (без уменьшения, UI сам масштабирует
@@ -5324,13 +6131,16 @@ class FreestyleParserApp:
                         factor = int(cfg.get('slowmo_factor', 4)) if cfg.get('slowmo_quarter') else 1
                         self._set_slowmo_ui(factor)
 
-                    # Загружаем стратегию обработки (из чекбоксов)
+                    # Загружаем режим обработки (комбобокс); легаси-коды
+                    # 'auto'/'athletes' закрыты - маппим на ближайшие
                     if 'strategy' in config['processing-config']:
                         strategy = config['processing-config']['strategy']
-                        if strategy in ('auto', 'manual', 'attempts', 'athletes'):
-                            if hasattr(self, 'save_now_var') and self.save_now_var is not None:
-                                self.save_now_var.set(strategy in ('auto', 'attempts'))
-                                self.athletes_var.set(strategy in ('attempts', 'athletes'))
+                        legacy = {'auto': 'attempts', 'athletes': 'manual'}
+                        strategy = legacy.get(strategy, strategy)
+                        if strategy in ('manual', 'attempts'):
+                            if hasattr(self, 'strategy_var') and self.strategy_var is not None:
+                                self.strategy_var.set(self._strategy_display(strategy))
+                                self._update_strategy_hint()
 
                     # Восстанавливаем выбранные файлы этого дня
                     # (с сортировкой - в yaml мог остаться непредсказуемый порядок)
@@ -5628,6 +6438,8 @@ class FreestyleParserApp:
         self._render_file_list()
         # Показываем canvas и сохранённый ROI новой рабочей папки
         self.refresh_canvas_from_folder()
+        # «Обработать»/«Продолжить» - по точке продолжения новой папки
+        self.update_process_button_state()
 
 
 
@@ -5674,7 +6486,7 @@ class VideoPreviewPopup:
 
     def __init__(self, app, video_path, start_file_sec, title, factor=1,
                  attempt=None, live=False, live_index=0, interval=None,
-                 clip_bytes=None, cand=None):
+                 clip_bytes=None, cand=None, from_original=False):
         self.app = app
         self._path = video_path
         self.attempt = attempt
@@ -5689,6 +6501,8 @@ class VideoPreviewPopup:
         # по списку ожидающих кандидатов
         self._cand = cand
         self._cand_key = self.app._candidate_key(cand) if cand is not None else None
+        # просмотр из оригинала: кнопка удаления плеера недоступна
+        self.from_original = from_original
         self._interval = interval   # (t0, t1) реальных секунд границы просмотра
         self._inside = True     # находимся ли внутри интервала (для границы)
         # ключ атрибуции: клип-строка или номер AttemptInfo (NNNN.mp4)
@@ -5808,8 +6622,10 @@ class VideoPreviewPopup:
         else:
             cb.pack(side=tk.LEFT, padx=4)
             cb.config(state=tk.DISABLED)
+        if self._cand is not None:
+            self._build_keep_btns(ctrl)
         self._ctrl = ctrl
-        if self.attempt is not None and not self._live:
+        if self.attempt is not None and not self.from_original:
             # рейтинг попытки прямо из плеера (как 👍/👎 на плитке)
             self.rate_up_btn = tk.Button(ctrl, text='👍', width=3, bd=1,
                                          command=lambda: self._rate('up'))
@@ -5818,7 +6634,7 @@ class VideoPreviewPopup:
                                            command=lambda: self._rate('down'))
             self.rate_down_btn.pack(side=tk.LEFT, padx=1)
             self._refresh_rating_btns()
-        if self.attempt is not None:
+        if self.attempt is not None and not self.from_original:
             self._rebuild_selector()
             # двухфазное удаление: 1-й клик - краснеет, 2-й - удаляет и закрывает
             self._del_armed = False
@@ -5998,6 +6814,41 @@ class VideoPreviewPopup:
                          start_real * self.factor if self.factor > 1 else start_real,
                          self.app._candidate_title(cand),
                          clip_bytes=self.app._estimate_output_bytes(src, interval[1] - interval[0]))
+        self._refresh_keep_btns()
+
+    def _build_keep_btns(self, ctrl):
+        """[💾 Сохранять][✕ Не сохранять] в плеере из оригинала: дублируют
+        галку разметки, чтобы отмечать сохраняемое прямо при просмотре."""
+        self.keep_btn = tk.Label(ctrl, text=i18n.tr('💾 Сохранять'),
+                                 font=('Arial', 9), cursor='hand2',
+                                 padx=6, pady=2)
+        self.keep_btn.bind('<Button-1>', lambda e: self._set_cand_keep(True))
+        self.keep_btn.pack(side=tk.LEFT, padx=(14, 2))
+        self.skip_btn = tk.Label(ctrl, text=i18n.tr('✕ Не сохранять'),
+                                 font=('Arial', 9), cursor='hand2',
+                                 padx=6, pady=2)
+        self.skip_btn.bind('<Button-1>', lambda e: self._set_cand_keep(False))
+        self.skip_btn.pack(side=tk.LEFT, padx=2)
+        self._refresh_keep_btns()
+
+    def _set_cand_keep(self, flag):
+        if self._cand is None:
+            return
+        self._cand['selected'] = bool(flag)
+        self.app.save_candidates()
+        self.app.need_update_attempts = True
+        self.app.update_cut_button_state()
+        self._refresh_keep_btns()
+
+    def _refresh_keep_btns(self):
+        if getattr(self, 'keep_btn', None) is None or \
+                not self.keep_btn.winfo_exists():
+            return
+        sel = bool(self._cand.get('selected'))
+        self.keep_btn.config(bg='#4caf50' if sel else '#dddddd',
+                             fg='white' if sel else 'black')
+        self.skip_btn.config(bg='#e57373' if not sel else '#dddddd',
+                             fg='white' if not sel else 'black')
 
     def _on_video_press(self, e):
         """Начало клика/перетаскивания за видео"""

@@ -53,7 +53,7 @@ def _log(msg):
 class AttemptInfo:
 
     def __init__(self, source_video, start, end, number, best_frame, person_frame, base_frame, person_bbox,
-                 is_candidate=False):
+                 is_candidate=False, thumb_t=None, thumb_frame=None):
         self.source_video = source_video
         self.start = start
         self.end = end
@@ -63,6 +63,9 @@ class AttemptInfo:
         self.base_frame = base_frame
         self.person_bbox = person_bbox
         self.is_candidate = is_candidate
+        # превью: момент и кадр, где атлет ближе всего к центру ROI
+        self.thumb_t = thumb_t
+        self.thumb_frame = thumb_frame
 
     def duration(self):
         return self.end - self.start
@@ -87,6 +90,9 @@ def _iou(box1, box2):
 
 _YOLO_MODEL = None
 
+# Кэш проб скорости (декодинг файла / модель на эталоне), за сессию
+_PROBE_CACHE = {}
+
 
 def load_yolo_model():
     """Загружает модель YOLO с кешем: загрузка занимает секунды,
@@ -95,13 +101,41 @@ def load_yolo_model():
     if _YOLO_MODEL is None:
         model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models/yolo11s-seg.pt')
         _YOLO_MODEL = YOLO(model_path)
+        # явный выбор ускорителя: без этого ultralytics оставляет модель
+        # на cpu даже на Apple Silicon (MPS ~в 3.6 раза быстрее на кадр)
+        try:
+            import torch
+            dev = 'cuda' if torch.cuda.is_available() else \
+                ('mps' if torch.backends.mps.is_available() else 'cpu')
+            if dev != 'cpu':
+                _YOLO_MODEL.to(dev)
+                # прогрев: MPS-компиляция графика на первом инференсе (~10с),
+                # без неё первый сэмпл анализа тормозит весь прогресс
+                _YOLO_MODEL(np.zeros((338, 600, 3), dtype=np.uint8), verbose=False)
+        except Exception:
+            pass
+        # устройство инференса в лог: cpu на машинах без GPU = медленно,
+        # пользователь должен видеть причину из лога
+        try:
+            dev = next(_YOLO_MODEL.model.parameters()).device
+            _log(i18n.tr("Нейросеть YOLO загружена (yolo11s-seg), устройство: {dev}",
+                         dev=dev))
+        except Exception:
+            pass
     return _YOLO_MODEL
 
 
 def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
                       person_bbox, base_frame, best_frame, person_frame,
-                      fallback_frame, video_file, callback, params, scan_mode=False):
-    """Создаёт попытку и вызывает callback. Возвращает (attempt, attempt_number) или (None, attempt_number) или (False, attempt_number) для стопа."""
+                      fallback_frame, video_file, callback, params, scan_mode=False,
+                      thumb_t=None, thumb_frame=None):
+    """Создаёт попытку и вызывает callback. Возвращает (attempt, attempt_number) или (None, attempt_number) или (False, attempt_number) для стопа.
+    scan_mode: границы отдаются «сырыми» (без паддинга) - его добавляет
+    сохраняющий код (ручная нарезка / автосохранение) единообразно."""
+    if scan_mode:
+        # единая конвенция скан-режимов: детектор отдаёт сырые границы,
+        # паддинг из params добавляет код сохранения один раз
+        params = dict(params, attempt_start_padding=0.0, attempt_end_padding=0.0)
     start_padding = params['attempt_start_padding']
     end_padding = params['attempt_end_padding']
     min_duration = params['min_attempt_duration']
@@ -109,19 +143,20 @@ def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
     start1 = max(0, start_time - start_padding)
     end1 = min(end_time + end_padding, real_duration)
 
+    _skip_word = i18n.tr("Зона") if scan_mode else i18n.tr("Попытка")
     if end1 <= start1:
-        _log(i18n.tr("  [SKIP] Попытка #{n}: start ({start:.2f}s) >= end ({end:.2f}s)",
-                           n=attempt_number, start=start1, end=end1))
+        _log(i18n.tr("  [SKIP] {word} #{n}: start ({start:.2f}s) >= end ({end:.2f}s)",
+                           word=_skip_word, n=attempt_number, start=start1, end=end1))
         return None, attempt_number
 
     duration = end1 - start1
     if duration < min_duration:
-        _log(i18n.tr("  [SKIP] Попытка #{n}: duration {dur:.2f}s < {min}s",
-                           n=attempt_number, dur=duration, min=min_duration))
+        _log(i18n.tr("  [SKIP] {word} #{n}: duration {dur:.2f}s < {min}s",
+                           word=_skip_word, n=attempt_number, dur=duration, min=min_duration))
         return None, attempt_number
 
     if person_bbox is None:
-        _log(i18n.tr("  [SKIP] Попытка #{n}: нет данных о позиции человека", n=attempt_number))
+        _log(i18n.tr("  [SKIP] {word} #{n}: нет данных о позиции человека", word=_skip_word, n=attempt_number))
         return None, attempt_number
 
     x1, y1, x2, y2 = map(int, person_bbox)
@@ -137,7 +172,9 @@ def _finalize_attempt(attempt_number, start_time, end_time, real_duration,
                           person_bbox=person_bbox,
                           source_video=video_file,
                           start=start1, end=end1,
-                          is_candidate=scan_mode)
+                          is_candidate=scan_mode,
+                          thumb_t=thumb_t,
+                          thumb_frame=thumb_frame)
     attempt_number += 1
     need_stop = not callback(attempt)
     if need_stop:
@@ -281,7 +318,7 @@ class _KeyframeStreamIter:
 
     def __init__(self, cap, video_file, fps_real, total_frames, real_duration,
                  scan_interval, slowmo_factor, range_start, range_end,
-                 sample_rate):
+                 sample_rate, seek_pos=None):
         self.cap = cap
         self.video_file = video_file
         self.fps_real = fps_real
@@ -292,6 +329,7 @@ class _KeyframeStreamIter:
         self.range_start = range_start
         self.range_end = range_end
         self.sample_rate = sample_rate
+        self.seek_pos = seek_pos        # старт декодирования с позиции (резюме)
         self.rate = sample_rate          # уточняется после бутстрапа
         self.sample_count = int(real_duration * sample_rate) + 1
         self._h_out = None
@@ -309,8 +347,13 @@ class _KeyframeStreamIter:
             return False
         self._h_out = max(2, int(round(h * YOLO_MAX_WIDTH / w / 2.0)) * 2)
         self._frame_bytes = YOLO_MAX_WIDTH * self._h_out * 3
-        cmd = [ffmpeg, '-hide_banner', '-nostdin', '-skip_frame', 'nokey',
-               '-i', self.video_file,
+        cmd = [ffmpeg]
+        if self.seek_pos:
+            # Резюме: вход с позиции seek_pos; -copyts сохраняет абсолютные
+            # pts контейнера (без пересчёта с нуля) - реальные секунды сходятся
+            cmd += ['-ss', f'{self.seek_pos:.3f}', '-copyts']
+        cmd += ['-hide_banner', '-nostdin', '-skip_frame', 'nokey',
+                '-i', self.video_file,
                '-vf', f'showinfo,scale={YOLO_MAX_WIDTH}:{self._h_out}',
                '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-vsync', '0', 'pipe:1']
         try:
@@ -358,6 +401,7 @@ class _KeyframeStreamIter:
         return pts, frame.reshape(self._h_out, YOLO_MAX_WIDTH, 3)
 
     def _real_sec(self, pts):
+        # с -copyts pts всегда абсолютные (контейнерные)
         return pts / self.slowmo_factor if self.slowmo_factor > 1 else pts
 
     def _in_range(self, real_sec):
@@ -512,6 +556,24 @@ class _Detector:
         self.detection_window = deque(maxlen=self.window_size)
         self.bbox_history = deque(maxlen=self.window_size)  # [(x1,y1,x2,y2,conf), ...]
 
+        # превью: сэмпл, где атлет ближе всего к центру ROI (единая логика
+        # для всех режимов); сравниваем в нормированных координатах сэмпла
+        self.thumb_dist = None
+        self.thumb_t = None
+        self.thumb_frame = None
+        self.roi_center_norm = self._roi_center_norm(roi)
+
+    @staticmethod
+    def _roi_center_norm(roi):
+        """Центр ROI в нормированных координатах сэмпла (0..1).
+        Прямоугольный ROI: сэмпл уже обрезан по ROI - центр (0.5, 0.5).
+        Полигон: сэмпл - полный кадр, центр = среднее точек (в %)."""
+        if roi and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in roi):
+            xs = [float(p[0]) for p in roi]
+            ys = [float(p[1]) for p in roi]
+            return (sum(xs) / len(xs) / 100.0, sum(ys) / len(ys) / 100.0)
+        return (0.5, 0.5)
+
     def process_sample(self, current_sec, frame):
         """Обрабатывает один сэмпл. Возвращает AttemptInfo (попытка завершена),
         False (остановка по запросу callback) или None."""
@@ -549,6 +611,7 @@ class _Detector:
         self.fallback_frame = small_frame_original
 
         results = self.model(small_frame, verbose=False)
+        self.last_results = results  # для профайлера атлетов (без 2го инференса)
 
         # Проверка наличия объектов в ТЕКУЩЕМ кадре
         person_detected_in_frame = False
@@ -583,6 +646,17 @@ class _Detector:
 
             self.person_bbox = best_person_box_np
             self.bbox_history.append((bx1, by1, bx2, by2, best_conf_in_frame))
+
+            # Лучший кадр превью: атлет ближе всего к центру ROI
+            fh, fw = small_frame_original.shape[:2]
+            cx = (best_person_box_np[0] + best_person_box_np[2]) / (2.0 * fw)
+            cy = (best_person_box_np[1] + best_person_box_np[3]) / (2.0 * fh)
+            d = ((cx - self.roi_center_norm[0]) ** 2 +
+                 (cy - self.roi_center_norm[1]) ** 2) ** 0.5
+            if self.thumb_dist is None or d < self.thumb_dist:
+                self.thumb_dist = d
+                self.thumb_t = current_sec
+                self.thumb_frame = small_frame_original
 
             # Обновляем лучший кадр для превью (приоритет к person)
             if best_person_box is not None:
@@ -637,8 +711,14 @@ class _Detector:
                     if detection_start_time - (self.end_time or 0) >= self.min_pause:
                         self.in_attempt = True
                         self.start_time = detection_start_time
-                        _log(i18n.tr("  [START] Попытка #{n} на {t:.2f}s",
-                                           n=self.attempt_number, t=self.start_time))
+                        if self.scan_mode:
+                            # скан-режим: считаются все зоны, включая потом
+                            # отброшенные как дубли области - номер служебный
+                            _log(i18n.tr("  [START] Зона #{n} на {t:.2f}s",
+                                         n=self.attempt_number, t=self.start_time))
+                        else:
+                            _log(i18n.tr("  [START] Попытка #{n} на {t:.2f}s",
+                                         n=self.attempt_number, t=self.start_time))
         else:
             self.detection_window.append(0)
             self.frames_out_of_attempt += 1
@@ -663,27 +743,150 @@ class _Detector:
             self.attempt_number, start_time, end_time, end_limit,
             self.person_bbox, self.base_frame, self.best_frame, self.person_frame,
             self.fallback_frame, self.video_file, self.callback, self.params,
-            scan_mode=self.scan_mode)
+            scan_mode=self.scan_mode,
+            thumb_t=self.thumb_t, thumb_frame=self.thumb_frame)
         if result is not None:
             self.best_frame = None
             self.base_frame = None
             self.person_bbox = None
+            self.thumb_dist = None
+            self.thumb_t = None
+            self.thumb_frame = None
         return result
 
     def finish(self):
         """Финализирует незакрытую попытку на конце файла/диапазона."""
         if self.in_attempt and self.start_time is not None:
             end_time = self.real_duration if self.range_end is None else min(self.real_duration, self.range_end)
-            _log(i18n.tr("  [{file}] Финализация попытки #{n} на конце ({t:.1f}s)",
-                               file=os.path.basename(self.video_file),
-                               n=self.attempt_number, t=end_time))
+            if self.scan_mode:
+                _log(i18n.tr("  [{file}] Финализация зоны #{n} на конце ({t:.1f}s)",
+                             file=os.path.basename(self.video_file),
+                             n=self.attempt_number, t=end_time))
+            else:
+                _log(i18n.tr("  [{file}] Финализация попытки #{n} на конце ({t:.1f}s)",
+                             file=os.path.basename(self.video_file),
+                             n=self.attempt_number, t=end_time))
             return self._finalize(self.start_time, end_time)
         return None
+
+def _reference_video_path():
+    """Эталонный ролик для пробы скорости скана (dev: assets/, сборка:
+    распакованные ресурсы PyInstaller)."""
+    import sys
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, 'assets', 'reference_scan.mp4')
+
+
+def probe_stream_rate(video_path, budget_sec=4.0):
+    """Проба декодинга I-кадров БЕЗ модели: носитель + декодер конкретного
+    файла (флешка/диск, GOP, разрешение). Возвращает dict
+    {'rate': video_sec/wall_sec, 'density': сэмплов на сек видео} или None.
+    Кэш за сессию по файлу."""
+    key = ('stream', video_path)
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    if not video_path or not os.path.exists(video_path):
+        return None
+    try:
+        cap = open_capture(video_path)
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        real_duration = total_frames / fps if fps > 0 else 0.0
+        stream = _KeyframeStreamIter(cap, video_path, fps, total_frames,
+                                     real_duration, 1.0, 1, None, None, 1.0)
+        t0 = time.time()
+        first_sec = last_sec = None
+        samples = 0
+        for real_sec, _frame, _pos, _tot in iter(stream):
+            if first_sec is None:
+                first_sec = real_sec
+            last_sec = real_sec
+            samples += 1
+            if time.time() - t0 >= budget_sec:
+                break
+        wall = max(0.2, time.time() - t0)
+        video_sec = max(0.0, last_sec - first_sec) if first_sec is not None else 0.0
+        res = None
+        if video_sec > 1.0:
+            res = {'rate': video_sec / wall,
+                   'density': samples / video_sec}
+        _PROBE_CACHE[key] = res
+        return res
+    except Exception:
+        return None
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+
+def probe_model_rate(budget_sec=4.0):
+    """Проба модели на эталонном ролике: полный пайплайн (YOLO-детекция)
+    на детерминированном CPU-пути. Возвращает dict
+    {'rate': video_sec/wall_sec, 'density': сэмплов на сек видео} или None.
+    Кэш за сессию."""
+    key = ('model',)
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    ref = _reference_video_path()
+    if not os.path.exists(ref):
+        return None
+    model = load_yolo_model()  # загрузка в кэш; в пробу не включаем
+    # прогрев: первый инференс компилирует MPS-граф (~10с) - вне замера
+    try:
+        model(np.zeros((338, 600, 3), dtype=np.uint8), verbose=False)
+    except Exception:
+        pass
+    try:
+        cap = open_capture(ref)
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        real_duration = total_frames / fps if fps > 0 else 0.0
+        stream = _KeyframeStreamIter(cap, ref, fps, total_frames, real_duration,
+                                     1.0, 1, None, None, 1.0)
+        detector = _Detector(load_yolo_model(), (0, 0, 100, 100), ref,
+                             analysis_rate=stream.rate,
+                             real_duration=real_duration,
+                             params=DEFAULT_PROCESSING_PARAMS.copy(),
+                             min_strength=0.5, attempt_number=1,
+                             callback=lambda a: True, scan_mode=True)
+        t0 = time.time()
+        first_sec = last_sec = None
+        samples = 0
+        for real_sec, frame, _pos, _tot in iter(stream):
+            detector.process_sample(real_sec, frame)
+            if first_sec is None:
+                first_sec = real_sec
+            last_sec = real_sec
+            samples += 1
+            if time.time() - t0 >= budget_sec:
+                break
+        wall = max(0.2, time.time() - t0)
+        video_sec = max(0.0, last_sec - first_sec) if first_sec is not None else 0.0
+        res = None
+        if video_sec > 1.0:
+            res = {'rate': video_sec / wall,
+                   'density': samples / video_sec}
+        _PROBE_CACHE[key] = res
+        return res
+    except Exception:
+        return None
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
 
 def process_video(input_paths, roi, callback, begin_attempt_number=1, params=None,
                   progress_callback=None, should_continue=None, slowmo_factor=1,
                   scan_mode=False, model=None, restrict_range=None,
-                  log_fn=None):
+                  log_fn=None, start_file_index=0, resume_pos=0.0):
     """Обрабатывает видео и вырезает попытки.
 
     callback(attempt: AttemptInfo) вызывается после обнаружения каждой попытки;
@@ -705,6 +908,10 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     все I-кадры). Если I-кадры в среднем реже KEYFRAME_MAX_GAP сек -
     откат к обычным сэмплам. Только для scan_mode.
     log_fn - callback для лога (GUI-панель приложения); по умолчанию консоль.
+    start_file_index/resume_pos - продолжение прерванного прогона: файлы с
+    индексом меньше start_file_index пропускаются, в файле start_file_index
+    анализ начинается с позиции resume_pos (реальные секунды; декодирование
+    стрима стартует с ближайшего ключевого кадра перед позицией).
     """
     global _LOG_FN
     if log_fn is not None:
@@ -720,7 +927,8 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
     attempt_number = begin_attempt_number
     file_count = len(video_files)
     scan_interval = float(params.get('scan_interval', SCAN_INTERVAL))
-    sample_rate = (1.0 / scan_interval) if scan_mode else TARGET_ANALYSIS_FPS
+    sample_rate = (1.0 / scan_interval) if scan_mode \
+        else float(params.get('precise_analysis_fps', TARGET_ANALYSIS_FPS))
     range_start, range_end = restrict_range if restrict_range else (None, None)
     use_keyframes = scan_mode and KEYFRAME_SCAN
 
@@ -745,8 +953,18 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
             cap_prefetch[idx] = (None, 0.0)
 
     for file_index, video_file in enumerate(video_files):
+        if file_index < start_file_index:
+            continue
         _log(f"Processing {video_file}...")
         prefetched = cap_prefetch.pop(file_index, None) if scan_mode else None
+
+        # Per-file диапазон и позиция резюме (только для стартового файла)
+        file_range_start = range_start
+        file_seek_pos = None
+        if file_index == start_file_index and resume_pos > 0:
+            file_range_start = resume_pos if range_start is None else max(range_start, resume_pos)
+            # -ss ищет в контейнерном времени: для слоумо умножаем
+            file_seek_pos = resume_pos * slowmo_factor if slowmo_factor > 1 else resume_pos
 
         # Сразу запускаем в фоне открытие следующего файла - оно перекроется
         # сканом текущего
@@ -783,15 +1001,15 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
         if use_keyframes:
             stream = _KeyframeStreamIter(cap, video_file, fps_real, total_frames,
                                          real_duration, scan_interval,
-                                         slowmo_factor, range_start, range_end,
-                                         sample_rate)
+                                         slowmo_factor, file_range_start, range_end,
+                                         sample_rate, seek_pos=file_seek_pos)
             sample_iter = iter(stream)
             analysis_rate = stream.rate  # уточнится после бутстрапа стрима
             sample_count = stream.sample_count
         elif scan_mode:
             # Скан: редкие сэмплы точечным seek - не декодируем весь файл
             sample_iter = _seek_sample_iter(cap, fps_real, total_frames, sample_rate,
-                                            range_start, range_end)
+                                            file_range_start, range_end)
             analysis_rate = sample_rate
             sample_count = int(real_duration * sample_rate) + 1
         else:
@@ -799,7 +1017,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
             frame_skip = max(1, int(round(fps_real / sample_rate)))
             analysis_rate = fps_real / frame_skip
             sample_iter = _grab_sample_iter(cap, fps_container, fps_real, total_frames,
-                                            frame_skip, range_start, range_end)
+                                            frame_skip, file_range_start, range_end)
             sample_count = total_frames
 
         detector = None
@@ -810,7 +1028,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                                  params=params, min_strength=min_strength,
                                  attempt_number=attempt_number, callback=callback,
                                  scan_mode=scan_mode,
-                                 range_start=range_start, range_end=range_end)
+                                 range_start=file_range_start, range_end=range_end)
 
         file_t0 = time.time()
         last_hb = file_t0
@@ -832,7 +1050,7 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
                                          params=params, min_strength=min_strength,
                                          attempt_number=attempt_number,
                                          callback=callback, scan_mode=scan_mode,
-                                         range_start=range_start,
+                                         range_start=file_range_start,
                                          range_end=range_end)
                 sample_index += 1
                 if progress_callback is not None:
@@ -877,3 +1095,160 @@ def process_video(input_paths, roi, callback, begin_attempt_number=1, params=Non
             _kf_prefetch_cleanup()
             return
     _kf_prefetch_cleanup()
+
+
+# Атрибутика атлетов вынесена в athlete_attribution.py (алиас для
+# совместимости: process_video_athletes и старый код ссылаются на имя)
+from athlete_attribution import AthleteZoneProfiler as _AthleteZoneProfiler
+
+
+def process_video_athletes(video_path, roi, should_continue=None,
+                           progress_cb=None, log_cb=None, params=None,
+                           attempt_found_cb=None, reid_embed_rate=5.0,
+                           slowmo_factor=1.0, resume_pos=None,
+                           athlete_attribution=True):
+    """Единый быстрый пайплайн атлет-режимов (3/4): кейфрейм-скан зон тем же
+    детектором, что и режимы 1/2, + накопление атрибутики атлета по сэмплам
+    открытой зоны (vest/helmet HSV, reid OSNet с троттлингом, boat hue,
+    thumb_t). athlete_attribution=False - только границы зон, без
+    атрибутики (режим «Сохранение попыток» на текущем этапе). Возвращает
+    список dict {start, end, thumb_t, vest, helmet, reid, boat, boat_top} -
+    совместимо с результатами attempts_v2 (без tiles/helmet-банков
+    сегментации); attempt_found_cb вызывается сразу при финализации зоны
+    (прогрессивный UI)."""
+    global _LOG_FN
+    if log_cb is not None:
+        _LOG_FN = log_cb
+    if params is None:
+        params = DEFAULT_PROCESSING_PARAMS.copy()
+    p = params.copy()
+    min_strength = p.get('min_detection_strength', 0.5)
+
+    embedder = None
+    if athlete_attribution:
+        import attempts_v2
+        try:
+            import torch
+            device = attempts_v2.default_device() if hasattr(attempts_v2, 'default_device') else \
+                ('mps' if torch.backends.mps.is_available() else 'cpu')
+            embedder = attempts_v2._get_embedder(device)
+        except Exception as e:
+            _log(i18n.tr("  Атрибутика недоступна ({err}) - зоны будут без reid", err=e))
+
+    model = load_yolo_model()
+    cap = open_capture(video_path)
+    if not cap.isOpened():
+        _log(i18n.tr("  Не удалось открыть файл: {file}", file=video_path))
+        return []
+    try:
+        fps_container = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps_real = fps_container * slowmo_factor if slowmo_factor > 1 else fps_container
+        real_duration = total_frames / fps_real if fps_real > 0 else 0.0
+        scan_interval = float(p.get('scan_interval', SCAN_INTERVAL))
+        seek = resume_pos * slowmo_factor if slowmo_factor > 1 and resume_pos else resume_pos
+        stream = _KeyframeStreamIter(cap, video_path, fps_real, total_frames,
+                                     real_duration, scan_interval, slowmo_factor,
+                                     resume_pos, None, 1.0 / scan_interval,
+                                     seek_pos=seek)
+        # Детектор создаём лениво на первом сэмпле (как в process_video):
+        # к тому моменту бутстрап стрима уже уточнит stream.rate - иначе
+        # pause_samples считается по грубой оценке 1/scan_interval и зоны
+        # закрываются дольше, чем в остальных режимах (слипание попыток)
+        detector = None
+        # ROI в координатах сэмпла (600px) - для thumb и profiler.
+        # Детектору ROI передаётся как есть (полигон или прям) - идентично
+        # process_video; bbox нужен только профайлеру атрибутики
+        if roi and not (len(roi) == 4 and all(isinstance(v, (int, float)) for v in roi)):
+            xs = [p[0] for p in roi]
+            ys = [p[1] for p in roi]
+            roi_bbox = (min(xs), min(ys), max(xs), max(ys))
+        else:
+            roi_bbox = roi
+        results_out = []
+        cur_prof = [None]
+        model_names = model.names
+
+        def _collect(info):
+            """Callback детектора: зона финализирована - отправляем результат."""
+            prof = cur_prof[0]
+            cur_prof[0] = None
+            if info is None:
+                return True
+            if prof is None:
+                if not athlete_attribution:
+                    # только границы: минимальный результат без атрибутики
+                    r = {'start': info.start, 'end': info.end,
+                         'thumb_t': info.thumb_t if info.thumb_t is not None else info.start,
+                         'thumb_frame': info.thumb_frame,
+                         'vest': None,
+                         'helmet': None, 'reid': None, 'boat': None,
+                         'boat_top': None}
+                    results_out.append(r)
+                    if attempt_found_cb is not None:
+                        return attempt_found_cb(r) is not False
+                return True
+            r = prof.result(info.start, info.end)
+            results_out.append(r)
+            cur_prof[0] = None
+            if attempt_found_cb is not None:
+                return attempt_found_cb(r) is not False
+            return True
+
+        sample_iter = iter(stream)
+        try:
+            _perf_t = time.time()
+            for real_sec, frame, pos, pos_total in sample_iter:
+                if should_continue is not None and not should_continue():
+                    _log(i18n.tr("  Остановка обработки по запросу пользователя"))
+                    return results_out
+                if detector is None:
+                    detector = _Detector(model, roi, video_path,
+                                         analysis_rate=stream.rate,
+                                         real_duration=real_duration,
+                                         params=p, min_strength=min_strength,
+                                         attempt_number=1,
+                                         callback=_collect,
+                                         scan_mode=True)
+                _now = time.time()
+                if _now - _perf_t > 0.5:
+                    _log(i18n.tr("  [perf] сэмпл @{t:.1f}с: ожидание {dt:.1f}с "
+                                 "(зона={zone})",
+                                 t=real_sec, dt=_now - _perf_t,
+                                 zone='да' if detector.in_attempt else 'нет'))
+                _perf_t = _now
+                det_res = detector.process_sample(real_sec, frame)
+                _now2 = time.time()
+                if _now2 - _perf_t > 0.5:
+                    _log(i18n.tr("  [perf] обработка сэмпла @{t:.1f}с: {dt:.1f}с",
+                                 t=real_sec, dt=_now2 - _perf_t))
+                    _perf_t = _now2
+                # накопление профиля открытой зоны (без 2го инференса YOLO -
+                # берём результаты детектора); при athlete_attribution=False
+                # профили не копятся вовсе
+                if athlete_attribution and detector.in_attempt \
+                        and detector.start_time is not None:
+                    if cur_prof[0] is None or cur_prof[0].start != detector.start_time:
+                        cur_prof[0] = _AthleteZoneProfiler(
+                            detector.start_time, roi_bbox,
+                            reid_embed_rate=reid_embed_rate, embedder=embedder)
+                    cur_prof[0]._model_names = model_names
+                    cur_prof[0].on_sample(real_sec, frame,
+                                          getattr(detector, 'last_results', None))
+                if det_res is False:
+                    return results_out
+                if progress_cb is not None:
+                    progress_cb(int(real_sec * 100),
+                                int(max(real_duration, real_sec) * 100))
+            if detector is not None:
+                fin = detector.finish()
+                if fin is not None:
+                    _collect(fin)
+        finally:
+            try:
+                sample_iter.close()
+            except Exception:
+                pass
+    finally:
+        cap.release()
+    return results_out

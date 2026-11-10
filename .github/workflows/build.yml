@@ -40,6 +40,13 @@ jobs:
       - name: Download FFmpeg
         run: python download_ffmpeg.py
 
+      # Стриминговый скан (v1.3.22 на Windows получил 0 I-кадров) -
+      # проверяем бандловый ffmpeg: encode+decode interlaced MTS GOP=12
+      # через тот же пайп (-skip_frame nokey); падение = не выпускаем
+      - name: Test ffmpeg keyframe stream
+        run: python tools/test_ffmpeg_stream.py
+
+
       - name: Build EXE
         run: python build.py
 
@@ -110,6 +117,13 @@ jobs:
       - name: Download FFmpeg
         run: python download_ffmpeg.py
 
+      # Стриминговый скан (v1.3.22 на Windows получил 0 I-кадров) -
+      # проверяем бандловый ffmpeg: encode+decode interlaced MTS GOP=12
+      # через тот же пайп (-skip_frame nokey); падение = не выпускаем
+      - name: Test ffmpeg keyframe stream
+        run: python tools/test_ffmpeg_stream.py
+
+
       - name: Build binary
         run: python build.py
 
@@ -171,6 +185,13 @@ jobs:
 
       - name: Download FFmpeg
         run: python download_ffmpeg.py
+
+      # Стриминговый скан (v1.3.22 на Windows получил 0 I-кадров) -
+      # проверяем бандловый ffmpeg: encode+decode interlaced MTS GOP=12
+      # через тот же пайп (-skip_frame nokey); падение = не выпускаем
+      - name: Test ffmpeg keyframe stream
+        run: python tools/test_ffmpeg_stream.py
+
 
       - name: Build .app
         run: python build.py

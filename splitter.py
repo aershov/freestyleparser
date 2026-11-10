@@ -365,10 +365,16 @@ class _KeyframeStreamIter:
         self._pts_q = queue.Queue()
 
         def _reader():
+            self._stderr_tail = []
             try:
                 try:
                     for line in self._proc.stderr:
-                        m = _PTS_TIME_RE.search(line.decode('utf-8', 'replace'))
+                        text = line.decode('utf-8', 'replace')
+                        # хвост stderr - для диагностики, если ffmpeg не дал кадров
+                        self._stderr_tail.append(text.strip())
+                        if len(self._stderr_tail) > 5:
+                            self._stderr_tail.pop(0)
+                        m = _PTS_TIME_RE.search(text)
                         if m:
                             try:
                                 self._pts_q.put(float(m.group(1)))
@@ -452,6 +458,21 @@ class _KeyframeStreamIter:
                     gaps.append(pts - last_pts)
                 last_pts = pts
             gop = _median_gap([pts for pts, _ in buffered])
+            if len(buffered) < 2 or gop <= 0:
+                # ffmpeg не отдал ни одной пары I-кадров (сборка не умеет
+                # -skip_frame nokey для этого контейнера, битый поток и т.п.) -
+                # стриминг здесь не работает, откат к seek-скану
+                tail = ' | '.join(getattr(self, '_stderr_tail', []))
+                _log(i18n.tr("  Внимание: ключевые кадры не читаются "
+                             "(получено кадров: {n}, GOP ~{gop:.2f}с) - "
+                             "скан обычными сэмплами (seek)", n=len(buffered), gop=gop))
+                if tail:
+                    _log(i18n.tr("  ffmpeg: {tail}", tail=tail))
+                self._stop_ffmpeg()
+                yield from _seek_sample_iter(self.cap, self.fps_real,
+                                             self.total_frames, self.sample_rate,
+                                             self.range_start, self.range_end)
+                return
             if gop > KEYFRAME_MAX_GAP:
                 _log(i18n.tr("  Ключевые кадры редкие (шаг ~{gap:.1f}с > {max:.0f}с) - "
                              "скан обычными сэмплами", gap=gop, max=KEYFRAME_MAX_GAP))

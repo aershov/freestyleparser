@@ -355,7 +355,7 @@ class _KeyframeStreamIter:
         cmd += ['-hide_banner', '-nostdin', '-skip_frame', 'nokey',
                 '-i', self.video_file,
                '-vf', f'showinfo,scale={YOLO_MAX_WIDTH}:{self._h_out}',
-               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-vsync', '0', 'pipe:1']
+               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-fps_mode', 'passthrough', 'pipe:1']
         try:
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                           stderr=subprocess.PIPE)

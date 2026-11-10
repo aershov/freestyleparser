@@ -57,7 +57,7 @@ def main():
         cmd = [ffmpeg, '-hide_banner', '-nostdin', '-skip_frame', 'nokey',
                '-i', mts,
                '-vf', f'showinfo,scale={W}:{out_h}',
-               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-vsync', '0', 'pipe:1']
+               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-fps_mode', 'passthrough', 'pipe:1']
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         frame_bytes = W * out_h * 3

@@ -585,6 +585,73 @@ class FreestyleParserApp:
         return (i_idx[1] - i_idx[0]) if len(i_idx) >= 2 else (
             i_idx[0] if i_idx else None)
 
+    def run_ffmpeg_diagnostics(self):
+        """Кнопка «🩺»: проверяет ffmpeg на выбранных файлах - версия и
+        отдаёт ли он I-кадры через стриминговый пайп (-skip_frame nokey,
+        как в скане). Фон - чтобы не морозить UI."""
+        threading.Thread(target=self._ffmpeg_diagnostics_thread, daemon=True).start()
+
+    def _ffmpeg_diagnostics_thread(self):
+        try:
+            files = [f for f in (self.selected_files or []) if isinstance(f, str)]
+            ffmpeg = get_ffmpeg_path()
+            if not ffmpeg or not os.path.isfile(ffmpeg):
+                self.log(i18n.tr("Диагностика: ffmpeg не найден в bin/ - "
+                                 "стриминговый скан и нарезка не будут работать"),
+                         logging.ERROR)
+                return
+            try:
+                ver = subprocess.run([ffmpeg, '-version'], capture_output=True,
+                                     timeout=30)
+                first = ver.stdout.decode('utf-8', 'replace').splitlines()
+                self.log(i18n.tr("Диагностика ffmpeg: {ver}",
+                                 ver=first[0] if first else '?'))
+            except Exception as e:
+                self.log(i18n.tr("Диагностика: ffmpeg -version упал: {err}", err=e),
+                         logging.ERROR)
+                return
+            if not files:
+                self.log(i18n.tr("Диагностика: выберите файлы - проверю I-кадры "
+                                 "через стриминговый пайп (10с на файл)"))
+                return
+            for path in files[:3]:
+                self._ffmpeg_stream_check(path)
+        except Exception as e:
+            self.log(i18n.tr("Диагностика: ошибка {err}", err=e), logging.ERROR)
+
+    def _ffmpeg_stream_check(self, video_path, probe_sec=10):
+        """Стриминговый пайп скана на файле: сколько I-кадров ffmpeg отдаёт
+        за первые probe_sec секунд (кейс v1.3.22: 0 кадров - пустой прогон)."""
+        name = os.path.basename(video_path)
+        src = self.get_absolute_path(video_path)
+        ffmpeg = get_ffmpeg_path()
+        try:
+            cap = open_capture(src)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            cmd = [ffmpeg, '-hide_banner', '-nostdin', '-skip_frame', 'nokey',
+                   '-i', src, '-t', str(probe_sec),
+                   '-vf', 'showinfo,scale=320:-2', '-f', 'null', '-']
+            r = subprocess.run(cmd, capture_output=True, timeout=180)
+            stderr = r.stderr.decode('utf-8', 'replace')
+            n_iframes = stderr.count('pts_time:')
+            self.log(i18n.tr("Диагностика {file} ({sec}с): {n} I-кадров "
+                             "через стриминговый пайп",
+                             file=name, sec=probe_sec, n=n_iframes))
+            if n_iframes > 0:
+                self.log(i18n.tr("  Стриминговый скан на этом файле работает"))
+            else:
+                self.log(i18n.tr("  ВНИМАНИЕ: I-кадров нет (код {code}) - "
+                                 "стриминговый скан не работает, скан уйдёт "
+                                 "в seek-фолбэк", code=r.returncode),
+                         logging.WARNING)
+                for line in stderr.strip().splitlines()[-5:]:
+                    self.log(f"  ffmpeg: {line}")
+        except Exception as e:
+            self.log(i18n.tr("Диагностика {file}: ошибка {err}", file=name, err=e),
+                     logging.ERROR)
+
     def _log_file_done(self, base, size_bytes, t0):
         """Итог по одному файлу: размер и время разбора."""
         elapsed = max(0, int(time.time() - t0))
@@ -844,10 +911,10 @@ class FreestyleParserApp:
     # Режимы обработки: (код, подпись, описание для подсказки, дефолтный
     # множитель оценки времени до первой калибровки)
     STRATEGY_MODES = [
-        ('manual', "Сканирование попыток (быстро, без сохранения)",
-         "Быстрый кейфрейм-скан: кандидаты с превью; сохраняете точечно "
+        ('manual', "Сканирование попыток (без сохранения)",
+         "Кейфрейм-скан: кандидаты с превью; сохраняете точечно "
          "через «Нарезать»", 1.0),
-        ('attempts', "Сохранение попыток (быстро, нужно место)",
+        ('attempts', "Сохранение попыток (нужно место)",
          "Нарезка + определение атлетов в попытках: экспорт по людям "
          "(медленнее: атрибутика атлетов)", 38.0),
     ]
@@ -1337,7 +1404,18 @@ class FreestyleParserApp:
         """Нарезает одну попытку (jpg + mp4 + запись в журнал).
         Вызывается из фонового потока нарезки (очередь), детекция не ждёт диск.
         Возвращает True при успехе (тогда точка продолжения сдвигается)."""
-        imwrite_unicode(os.path.join(self.output_folder, f"{attempt.number:04d}.jpg"), attempt.best_frame)
+        thumb_file = os.path.join(self.output_folder, f"{attempt.number:04d}.jpg")
+        if not imwrite_unicode(thumb_file, attempt.best_frame):
+            # imwrite_unicode молча возвращает False - без этого лога
+            # пропажа превью остаётся незамеченной до перезапуска
+            self.log(i18n.tr("Не удалось записать превью {file} (cv2.imencode) - "
+                             "будет догенерировано из клипа",
+                             file=os.path.basename(thumb_file)), logging.WARNING)
+            try:
+                self.generate_thumbnail(output_file, thumb_file, self.roi)
+            except Exception as e:
+                self.log(i18n.tr("Ошибка превью {attempt}: {err}", attempt=attempt.number, err=e),
+                         logging.ERROR)
         output_file = os.path.join(self.output_folder, f"{attempt.number:04d}.mp4")
         duration = attempt.end - attempt.start
         if duration <= 0:
@@ -3181,7 +3259,6 @@ class FreestyleParserApp:
             ('min_detection_strength', i18n.tr('Мин. сила детекции (0-1)')),
             ('scan_interval', i18n.tr('Шаг скана, с')),
             ('scan_threshold', i18n.tr('Порог скана (0-1)')),
-            ('reid_embed_rate', i18n.tr('OSNet сэмплов/с в попытке')),
             ('precise_left_margin', i18n.tr('Поиск начала влево, с')),
         ]
 
@@ -3208,9 +3285,6 @@ class FreestyleParserApp:
             'scan_threshold':
                 i18n.tr('Порог YOLO при сканировании (0-1), ниже обычного анализа.\n'
                         'Меньше - больше кандидатов (в т.ч. ложных).'),
-            'reid_embed_rate':
-                i18n.tr('Сколько OSNet-эмбеддингов в секунду брать внутри попытки\n'
-                        'для атрибуции. Больше - точнее, медленнее.'),
             'precise_left_margin':
                 i18n.tr('Насколько влево от кандидата искать точное начало попытки, сек.'),
         }
@@ -3301,6 +3375,16 @@ class FreestyleParserApp:
         self._attach_tooltip(self.button_process,
                              i18n.tr("Найти и нарезать попытки по выбранным файлам\n"
                                      "(стратегия - чекбоксами выше)"))
+
+        # Диагностика ffmpeg/стриминга: проверяет, отдаёт ли ffmpeg I-кадры
+        # для выбранных файлов (кейс v1.3.22: 0 I-кадров -> пустой прогон)
+        self.button_diagnostics = tk.Button(control_inner, text="🩺", width=3,
+                                            command=self.run_ffmpeg_diagnostics)
+        self.button_diagnostics.pack(side=tk.LEFT, padx=2)
+        self._attach_tooltip(self.button_diagnostics,
+                             i18n.tr("Проверить ffmpeg на выбранных файлах: версия,\n"
+                                     "I-кадры через стриминговый пайп (10с на файл).\n"
+                                     "Результат - в лог"))
 
         # «Заново» появляется рядом с «Продолжить»: сброс точки продолжения,
         # журнал попыток очищается, нарезка с попытки №1 с перезаписью
@@ -3410,9 +3494,12 @@ class FreestyleParserApp:
         # (ttk.Notebook на macOS aqua рисует толстую тематическую рамку
         # вокруг области табов с внутренними отступами - стилем не убираются) ===
         self.frame_athletes = tk.LabelFrame(self.right_frame, text=i18n.tr("Атлеты / Скан"))
-        # stretch=never: фиксированная ширина, без пустот по краям
-        self.right_frame.add(self.frame_athletes, width=235, stretch="never",
-                             minsize=225)
+        # Временно скрыто (стабилизация основного функционала): панель
+        # создаётся (остальной код обращается к её виджетам), но не
+        # добавляется в окно. Вернуть - раскомментировать add ниже
+        # и ath_toggle в конце _build_... (см. 'Панель Атлеты / Скан').
+        # self.right_frame.add(self.frame_athletes, width=235, stretch="never",
+        #                      minsize=225)
         tabbar = tk.Frame(self.frame_athletes, bd=0, highlightthickness=0)
         tabbar.pack(fill=tk.X, padx=2, pady=(2, 0))
         self._athlete_tab_buttons = {}
@@ -3606,13 +3693,14 @@ class FreestyleParserApp:
                              i18n.tr("Справка: Логи"))
 
         # Панель 'Атлеты / Скан': скрываемая целиком (кнопка-язычок внизу
-        # справа; при скрытии панель попыток расширяется)
-        self._ath_pane_visible = True
-        self.ath_toggle = tk.Label(self.right_frame, text='⇥', cursor='hand2',
-                                   font=('Arial', 9, 'bold'), padx=3,
-                                   bg='#e8e8e8')
-        self.ath_toggle.place(relx=1.0, rely=1.0, x=-26, y=-4, anchor='se')
-        self.ath_toggle.bind('<Button-1>', lambda e: self._toggle_athletes())
+        # справа; при скрытии панель попыток расширяется).
+        # Временно скрыта вместе с панелью - вернуть вместе с right_frame.add
+        # self._ath_pane_visible = True
+        # self.ath_toggle = tk.Label(self.right_frame, text='⇥', cursor='hand2',
+        #                            font=('Arial', 9, 'bold'), padx=3,
+        #                            bg='#e8e8e8')
+        # self.ath_toggle.place(relx=1.0, rely=1.0, x=-26, y=-4, anchor='se')
+        # self.ath_toggle.bind('<Button-1>', lambda e: self._toggle_athletes())
 
         # колесо мыши: один глобальный обработчик для всех скроллируемых панелей
         self._setup_wheel_scrolling()
